@@ -99,7 +99,11 @@ class Orchestrator:
             f"TASK TO PLAN:\n{task}\n\n"
             f"Return the plan as JSON."
         )
-        raw = self.agent.chat(_SYSTEM, [{"role": "user", "content": msg}])
+        # Use chat_plan if available (ClaudeCodeCLIAgent with --json-schema)
+        if hasattr(self.agent, "chat_plan"):
+            raw = self.agent.chat_plan(_SYSTEM, [{"role": "user", "content": msg}])
+        else:
+            raw = self.agent.chat(_SYSTEM, [{"role": "user", "content": msg}])
         data = self._extract_json(raw)
         if not data.get("task_id"):
             data["task_id"] = str(uuid.uuid4())[:8]
@@ -122,7 +126,11 @@ class Orchestrator:
             f"WORKER RESULT:\n{files_summary}\n\n{result_preview}\n\n"
             f"Return your review as JSON."
         )
-        raw = self.agent.chat(_SYSTEM, [{"role": "user", "content": msg}])
+        # Use chat_review if available (ClaudeCodeCLIAgent with --json-schema)
+        if hasattr(self.agent, "chat_review"):
+            raw = self.agent.chat_review(_SYSTEM, [{"role": "user", "content": msg}])
+        else:
+            raw = self.agent.chat(_SYSTEM, [{"role": "user", "content": msg}])
         data = self._extract_json(raw)
         return Review(**data)
 

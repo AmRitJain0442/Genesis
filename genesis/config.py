@@ -1,5 +1,4 @@
 from __future__ import annotations
-import os
 import sys
 import shutil
 from pathlib import Path
@@ -18,47 +17,69 @@ CONFIG_FILE = CONFIG_DIR / "config.toml"
 
 _DEFAULT_CONFIG = """\
 # Genesis Configuration
+# Run 'genesis init' to create this file, then edit as needed.
 
 [orchestrator]
-provider = "claude"
-model = "claude-opus-4-6"
-max_tokens = 4096
+# The director agent: plans tasks, assigns workers, reviews results.
+provider = "claude-cli"          # "claude-cli" | "chatgpt-browser"
+model = "claude-opus-4-6"        # alias "opus" also works
 
 [worker]
-provider = "claude"
-model = "claude-sonnet-4-6"
-max_tokens = 8192
+# The executor agents: write code, docs, tests, configs.
+provider = "claude-cli"          # "claude-cli" | "chatgpt-browser"
+model = "claude-sonnet-4-6"      # alias "sonnet" also works
 
-[api_keys]
-anthropic = ""
-openai = ""
+[claude_cli]
+# Settings for the Claude Code CLI agent.
+# Requires: `claude` is installed and you are logged in (`claude login`).
+command = "claude"               # path to the claude binary (auto-detected if in PATH)
+timeout = 300                    # seconds to wait for a response
+
+[chatgpt_browser]
+# Settings for the optional ChatGPT browser agent.
+# Requires: pip install playwright && playwright install chromium
+enabled = false
+headless = true
+profile_dir = ""                 # set to ~/.genesis/chatgpt_profile to persist login
 
 [git]
-auto_commit = true
-auto_push = false
+auto_commit = true               # commit after each approved step
+auto_push = false                # push to remote after each commit
 remote = "origin"
 branch = "main"
 commit_prefix = "[genesis]"
 
 [memory]
-file = "GENESIS_MEMORY.md"
-max_context_chars = 6000
-auto_append_plan = true
+file = "GENESIS_MEMORY.md"       # created in the current working directory
+max_context_chars = 6000         # max memory chars injected into prompts
+auto_append_plan = true          # write the task plan to memory at start
 """
 
 
 @dataclass
 class OrchestratorConfig:
-    provider: str = "claude"
+    provider: str = "claude-cli"
     model: str = "claude-opus-4-6"
-    max_tokens: int = 4096
 
 
 @dataclass
 class WorkerConfig:
-    provider: str = "claude"
+    provider: str = "claude-cli"
     model: str = "claude-sonnet-4-6"
-    max_tokens: int = 8192
+
+
+@dataclass
+class ClaudeCLIConfig:
+    command: str = "claude"
+    timeout: int = 300
+
+
+@dataclass
+class ChatGPTBrowserConfig:
+    enabled: bool = False
+    headless: bool = True
+    profile_dir: str = ""
+    model: str = "gpt-4o"
 
 
 @dataclass
@@ -78,24 +99,13 @@ class MemoryConfig:
 
 
 @dataclass
-class ApiKeys:
-    anthropic: str = ""
-    openai: str = ""
-
-
-@dataclass
 class GenesisConfig:
     orchestrator: OrchestratorConfig = field(default_factory=OrchestratorConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
+    claude_cli: ClaudeCLIConfig = field(default_factory=ClaudeCLIConfig)
+    chatgpt_browser: ChatGPTBrowserConfig = field(default_factory=ChatGPTBrowserConfig)
     git: GitConfig = field(default_factory=GitConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
-    api_keys: ApiKeys = field(default_factory=ApiKeys)
-
-    def get_anthropic_key(self) -> str:
-        return self.api_keys.anthropic or os.environ.get("ANTHROPIC_API_KEY", "")
-
-    def get_openai_key(self) -> str:
-        return self.api_keys.openai or os.environ.get("OPENAI_API_KEY", "")
 
 
 def load_config() -> GenesisConfig:
@@ -109,16 +119,28 @@ def load_config() -> GenesisConfig:
 
     if o := data.get("orchestrator"):
         cfg.orchestrator = OrchestratorConfig(
-            provider=o.get("provider", "claude"),
+            provider=o.get("provider", "claude-cli"),
             model=o.get("model", "claude-opus-4-6"),
-            max_tokens=o.get("max_tokens", 4096),
         )
 
     if w := data.get("worker"):
         cfg.worker = WorkerConfig(
-            provider=w.get("provider", "claude"),
+            provider=w.get("provider", "claude-cli"),
             model=w.get("model", "claude-sonnet-4-6"),
-            max_tokens=w.get("max_tokens", 8192),
+        )
+
+    if c := data.get("claude_cli"):
+        cfg.claude_cli = ClaudeCLIConfig(
+            command=c.get("command", "claude"),
+            timeout=c.get("timeout", 300),
+        )
+
+    if b := data.get("chatgpt_browser"):
+        cfg.chatgpt_browser = ChatGPTBrowserConfig(
+            enabled=b.get("enabled", False),
+            headless=b.get("headless", True),
+            profile_dir=b.get("profile_dir", ""),
+            model=b.get("model", "gpt-4o"),
         )
 
     if g := data.get("git"):
@@ -137,23 +159,17 @@ def load_config() -> GenesisConfig:
             auto_append_plan=m.get("auto_append_plan", True),
         )
 
-    if k := data.get("api_keys"):
-        cfg.api_keys = ApiKeys(
-            anthropic=k.get("anthropic", ""),
-            openai=k.get("openai", ""),
-        )
-
     return cfg
 
 
 def init_config(force: bool = False) -> Path:
-    """Create ~/.genesis/config.toml from the example template."""
+    """Create ~/.genesis/config.toml."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
     if CONFIG_FILE.exists() and not force:
         return CONFIG_FILE
 
-    # Try to copy from the package's example file first
+    # Try to copy from the package's example file
     example = Path(__file__).parent.parent / "config.example.toml"
     if example.exists():
         shutil.copy(example, CONFIG_FILE)

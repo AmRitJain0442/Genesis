@@ -16,8 +16,7 @@ from genesis.config import get_config, CONFIG_FILE
 from genesis.memory import MemoryManager
 from genesis.git_ops import GitManager
 from genesis.agents.base import AgentInfo, BaseAgent
-from genesis.agents.claude_agent import ClaudeAgent
-from genesis.agents.gpt_agent import GPTAgent
+from genesis.agents.claude_cli import ClaudeCodeCLIAgent, find_claude_binary
 from genesis.agents.orchestrator import Orchestrator
 from genesis.ui.console import console
 from genesis.ui.dashboard import DashboardState, make_layout
@@ -27,22 +26,22 @@ logger = logging.getLogger(__name__)
 _HELP = """\
 [bold]GENESIS COMMANDS[/bold]
 
-  [bold cyan]run[/bold cyan] [dim]<task>[/dim]                    Execute a task through the AI orchestrator
-  [bold cyan]plan[/bold cyan] [dim]<task>[/dim]                   Generate and preview a plan (no execution)
-  [bold cyan]status[/bold cyan]                         Show agent info and recent git log
-  [bold cyan]memory show[/bold cyan]                    Display the shared memory file
-  [bold cyan]memory clear[/bold cyan]                   Reset the memory file (prompts for confirmation)
-  [bold cyan]memory append[/bold cyan] [dim]<text>[/dim]          Manually add a note to memory
-  [bold cyan]config show[/bold cyan]                    Display current configuration
-  [bold cyan]config edit[/bold cyan]                    Open config in your editor
-  [bold cyan]git log[/bold cyan]                        Show recent Genesis commits
-  [bold cyan]git commit[/bold cyan] [dim][message][/dim]          Manually commit current changes
-  [bold cyan]agents[/bold cyan]                         List configured agents
-  [bold cyan]switch orchestrator[/bold cyan] [dim]<claude|gpt>[/dim]  Hot-swap orchestrator
-  [bold cyan]switch worker[/bold cyan] [dim]<claude|gpt>[/dim]      Hot-swap worker
-  [bold cyan]help[/bold cyan]                           Show this help
-  [bold cyan]clear[/bold cyan]                          Clear the terminal
-  [bold cyan]exit[/bold cyan]                           Exit Genesis
+  [bold cyan]run[/bold cyan] [dim]<task>[/dim]                       Execute a task through the AI orchestrator
+  [bold cyan]plan[/bold cyan] [dim]<task>[/dim]                      Generate and preview a plan (no execution)
+  [bold cyan]status[/bold cyan]                            Show agent info and recent git log
+  [bold cyan]memory show[/bold cyan]                       Display the shared memory file
+  [bold cyan]memory clear[/bold cyan]                      Reset the memory file
+  [bold cyan]memory append[/bold cyan] [dim]<text>[/dim]             Manually add a note to memory
+  [bold cyan]config show[/bold cyan]                       Display current configuration
+  [bold cyan]config edit[/bold cyan]                       Open config in your editor
+  [bold cyan]git log[/bold cyan]                           Show recent Genesis commits
+  [bold cyan]git commit[/bold cyan] [dim][message][/dim]             Manually commit current changes
+  [bold cyan]agents[/bold cyan]                            List available agents
+  [bold cyan]switch orchestrator[/bold cyan] [dim]<claude-cli|chatgpt>[/dim]   Hot-swap orchestrator
+  [bold cyan]switch worker[/bold cyan] [dim]<claude-cli|chatgpt>[/dim]         Hot-swap worker
+  [bold cyan]help[/bold cyan]                              Show this help
+  [bold cyan]clear[/bold cyan]                             Clear the terminal
+  [bold cyan]exit[/bold cyan]                              Exit Genesis
 """
 
 
@@ -62,55 +61,58 @@ class GenesisREPL:
     # ── Agent construction ─────────────────────────────────────────────────
 
     def _build_agents(self) -> None:
-        ak = self.config.get_anthropic_key()
-        ok = self.config.get_openai_key()
+        """Detect available providers and create agent instances."""
+        cfg = self.config
+        cmd = find_claude_binary() or cfg.claude_cli.command
 
-        if ak:
-            self._agents["claude-orchestrator"] = ClaudeAgent(
+        # Claude Code CLI agents (no API key needed — uses `claude login` session)
+        if find_claude_binary():
+            self._agents["claude-cli-orchestrator"] = ClaudeCodeCLIAgent(
                 AgentInfo(
-                    "claude-orchestrator", "claude",
-                    self.config.orchestrator.model
-                    if self._orch_provider == "claude"
-                    else "claude-opus-4-6",
-                    self.config.orchestrator.max_tokens,
+                    "claude-cli-orchestrator",
+                    "claude-cli",
+                    cfg.orchestrator.model if self._orch_provider == "claude-cli" else "claude-opus-4-6",
+                    max_tokens=8096,
                 ),
-                ak,
+                command=cmd,
+                timeout=cfg.claude_cli.timeout,
             )
-            self._agents["claude-worker"] = ClaudeAgent(
+            self._agents["claude-cli-worker"] = ClaudeCodeCLIAgent(
                 AgentInfo(
-                    "claude-worker", "claude",
-                    self.config.worker.model
-                    if self._worker_provider == "claude"
-                    else "claude-sonnet-4-6",
-                    self.config.worker.max_tokens,
+                    "claude-cli-worker",
+                    "claude-cli",
+                    cfg.worker.model if self._worker_provider == "claude-cli" else "claude-sonnet-4-6",
+                    max_tokens=8096,
                 ),
-                ak,
+                command=cmd,
+                timeout=cfg.claude_cli.timeout,
             )
 
-        if ok:
-            self._agents["gpt-orchestrator"] = GPTAgent(
-                AgentInfo(
-                    "gpt-orchestrator", "gpt",
-                    self.config.orchestrator.model
-                    if self._orch_provider == "gpt"
-                    else "gpt-4o",
-                    self.config.orchestrator.max_tokens,
-                ),
-                ok,
-            )
-            self._agents["gpt-worker"] = GPTAgent(
-                AgentInfo(
-                    "gpt-worker", "gpt",
-                    self.config.worker.model
-                    if self._worker_provider == "gpt"
-                    else "gpt-4o",
-                    self.config.worker.max_tokens,
-                ),
-                ok,
-            )
+        # ChatGPT browser agent (optional — requires playwright)
+        if cfg.chatgpt_browser.enabled:
+            try:
+                from genesis.agents.chatgpt_browser import ChatGPTBrowserAgent
+                self._agents["chatgpt-orchestrator"] = ChatGPTBrowserAgent(
+                    AgentInfo("chatgpt-orchestrator", "chatgpt-browser",
+                              cfg.chatgpt_browser.model, max_tokens=4096),
+                    headless=cfg.chatgpt_browser.headless,
+                    profile_dir=cfg.chatgpt_browser.profile_dir,
+                )
+                self._agents["chatgpt-worker"] = ChatGPTBrowserAgent(
+                    AgentInfo("chatgpt-worker", "chatgpt-browser",
+                              cfg.chatgpt_browser.model, max_tokens=4096),
+                    headless=cfg.chatgpt_browser.headless,
+                    profile_dir=cfg.chatgpt_browser.profile_dir,
+                )
+            except Exception as e:
+                logger.warning("ChatGPT browser agent failed to load: %s", e)
 
     def _get_orchestrator(self) -> BaseAgent | None:
-        return self._agents.get(f"{self._orch_provider}-orchestrator")
+        # Prefer the configured provider, fall back to whatever is available
+        for key in (f"{self._orch_provider}-orchestrator", "claude-cli-orchestrator", "chatgpt-orchestrator"):
+            if key in self._agents:
+                return self._agents[key]
+        return None
 
     def _get_workers(self) -> dict[str, BaseAgent]:
         return {k: v for k, v in self._agents.items() if "worker" in k}
@@ -132,9 +134,10 @@ class GenesisREPL:
         orchestrator = self._make_orchestrator()
         if not orchestrator:
             console.print(
-                "[red]No agents available.[/red] "
-                "Set [bold]ANTHROPIC_API_KEY[/bold] and/or [bold]OPENAI_API_KEY[/bold], "
-                "then run [cyan]config show[/cyan] to verify."
+                "[red]No agents available.[/red]\n"
+                "Make sure [bold]Claude Code[/bold] is installed and logged in:\n"
+                "  [cyan]claude login[/cyan]\n"
+                "Then run [cyan]genesis status[/cyan] to verify."
             )
             return
 
@@ -308,20 +311,20 @@ class GenesisREPL:
             tbl.add_column("Setting", style="cyan")
             tbl.add_column("Value")
 
+            claude_bin = find_claude_binary()
             rows = [
                 ("orchestrator.provider", cfg.orchestrator.provider),
                 ("orchestrator.model", cfg.orchestrator.model),
-                ("orchestrator.max_tokens", str(cfg.orchestrator.max_tokens)),
                 ("worker.provider", cfg.worker.provider),
                 ("worker.model", cfg.worker.model),
-                ("worker.max_tokens", str(cfg.worker.max_tokens)),
+                ("claude_cli.command", claude_bin or f"[red]{cfg.claude_cli.command} (not found)[/red]"),
+                ("claude_cli.timeout", f"{cfg.claude_cli.timeout}s"),
+                ("chatgpt_browser.enabled", "[green]yes[/green]" if cfg.chatgpt_browser.enabled else "no"),
                 ("git.auto_commit", str(cfg.git.auto_commit)),
                 ("git.auto_push", str(cfg.git.auto_push)),
                 ("git.commit_prefix", cfg.git.commit_prefix),
                 ("memory.file", cfg.memory.file),
                 ("memory.max_context_chars", str(cfg.memory.max_context_chars)),
-                ("anthropic_key", "[green]✓ set[/green]" if cfg.get_anthropic_key() else "[red]✗ not set[/red]"),
-                ("openai_key", "[green]✓ set[/green]" if cfg.get_openai_key() else "[red]✗ not set[/red]"),
             ]
             for k, v in rows:
                 tbl.add_row(k, v)
@@ -357,13 +360,18 @@ class GenesisREPL:
 
     def cmd_switch(self, args: list[str]) -> None:
         if len(args) < 2:
-            console.print("Usage: switch [orchestrator|worker] [claude|gpt]")
+            console.print("Usage: switch [orchestrator|worker] [claude-cli|chatgpt]")
             return
 
         role, provider = args[0].lower(), args[1].lower()
-        if provider not in ("claude", "gpt"):
-            console.print("[red]Provider must be 'claude' or 'gpt'[/red]")
+        valid = ("claude-cli", "chatgpt", "chatgpt-browser")
+        if provider not in valid:
+            console.print(f"[red]Provider must be one of: {', '.join(valid)}[/red]")
             return
+
+        # Normalise "chatgpt" → "chatgpt-browser"
+        if provider == "chatgpt":
+            provider = "chatgpt-browser"
 
         if role == "orchestrator":
             self._orch_provider = provider
@@ -373,8 +381,8 @@ class GenesisREPL:
             console.print(f"[green]Worker → {provider}[/green]")
         else:
             console.print("[red]Role must be 'orchestrator' or 'worker'[/red]")
+            return
 
-        # Rebuild agents with new provider settings
         self._build_agents()
 
     # ── Main loop ──────────────────────────────────────────────────────────
@@ -433,18 +441,17 @@ class GenesisREPL:
                 )
 
     def _print_banner(self) -> None:
+        claude_bin = find_claude_binary()
         key_status = []
-        if self.config.get_anthropic_key():
-            key_status.append("[green]Claude ✓[/green]")
+        if claude_bin:
+            key_status.append("[green]Claude Code ✓[/green]")
         else:
-            key_status.append("[red]Claude ✗[/red]")
-        if self.config.get_openai_key():
-            key_status.append("[green]GPT ✓[/green]")
-        else:
-            key_status.append("[red]GPT ✗[/red]")
+            key_status.append("[red]Claude Code ✗ (run: claude login)[/red]")
+        if self.config.chatgpt_browser.enabled:
+            key_status.append("[cyan]ChatGPT browser ✓[/cyan]")
 
         agents_line = "  ·  ".join(key_status)
-        agent_names = ", ".join(self._agents.keys()) or "[red]none — set API keys[/red]"
+        agent_names = ", ".join(self._agents.keys()) or "[red]none available[/red]"
 
         console.print()
         console.print(
