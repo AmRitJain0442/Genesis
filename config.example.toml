@@ -1,0 +1,31 @@
+# Genesis Configuration
+# Copy to ~/.genesis/config.toml and fill in your API keys
+
+[orchestrator]
+# The director agent: plans tasks, assigns workers, reviews results
+provider = "claude"                  # "claude" | "gpt"
+model = "claude-opus-4-6"           # Must be valid for the provider
+max_tokens = 4096
+
+[worker]
+# The executor agents: write code, docs, tests, configs
+provider = "claude"                  # "claude" | "gpt"
+model = "claude-sonnet-4-6"         # Use a faster/cheaper model for workers
+max_tokens = 8192
+
+[api_keys]
+# Leave empty to use environment variables instead
+anthropic = ""                       # Or set ANTHROPIC_API_KEY env var
+openai = ""                          # Or set OPENAI_API_KEY env var
+
+[git]
+auto_commit = true                   # Commit after each approved step
+auto_push = false                    # Push to remote after each commit
+remote = "origin"
+branch = "main"
+commit_prefix = "[genesis]"
+
+[memory]
+file = "GENESIS_MEMORY.md"           # Created in the current working directory
+max_context_chars = 6000             # Max memory chars injected into prompts
+auto_append_plan = true              # Write the task plan to memory at start
