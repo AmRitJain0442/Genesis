@@ -14,6 +14,18 @@ from genesis.config import GenesisConfig
 if TYPE_CHECKING:
     from genesis.agents.base import BaseAgent
 
+
+def _make_worker(agent: BaseAgent, memory_summary: str, work_dir: str):
+    """Return the right worker type for the given agent."""
+    try:
+        from genesis.agents.codex_cli import CodexCLIAgent
+        from genesis.agents.codex_worker import CodexWorker
+        if isinstance(agent, CodexCLIAgent):
+            return CodexWorker(agent, memory_summary, work_dir)
+    except ImportError:
+        pass
+    return Worker(agent, memory_summary, work_dir)
+
 logger = logging.getLogger(__name__)
 
 _SYSTEM = """\
@@ -160,7 +172,7 @@ class Orchestrator:
             fire("on_worker_assigned", step, worker_name)
 
             mem_summary = self.memory.get_summary(self.config.memory.max_context_chars)
-            worker = Worker(worker_agent, mem_summary, self.work_dir)
+            worker = _make_worker(worker_agent, mem_summary, self.work_dir)
 
             result = worker.execute(step)
 

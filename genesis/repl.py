@@ -17,6 +17,7 @@ from genesis.memory import MemoryManager
 from genesis.git_ops import GitManager
 from genesis.agents.base import AgentInfo, BaseAgent
 from genesis.agents.claude_cli import ClaudeCodeCLIAgent, find_claude_binary
+from genesis.agents.codex_cli import CodexCLIAgent, find_codex_binary
 from genesis.agents.orchestrator import Orchestrator
 from genesis.ui.console import console
 from genesis.ui.dashboard import DashboardState, make_layout
@@ -88,6 +89,33 @@ class GenesisREPL:
                 timeout=cfg.claude_cli.timeout,
             )
 
+        # Codex CLI agents (no API key needed — uses `codex login` / ChatGPT Pro session)
+        if find_codex_binary():
+            codex_cmd = find_codex_binary()
+            codex_model = cfg.codex_cli.model if cfg.codex_cli.model != "auto" else ""
+            self._agents["codex-orchestrator"] = CodexCLIAgent(
+                AgentInfo(
+                    "codex-orchestrator",
+                    "codex-cli",
+                    codex_model or "auto",
+                    max_tokens=8096,
+                ),
+                command=codex_cmd,
+                timeout=cfg.codex_cli.timeout,
+                work_dir=self.work_dir,
+            )
+            self._agents["codex-worker"] = CodexCLIAgent(
+                AgentInfo(
+                    "codex-worker",
+                    "codex-cli",
+                    codex_model or "auto",
+                    max_tokens=8096,
+                ),
+                command=codex_cmd,
+                timeout=cfg.codex_cli.timeout,
+                work_dir=self.work_dir,
+            )
+
         # ChatGPT browser agent (optional — requires playwright)
         if cfg.chatgpt_browser.enabled:
             try:
@@ -108,8 +136,13 @@ class GenesisREPL:
                 logger.warning("ChatGPT browser agent failed to load: %s", e)
 
     def _get_orchestrator(self) -> BaseAgent | None:
-        # Prefer the configured provider, fall back to whatever is available
-        for key in (f"{self._orch_provider}-orchestrator", "claude-cli-orchestrator", "chatgpt-orchestrator"):
+        # Prefer configured provider, then Claude (best for JSON reasoning), then Codex
+        for key in (
+            f"{self._orch_provider}-orchestrator",
+            "claude-cli-orchestrator",
+            "codex-orchestrator",
+            "chatgpt-orchestrator",
+        ):
             if key in self._agents:
                 return self._agents[key]
         return None
@@ -312,13 +345,15 @@ class GenesisREPL:
             tbl.add_column("Value")
 
             claude_bin = find_claude_binary()
+            codex_bin = find_codex_binary()
             rows = [
                 ("orchestrator.provider", cfg.orchestrator.provider),
                 ("orchestrator.model", cfg.orchestrator.model),
                 ("worker.provider", cfg.worker.provider),
                 ("worker.model", cfg.worker.model),
-                ("claude_cli.command", claude_bin or f"[red]{cfg.claude_cli.command} (not found)[/red]"),
-                ("claude_cli.timeout", f"{cfg.claude_cli.timeout}s"),
+                ("claude_cli.command", claude_bin or f"[red]not found[/red]"),
+                ("codex_cli.command", codex_bin or "[dim]not found[/dim]"),
+                ("codex_cli.model", cfg.codex_cli.model),
                 ("chatgpt_browser.enabled", "[green]yes[/green]" if cfg.chatgpt_browser.enabled else "no"),
                 ("git.auto_commit", str(cfg.git.auto_commit)),
                 ("git.auto_push", str(cfg.git.auto_push)),
@@ -364,14 +399,16 @@ class GenesisREPL:
             return
 
         role, provider = args[0].lower(), args[1].lower()
-        valid = ("claude-cli", "chatgpt", "chatgpt-browser")
+        valid = ("claude-cli", "codex", "codex-cli", "chatgpt", "chatgpt-browser")
         if provider not in valid:
-            console.print(f"[red]Provider must be one of: {', '.join(valid)}[/red]")
+            console.print(f"[red]Provider must be one of: claude-cli, codex, chatgpt[/red]")
             return
 
-        # Normalise "chatgpt" → "chatgpt-browser"
+        # Normalise aliases
         if provider == "chatgpt":
             provider = "chatgpt-browser"
+        elif provider == "codex":
+            provider = "codex-cli"
 
         if role == "orchestrator":
             self._orch_provider = provider
@@ -441,12 +478,15 @@ class GenesisREPL:
                 )
 
     def _print_banner(self) -> None:
-        claude_bin = find_claude_binary()
         key_status = []
-        if claude_bin:
+        if find_claude_binary():
             key_status.append("[green]Claude Code ✓[/green]")
         else:
-            key_status.append("[red]Claude Code ✗ (run: claude login)[/red]")
+            key_status.append("[red]Claude Code ✗[/red]")
+        if find_codex_binary():
+            key_status.append("[green]Codex ✓[/green]")
+        else:
+            key_status.append("[dim]Codex —[/dim]")
         if self.config.chatgpt_browser.enabled:
             key_status.append("[cyan]ChatGPT browser ✓[/cyan]")
 

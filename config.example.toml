@@ -1,33 +1,36 @@
 # Genesis Configuration
-# Copy to ~/.genesis/config.toml  (or run: genesis init)
+# Run `genesis init` to install this at ~/.genesis/config.toml
 #
 # No API keys required.
-# Claude Code uses your existing Claude Pro/Max account (via `claude login`).
-# ChatGPT uses browser automation against your Pro account (optional).
+# Both agents authenticate via their own CLIs using your Pro accounts.
 
 [orchestrator]
 # The director: plans tasks, assigns workers, reviews results.
-provider = "claude-cli"          # "claude-cli" | "chatgpt-browser"
+# Claude Code is recommended here — it gives the best structured JSON output.
+provider = "claude-cli"          # "claude-cli" | "codex-cli"
 model = "claude-opus-4-6"        # or alias "opus"
 
 [worker]
-# The executors: write code, docs, tests, configs.
-provider = "claude-cli"          # "claude-cli" | "chatgpt-browser"
-model = "claude-sonnet-4-6"      # or alias "sonnet" (faster, cheaper)
+# The executor: writes code, docs, tests, configs.
+# Codex is recommended here — it can autonomously run commands and write files.
+provider = "codex-cli"           # "codex-cli" | "claude-cli"
+model = "auto"                   # "auto" = use your account's default model (gpt-5.4)
 
 [claude_cli]
-# Settings for the Claude Code CLI agent.
-# Requires: Claude Code installed + `claude login` completed.
+# Requires: Claude Code installed + logged in (`claude login`)
 command = "claude"               # auto-detected from PATH
 timeout = 300                    # seconds to wait per call
 
+[codex_cli]
+# Requires: Codex CLI installed + logged in (`codex login`)
+command = "codex"                # auto-detected from PATH
+timeout = 600                    # codex tasks take longer (it runs code)
+model = "auto"                   # leave as "auto" to use your account default
+
 [chatgpt_browser]
-# Optional: drive ChatGPT Pro via browser automation (no API key needed).
+# Only needed if you want to drive ChatGPT via the web UI instead of Codex CLI.
 # Requires: pip install playwright && playwright install chromium
 enabled = false
-headless = true
-profile_dir = ""                 # set to a path to persist your login session
-model = "gpt-4o"                 # informational label only
 
 [git]
 auto_commit = true               # commit after each approved step
@@ -37,6 +40,6 @@ branch = "main"
 commit_prefix = "[genesis]"
 
 [memory]
-file = "GENESIS_MEMORY.md"       # in the current working directory
-max_context_chars = 6000         # max chars injected into prompts
-auto_append_plan = true          # write the task plan to memory at start
+file = "GENESIS_MEMORY.md"       # created in the current working directory
+max_context_chars = 6000
+auto_append_plan = true

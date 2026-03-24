@@ -75,6 +75,13 @@ class ClaudeCLIConfig:
 
 
 @dataclass
+class CodexCLIConfig:
+    command: str = "codex"
+    timeout: int = 600
+    model: str = "auto"   # "auto" = let Codex pick its default for your account
+
+
+@dataclass
 class ChatGPTBrowserConfig:
     enabled: bool = False
     headless: bool = True
@@ -103,6 +110,7 @@ class GenesisConfig:
     orchestrator: OrchestratorConfig = field(default_factory=OrchestratorConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     claude_cli: ClaudeCLIConfig = field(default_factory=ClaudeCLIConfig)
+    codex_cli: CodexCLIConfig = field(default_factory=CodexCLIConfig)
     chatgpt_browser: ChatGPTBrowserConfig = field(default_factory=ChatGPTBrowserConfig)
     git: GitConfig = field(default_factory=GitConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -133,6 +141,13 @@ def load_config() -> GenesisConfig:
         cfg.claude_cli = ClaudeCLIConfig(
             command=c.get("command", "claude"),
             timeout=c.get("timeout", 300),
+        )
+
+    if cx := data.get("codex_cli"):
+        cfg.codex_cli = CodexCLIConfig(
+            command=cx.get("command", "codex"),
+            timeout=cx.get("timeout", 600),
+            model=cx.get("model", "auto"),
         )
 
     if b := data.get("chatgpt_browser"):
