@@ -57,7 +57,8 @@ class CodexCLIAgent(BaseAgent):
         self.command = command
         self.timeout = timeout
         self.work_dir = str(Path(work_dir).resolve())
-        self.codex_home = codex_home  # CODEX_HOME env var for this account
+        # Normalise codex_home to OS path (config may use forward slashes on Windows)
+        self.codex_home = str(Path(codex_home)) if codex_home else ""
 
     # ── BaseAgent interface ────────────────────────────────────────────────
 
@@ -109,11 +110,17 @@ class CodexCLIAgent(BaseAgent):
         cmd = [
             self.command, "exec",
             "--full-auto",
-            "--ephemeral" if not allow_writes else "--skip-git-repo-check",
             "-C", self.work_dir,
             "-o", output_file,
             "-",  # read prompt from stdin
         ]
+
+        if not allow_writes:
+            cmd.append("--ephemeral")
+
+        # Trust the working directory so Codex doesn't prompt for confirmation
+        # when running in a repo it hasn't seen before
+        cmd += ["-c", f"projects.'{self.work_dir}'.trust_level=trusted"]
 
         # Only override model if explicitly set (let Codex pick its default otherwise)
         if self.model and self.model not in ("auto", "default"):

@@ -448,11 +448,12 @@ class GenesisREPL:
             console.print("[red]Login did not complete. Account not added.[/red]")
             return
 
-        # Append to config.toml
+        # Append to config.toml — always use forward slashes (TOML requires it)
+        home_toml = str(Path(home)).replace("\\", "/")
         entry = (
             f"\n[[codex_cli.accounts]]\n"
             f'name = "{name}"\n'
-            f'home = "{home}"\n'
+            f'home = "{home_toml}"\n'
             f'model = "auto"\n'
         )
 
