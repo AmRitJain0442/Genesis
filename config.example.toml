@@ -1,45 +1,65 @@
 # Genesis Configuration
 # Run `genesis init` to install this at ~/.genesis/config.toml
+# Or run `genesis add-account` from the REPL to add Codex accounts interactively.
 #
 # No API keys required.
-# Both agents authenticate via their own CLIs using your Pro accounts.
+# Claude Code and Codex both authenticate via OAuth using your Pro accounts.
 
 [orchestrator]
-# The director: plans tasks, assigns workers, reviews results.
-# Claude Code is recommended here — it gives the best structured JSON output.
-provider = "claude-cli"          # "claude-cli" | "codex-cli"
-model = "claude-opus-4-6"        # or alias "opus"
+# Claude Code is recommended as orchestrator — best structured JSON reasoning.
+provider = "claude-cli"
+model = "claude-opus-4-6"   # or alias "opus"
 
 [worker]
-# The executor: writes code, docs, tests, configs.
-# Codex is recommended here — it can autonomously run commands and write files.
-provider = "codex-cli"           # "codex-cli" | "claude-cli"
-model = "auto"                   # "auto" = use your account's default model (gpt-5.4)
+# Codex is recommended as worker — autonomous code execution with shell access.
+provider = "codex-cli"
+model = "auto"              # uses your account's default (currently gpt-5.4)
 
 [claude_cli]
-# Requires: Claude Code installed + logged in (`claude login`)
-command = "claude"               # auto-detected from PATH
-timeout = 300                    # seconds to wait per call
+# Requires: Claude Code installed + logged in via `claude login`
+command = "claude"          # auto-detected from PATH
+timeout = 300               # seconds per call
 
 [codex_cli]
-# Requires: Codex CLI installed + logged in (`codex login`)
-command = "codex"                # auto-detected from PATH
-timeout = 600                    # codex tasks take longer (it runs code)
-model = "auto"                   # leave as "auto" to use your account default
+# Requires: Codex CLI installed + logged in via `codex login`
+command = "codex"           # auto-detected from PATH
+timeout = 600               # codex tasks take longer (it runs code)
+
+# ── Multiple Codex accounts ────────────────────────────────────────────────
+# Add one [[codex_cli.accounts]] block per ChatGPT Pro account.
+# Each account uses its own CODEX_HOME directory with a separate login session.
+# Accounts are automatically registered as workers named by their "name" field.
+# Run `genesis add-account` from the REPL to add accounts interactively.
+
+[[codex_cli.accounts]]
+name  = "codex-main"        # used as the worker key in Genesis
+home  = ""                  # empty = default ~/.codex (your current login)
+model = "auto"
+
+# Uncomment and fill in additional accounts:
+# [[codex_cli.accounts]]
+# name  = "codex-pro2"
+# home  = "C:/Users/amrit/.codex-pro2"   # CODEX_HOME for this account
+# model = "auto"
+#
+# [[codex_cli.accounts]]
+# name  = "codex-pro3"
+# home  = "C:/Users/amrit/.codex-pro3"
+# model = "auto"
 
 [chatgpt_browser]
-# Only needed if you want to drive ChatGPT via the web UI instead of Codex CLI.
+# Only needed if you want to drive ChatGPT via the web UI.
 # Requires: pip install playwright && playwright install chromium
 enabled = false
 
 [git]
-auto_commit = true               # commit after each approved step
-auto_push = false                # push after each commit
-remote = "origin"
-branch = "main"
+auto_commit = true
+auto_push   = false
+remote        = "origin"
+branch        = "main"
 commit_prefix = "[genesis]"
 
 [memory]
-file = "GENESIS_MEMORY.md"       # created in the current working directory
+file              = "GENESIS_MEMORY.md"
 max_context_chars = 6000
-auto_append_plan = true
+auto_append_plan  = true

@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(python:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(codex login:*)",
+      "Bash(1 echo:*)",
+      "Read(//c/Users/amrit/.codex/**)"
     ]
   }
 }

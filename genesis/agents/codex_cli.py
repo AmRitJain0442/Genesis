@@ -38,6 +38,11 @@ class CodexCLIAgent(BaseAgent):
        Codex can create/modify files directly in the project directory.
        Used by CodexWorker. Returns the last agent message (a summary of
        what was done).
+
+    Pass codex_home to isolate a specific ChatGPT Pro account:
+        agent = CodexCLIAgent(..., codex_home="C:/Users/amrit/.codex-account2")
+    This sets CODEX_HOME when invoking the CLI, pointing it at a different
+    auth.json so multiple accounts can be used simultaneously.
     """
 
     def __init__(
@@ -46,11 +51,13 @@ class CodexCLIAgent(BaseAgent):
         command: str = "codex",
         timeout: int = 600,
         work_dir: str = ".",
+        codex_home: str = "",   # empty = use system default (~/.codex)
     ):
         super().__init__(info)
         self.command = command
         self.timeout = timeout
         self.work_dir = str(Path(work_dir).resolve())
+        self.codex_home = codex_home  # CODEX_HOME env var for this account
 
     # ── BaseAgent interface ────────────────────────────────────────────────
 
@@ -121,7 +128,12 @@ class CodexCLIAgent(BaseAgent):
         if os.name == "nt" and cmd[0].lower().endswith((".cmd", ".bat")):
             cmd = ["cmd", "/c"] + cmd
 
-        logger.debug("codex cmd: %s", " ".join(cmd[:6]))
+        # Build env — inherit current env, add CODEX_HOME if this agent has one
+        env = os.environ.copy()
+        if self.codex_home:
+            env["CODEX_HOME"] = self.codex_home
+
+        logger.debug("codex cmd: %s (home=%s)", " ".join(cmd[:6]), self.codex_home or "default")
 
         try:
             result = subprocess.run(
@@ -131,6 +143,7 @@ class CodexCLIAgent(BaseAgent):
                 text=True,
                 timeout=self.timeout,
                 encoding="utf-8",
+                env=env,
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"Codex timed out after {self.timeout}s")

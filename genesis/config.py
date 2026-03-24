@@ -75,10 +75,18 @@ class ClaudeCLIConfig:
 
 
 @dataclass
+class CodexAccount:
+    name: str = "codex-main"
+    home: str = ""          # CODEX_HOME — empty = system default (~/.codex)
+    model: str = "auto"
+
+
+@dataclass
 class CodexCLIConfig:
     command: str = "codex"
     timeout: int = 600
-    model: str = "auto"   # "auto" = let Codex pick its default for your account
+    model: str = "auto"     # fallback model if no accounts are defined
+    accounts: list[CodexAccount] = field(default_factory=list)
 
 
 @dataclass
@@ -144,10 +152,19 @@ def load_config() -> GenesisConfig:
         )
 
     if cx := data.get("codex_cli"):
+        accounts = [
+            CodexAccount(
+                name=a.get("name", f"codex-{i+1}"),
+                home=a.get("home", ""),
+                model=a.get("model", "auto"),
+            )
+            for i, a in enumerate(cx.get("accounts", []))
+        ]
         cfg.codex_cli = CodexCLIConfig(
             command=cx.get("command", "codex"),
             timeout=cx.get("timeout", 600),
             model=cx.get("model", "auto"),
+            accounts=accounts,
         )
 
     if b := data.get("chatgpt_browser"):

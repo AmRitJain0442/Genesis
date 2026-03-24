@@ -12,7 +12,7 @@ from rich.markdown import Markdown
 from rich import box
 
 from genesis import __version__
-from genesis.config import get_config, CONFIG_FILE
+from genesis.config import get_config, CONFIG_FILE, CodexAccount
 from genesis.memory import MemoryManager
 from genesis.git_ops import GitManager
 from genesis.agents.base import AgentInfo, BaseAgent
@@ -38,8 +38,9 @@ _HELP = """\
   [bold cyan]git log[/bold cyan]                           Show recent Genesis commits
   [bold cyan]git commit[/bold cyan] [dim][message][/dim]             Manually commit current changes
   [bold cyan]agents[/bold cyan]                            List available agents
-  [bold cyan]switch orchestrator[/bold cyan] [dim]<claude-cli|chatgpt>[/dim]   Hot-swap orchestrator
-  [bold cyan]switch worker[/bold cyan] [dim]<claude-cli|chatgpt>[/dim]         Hot-swap worker
+  [bold cyan]switch orchestrator[/bold cyan] [dim]<claude-cli|codex-cli>[/dim]   Hot-swap orchestrator
+  [bold cyan]switch worker[/bold cyan] [dim]<claude-cli|codex-cli>[/dim]        Hot-swap worker
+  [bold cyan]add-account[/bold cyan]                       Add a Codex account interactively
   [bold cyan]help[/bold cyan]                              Show this help
   [bold cyan]clear[/bold cyan]                             Clear the terminal
   [bold cyan]exit[/bold cyan]                              Exit Genesis
@@ -89,32 +90,32 @@ class GenesisREPL:
                 timeout=cfg.claude_cli.timeout,
             )
 
-        # Codex CLI agents (no API key needed — uses `codex login` / ChatGPT Pro session)
-        if find_codex_binary():
-            codex_cmd = find_codex_binary()
-            codex_model = cfg.codex_cli.model if cfg.codex_cli.model != "auto" else ""
-            self._agents["codex-orchestrator"] = CodexCLIAgent(
-                AgentInfo(
-                    "codex-orchestrator",
-                    "codex-cli",
-                    codex_model or "auto",
-                    max_tokens=8096,
-                ),
-                command=codex_cmd,
-                timeout=cfg.codex_cli.timeout,
-                work_dir=self.work_dir,
-            )
-            self._agents["codex-worker"] = CodexCLIAgent(
-                AgentInfo(
-                    "codex-worker",
-                    "codex-cli",
-                    codex_model or "auto",
-                    max_tokens=8096,
-                ),
-                command=codex_cmd,
-                timeout=cfg.codex_cli.timeout,
-                work_dir=self.work_dir,
-            )
+        # Codex CLI agents (no API key — uses `codex login` / ChatGPT Pro OAuth)
+        codex_cmd = find_codex_binary()
+        if codex_cmd:
+            accounts = cfg.codex_cli.accounts or [
+                CodexAccount(name="codex-main", home="", model=cfg.codex_cli.model)
+            ]
+            for i, account in enumerate(accounts):
+                model = account.model if account.model != "auto" else "auto"
+                # Orchestrator slot: first account only (claude-cli preferred)
+                if i == 0:
+                    self._agents["codex-orchestrator"] = CodexCLIAgent(
+                        AgentInfo("codex-orchestrator", "codex-cli", model, max_tokens=8096),
+                        command=codex_cmd,
+                        timeout=cfg.codex_cli.timeout,
+                        work_dir=self.work_dir,
+                        codex_home=account.home,
+                    )
+                # Every account registers as a worker
+                worker_key = account.name if account.name else f"codex-worker-{i+1}"
+                self._agents[worker_key] = CodexCLIAgent(
+                    AgentInfo(worker_key, "codex-cli", model, max_tokens=8096),
+                    command=codex_cmd,
+                    timeout=cfg.codex_cli.timeout,
+                    work_dir=self.work_dir,
+                    codex_home=account.home,
+                )
 
         # ChatGPT browser agent (optional — requires playwright)
         if cfg.chatgpt_browser.enabled:
@@ -393,6 +394,82 @@ class GenesisREPL:
     def cmd_agents(self) -> None:
         self.cmd_status()
 
+    def cmd_add_account(self, args: list[str]) -> None:
+        """
+        Interactively add a new Codex account to ~/.genesis/config.toml.
+
+        Usage: add-account
+        """
+        import subprocess as _sp
+
+        console.print("\n[bold]Add a Codex Account[/bold]")
+        console.print("Each account needs its own CODEX_HOME directory.\n")
+
+        console.print("[cyan]Account name[/cyan] (e.g. codex-pro2): ", end="")
+        name = input().strip()
+        if not name:
+            console.print("[red]Name cannot be empty.[/red]")
+            return
+
+        default_home = str(Path.home() / f".codex-{name}")
+        console.print(f"[cyan]CODEX_HOME directory[/cyan] (default: {default_home}): ", end="")
+        home = input().strip() or default_home
+
+        home_path = Path(home)
+        if not home_path.exists():
+            home_path.mkdir(parents=True, exist_ok=True)
+            console.print(f"[green]Created directory:[/green] {home}")
+
+        console.print(f"\n[dim]Now logging in to Codex with CODEX_HOME={home}[/dim]")
+        console.print("[dim]A browser window will open — log in with your second ChatGPT account.[/dim]\n")
+
+        # Determine the codex binary
+        codex_cmd = find_codex_binary() or "codex"
+        env = os.environ.copy()
+        env["CODEX_HOME"] = home
+
+        login_cmd = [codex_cmd, "login"]
+        if os.name == "nt" and codex_cmd.lower().endswith((".cmd", ".bat")):
+            login_cmd = ["cmd", "/c"] + login_cmd
+
+        try:
+            _sp.run(login_cmd, env=env, check=False)
+        except Exception as e:
+            console.print(f"[red]Login failed: {e}[/red]")
+            return
+
+        # Verify login succeeded
+        status_cmd = [codex_cmd, "login", "status"]
+        if os.name == "nt" and codex_cmd.lower().endswith((".cmd", ".bat")):
+            status_cmd = ["cmd", "/c"] + status_cmd
+
+        check = _sp.run(status_cmd, env=env, capture_output=True, text=True)
+        if check.returncode != 0:
+            console.print("[red]Login did not complete. Account not added.[/red]")
+            return
+
+        # Append to config.toml
+        entry = (
+            f"\n[[codex_cli.accounts]]\n"
+            f'name = "{name}"\n'
+            f'home = "{home}"\n'
+            f'model = "auto"\n'
+        )
+
+        try:
+            with open(CONFIG_FILE, "a", encoding="utf-8") as f:
+                f.write(entry)
+            console.print(f"\n[green]✓ Account '{name}' added to config.[/green]")
+            console.print("[dim]Rebuilding agents…[/dim]")
+            from genesis.config import reset_config_cache
+            reset_config_cache()
+            self.config = get_config()
+            self._build_agents()
+            self.cmd_status()
+        except Exception as e:
+            console.print(f"[red]Failed to update config: {e}[/red]")
+            console.print(f"Add this manually to {CONFIG_FILE}:\n{entry}")
+
     def cmd_switch(self, args: list[str]) -> None:
         if len(args) < 2:
             console.print("Usage: switch [orchestrator|worker] [claude-cli|chatgpt]")
@@ -465,6 +542,8 @@ class GenesisREPL:
                 self.cmd_git(args)
             elif cmd in ("agents", "agent"):
                 self.cmd_agents()
+            elif cmd in ("add-account", "add_account", "addaccount"):
+                self.cmd_add_account(args)
             elif cmd == "switch":
                 self.cmd_switch(args)
             elif cmd == "clear":
