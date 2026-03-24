@@ -152,13 +152,13 @@ class ClaudeCodeCLIAgent(BaseAgent):
         if envelope.get("is_error"):
             raise RuntimeError(f"Claude CLI error response: {envelope}")
 
+        # --json-schema puts the validated object in "structured_output", not "result"
+        if json_schema:
+            structured = envelope.get("structured_output")
+            if structured is not None:
+                return json.dumps(structured)
+
         raw_result = envelope.get("result", "")
-
-        # If we used --json-schema, the result IS the JSON object
-        # Return it serialised so the caller can parse it uniformly
-        if json_schema and isinstance(raw_result, dict):
-            return json.dumps(raw_result)
-
         return raw_result if isinstance(raw_result, str) else json.dumps(raw_result)
 
     def ping(self) -> bool:

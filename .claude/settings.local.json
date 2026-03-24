@@ -8,7 +8,12 @@
       "Bash(1 echo:*)",
       "Read(//c/Users/amrit/.codex/**)",
       "Bash(claude --print --model claude-haiku-4-5-20251001 --output-format stream-json)",
-      "Bash(claude --print --model claude-haiku-4-5-20251001 --output-format stream-json --verbose)"
+      "Bash(claude --print --model claude-haiku-4-5-20251001 --output-format stream-json --verbose)",
+      "Bash(PYTHONUTF8=1 genesis status)",
+      "Bash(PYTHONUTF8=1 genesis)",
+      "Bash(echo \"Reply with the JSON: {\"\"test\"\": true}\")",
+      "Bash(claude --print --model claude-opus-4-6 --output-format json)",
+      "Bash(claude --print --model claude-opus-4-6 --output-format json --json-schema '{\"\"\"\"type\"\"\"\":\"\"\"\"object\"\"\"\",\"\"\"\"properties\"\"\"\":{\"\"\"\"foo\"\"\"\":{\"\"\"\"type\"\"\"\":\"\"\"\"string\"\"\"\"}},\"\"\"\"required\"\"\"\":[\"\"\"\"foo\"\"\"\"]}')"
     ]
   }
 }

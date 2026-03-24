@@ -591,7 +591,7 @@ class GenesisREPL:
                 f"[cyan]Agents:[/cyan]    {agents_line}\n"
                 f"[cyan]Active:[/cyan]    {agent_names}\n\n"
                 f"[dim]Type [bold]help[/bold] · [bold]run <task>[/bold] to start · [bold]exit[/bold] to quit[/dim]",
-                title="[bold magenta]◈ GENESIS[/bold magenta]",
+                title="[bold magenta]* GENESIS[/bold magenta]",
                 border_style="magenta",
                 padding=(1, 3),
             )
