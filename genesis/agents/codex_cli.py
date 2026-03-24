@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import logging
 from pathlib import Path
+from typing import Callable
 
 from genesis.agents.base import BaseAgent, AgentInfo
 
@@ -62,13 +63,14 @@ class CodexCLIAgent(BaseAgent):
 
     # ── BaseAgent interface ────────────────────────────────────────────────
 
-    def chat(self, system: str, messages: list[dict]) -> str:
+    def chat(self, system: str, messages: list[dict],
+             output_callback: Callable[[str], None] | None = None) -> str:
         """
         Pure text/JSON exchange — ephemeral, no file writes.
         Used for orchestrator planning and review calls.
         """
         prompt = self._build_prompt(system, messages)
-        return self._run(prompt, allow_writes=False)
+        return self._run(prompt, allow_writes=False, output_callback=output_callback)
 
     def ping(self) -> bool:
         try:
@@ -80,12 +82,13 @@ class CodexCLIAgent(BaseAgent):
 
     # ── Worker-specific method ─────────────────────────────────────────────
 
-    def execute_task(self, prompt: str) -> str:
+    def execute_task(self, prompt: str,
+                     output_callback: Callable[[str], None] | None = None) -> str:
         """
         Autonomous execution — Codex can write files and run shell commands
         inside the workspace. Returns its final summary message.
         """
-        return self._run(prompt, allow_writes=True)
+        return self._run(prompt, allow_writes=True, output_callback=output_callback)
 
     # ── Internals ──────────────────────────────────────────────────────────
 
@@ -97,11 +100,14 @@ class CodexCLIAgent(BaseAgent):
                 parts.append(content)
         return "\n\n---\n\n".join(parts)
 
-    def _run(self, prompt: str, allow_writes: bool) -> str:
+    def _run(self, prompt: str, allow_writes: bool,
+             output_callback: Callable[[str], None] | None = None) -> str:
         """
         Run `codex exec` with the given prompt via stdin.
         Returns the last agent message text.
         """
+        if output_callback is not None:
+            return self._run_streaming(prompt, allow_writes, output_callback)
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False, encoding="utf-8"
         ) as tmp:
@@ -169,3 +175,115 @@ class CodexCLIAgent(BaseAgent):
             )
 
         return last_message or result.stdout.strip()
+
+    def _run_streaming(
+        self,
+        prompt: str,
+        allow_writes: bool,
+        output_callback: Callable[[str], None],
+    ) -> str:
+        """
+        Run `codex exec --json` and stream JSONL events to output_callback.
+        Returns the last agent_message content as the final result.
+        """
+        cmd = [
+            self.command, "exec",
+            "--full-auto",
+            "--json",
+            "-C", self.work_dir,
+            "-",
+        ]
+
+        if not allow_writes:
+            cmd.append("--ephemeral")
+
+        cmd += ["-c", f"projects.'{self.work_dir}'.trust_level=trusted"]
+
+        if self.model and self.model not in ("auto", "default"):
+            cmd += ["--model", self.model]
+
+        if allow_writes:
+            cmd += ["--sandbox", "workspace-write"]
+        else:
+            cmd += ["--sandbox", "read-only"]
+
+        if os.name == "nt" and cmd[0].lower().endswith((".cmd", ".bat")):
+            cmd = ["cmd", "/c"] + cmd
+
+        env = os.environ.copy()
+        if self.codex_home:
+            env["CODEX_HOME"] = self.codex_home
+
+        logger.debug("codex streaming cmd: %s (home=%s)", " ".join(cmd[:6]), self.codex_home or "default")
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            env=env,
+        )
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+
+        last_message = ""
+        try:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type", "")
+
+                if event_type == "item.completed":
+                    item = event.get("item", {})
+                    item_type = item.get("type", "")
+
+                    if item_type == "agent_message":
+                        content = item.get("content", "")
+                        if content:
+                            last_message = content
+                            output_callback(content)
+
+                    elif item_type == "command_execution":
+                        cmd_str = item.get("cmd", "")
+                        agg_out = item.get("aggregated_output", "").strip()
+                        exit_code = item.get("exit_code", 0)
+                        output_callback(f"[bold yellow]$ {cmd_str}[/bold yellow]")
+                        if agg_out:
+                            for out_line in agg_out.splitlines()[:5]:
+                                output_callback(f"  [dim]{out_line}[/dim]")
+                        if exit_code != 0:
+                            output_callback(f"  [red]exit {exit_code}[/red]")
+
+                    elif item_type == "file_change":
+                        path = item.get("path", "")
+                        mode = item.get("mode", "")
+                        icon = "+" if mode == "create" else "~"
+                        output_callback(f"[green]{icon} {path}[/green]")
+
+                elif event_type == "turn.completed":
+                    usage = event.get("usage", {})
+                    inp = usage.get("input_tokens", 0)
+                    cached = usage.get("cached_input_tokens", 0)
+                    out = usage.get("output_tokens", 0)
+                    output_callback(
+                        f"[dim]Tokens: in={inp} (cached={cached}) out={out}[/dim]"
+                    )
+        finally:
+            proc.wait()
+
+        if proc.returncode != 0 and not last_message:
+            stderr = proc.stderr.read().strip()
+            raise RuntimeError(f"Codex exited {proc.returncode}: {stderr[:400]}")
+
+        return last_message

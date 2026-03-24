@@ -13,6 +13,7 @@ import json
 import subprocess
 import logging
 import shutil
+from typing import Callable
 from genesis.agents.base import BaseAgent, AgentInfo
 
 logger = logging.getLogger(__name__)
@@ -87,8 +88,11 @@ class ClaudeCodeCLIAgent(BaseAgent):
 
     # ── Core chat method ───────────────────────────────────────────────────
 
-    def chat(self, system: str, messages: list[dict]) -> str:
+    def chat(self, system: str, messages: list[dict],
+             output_callback: Callable[[str], None] | None = None) -> str:
         prompt = self._build_prompt(system, messages)
+        if output_callback is not None:
+            return self._call_streaming(prompt, output_callback)
         return self._call(prompt)
 
     # ── Specialised methods for orchestrator use ───────────────────────────
@@ -164,3 +168,77 @@ class ClaudeCodeCLIAgent(BaseAgent):
         except Exception as e:
             logger.warning("ping failed: %s", e)
             return False
+
+    def _call_streaming(self, prompt: str, output_callback: Callable[[str], None]) -> str:
+        """
+        Run Claude with --output-format stream-json --verbose, emit live events
+        to output_callback, and return the final result text.
+        """
+        cmd = [
+            self.command,
+            "--print",
+            "--model", self.model,
+            "--output-format", "stream-json",
+            "--verbose",
+        ]
+
+        logger.debug("Claude streaming cmd: %s", " ".join(cmd[:5]))
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+
+        result_text = ""
+        try:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type", "")
+
+                if event_type == "assistant":
+                    for block in event.get("message", {}).get("content", []):
+                        btype = block.get("type", "")
+                        if btype == "thinking":
+                            thinking = block.get("thinking", "")
+                            if thinking:
+                                preview = thinking[:120].replace("\n", " ")
+                                suffix = "…" if len(thinking) > 120 else ""
+                                output_callback(f"[dim]💭 {preview}{suffix}[/dim]")
+                        elif btype == "text":
+                            text = block.get("text", "")
+                            if text:
+                                output_callback(text)
+
+                elif event_type == "result":
+                    usage = event.get("usage", {})
+                    cost = event.get("total_cost_usd", 0.0)
+                    inp = usage.get("input_tokens", 0)
+                    out = usage.get("output_tokens", 0)
+                    output_callback(
+                        f"[dim]Tokens: in={inp} out={out} | ${cost:.4f}[/dim]"
+                    )
+                    result_text = event.get("result", "")
+        finally:
+            proc.wait()
+
+        if proc.returncode != 0 and not result_text:
+            err = proc.stderr.read().strip()
+            raise RuntimeError(f"Claude CLI exited {proc.returncode}: {err[:400]}")
+
+        return result_text

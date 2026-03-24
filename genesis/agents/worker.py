@@ -3,7 +3,7 @@ import re
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from genesis.agents.base import BaseAgent
@@ -76,15 +76,21 @@ class WorkerResult:
 
 
 class Worker:
-    def __init__(self, agent: BaseAgent, memory_summary: str, work_dir: str = "."):
+    def __init__(self, agent: BaseAgent, memory_summary: str, work_dir: str = ".",
+                 output_callback: Callable[[str], None] | None = None):
         self.agent = agent
         self.memory_summary = memory_summary
         self.work_dir = Path(work_dir)
+        self.output_callback = output_callback
 
     def execute(self, step: Step) -> WorkerResult:
         user_msg = self._build_message(step)
         try:
-            raw = self.agent.chat(_SYSTEM, [{"role": "user", "content": user_msg}])
+            raw = self.agent.chat(
+                _SYSTEM,
+                [{"role": "user", "content": user_msg}],
+                output_callback=self.output_callback,
+            )
             return self._parse(raw, step)
         except Exception as e:
             logger.error("Worker error on %s: %s", step.step_id, e)

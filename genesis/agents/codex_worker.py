@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from genesis.agents.codex_cli import CodexCLIAgent
@@ -56,10 +56,12 @@ class CodexWorker:
         agent: CodexCLIAgent,
         memory_summary: str,
         work_dir: str = ".",
+        output_callback: Callable[[str], None] | None = None,
     ):
         self.agent = agent
         self.memory_summary = memory_summary
         self.work_dir = Path(work_dir).resolve()
+        self.output_callback = output_callback
 
     def execute(self, step: Step) -> WorkerResult:
         prompt = _WORKER_PROMPT_TEMPLATE.format(
@@ -76,7 +78,7 @@ class CodexWorker:
         before = self._snapshot()
 
         try:
-            summary = self.agent.execute_task(prompt)
+            summary = self.agent.execute_task(prompt, output_callback=self.output_callback)
         except Exception as e:
             logger.error("CodexWorker error on %s: %s", step.step_id, e)
             return WorkerResult(

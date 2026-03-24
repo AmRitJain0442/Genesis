@@ -15,16 +15,18 @@ if TYPE_CHECKING:
     from genesis.agents.base import BaseAgent
 
 
-def _make_worker(agent: BaseAgent, memory_summary: str, work_dir: str):
+def _make_worker(agent: BaseAgent, memory_summary: str, work_dir: str,
+                 output_callback=None):
     """Return the right worker type for the given agent."""
     try:
         from genesis.agents.codex_cli import CodexCLIAgent
         from genesis.agents.codex_worker import CodexWorker
         if isinstance(agent, CodexCLIAgent):
-            return CodexWorker(agent, memory_summary, work_dir)
+            return CodexWorker(agent, memory_summary, work_dir,
+                               output_callback=output_callback)
     except ImportError:
         pass
-    return Worker(agent, memory_summary, work_dir)
+    return Worker(agent, memory_summary, work_dir, output_callback=output_callback)
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +150,7 @@ class Orchestrator:
 
     def run_task(self, task: str, callbacks: dict[str, Callable] | None = None) -> None:
         cb = callbacks or {}
+        output_callback = cb.get("on_output")
 
         def fire(name: str, *args, **kwargs) -> None:
             if fn := cb.get(name):
@@ -172,7 +175,8 @@ class Orchestrator:
             fire("on_worker_assigned", step, worker_name)
 
             mem_summary = self.memory.get_summary(self.config.memory.max_context_chars)
-            worker = _make_worker(worker_agent, mem_summary, self.work_dir)
+            worker = _make_worker(worker_agent, mem_summary, self.work_dir,
+                                  output_callback=output_callback)
 
             result = worker.execute(step)
 

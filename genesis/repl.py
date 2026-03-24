@@ -243,7 +243,7 @@ class GenesisREPL:
             with Live(
                 make_layout(state),
                 console=console,
-                refresh_per_second=4,
+                refresh_per_second=8,
                 screen=False,
             ) as live:
                 def make_cb(fn):
@@ -253,6 +253,14 @@ class GenesisREPL:
                     return wrapped
 
                 callbacks = {k: make_cb(v) for k, v in raw_callbacks.items()}
+
+                # on_output fires very frequently (every streaming line) — just
+                # update state without forcing a redraw; Live's timer handles it.
+                def on_output(line: str) -> None:
+                    state.add_output(f"  {line}")
+
+                callbacks["on_output"] = on_output
+
                 orchestrator.run_task(task, callbacks)
 
         except KeyboardInterrupt:
