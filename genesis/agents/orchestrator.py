@@ -36,8 +36,9 @@ You are Genesis Orchestrator — the director of an AI software development firm
 Your two responsibilities are PLANNING and REVIEWING.
 
 Available worker agents:
-- claude-worker: Best for nuanced code, system design, complex reasoning, documentation.
-- gpt-worker: Best for structured output, boilerplate, tests, and config files.
+- codex-worker: Autonomous code executor — writes files and runs shell commands directly.
+  Use for ALL implementation, tests, config, and refactor tasks.
+- claude-worker: Reserved — only specify if no codex worker is available.
 
 ━━━ PLANNING ━━━
 When asked to plan a task, return ONLY a JSON object — no prose before or after:
@@ -52,7 +53,7 @@ When asked to plan a task, return ONLY a JSON object — no prose before or afte
       "title": "<≤60 chars>",
       "description": "<detailed instructions for the worker — be precise>",
       "type": "<code|docs|review|research|test|config|refactor>",
-      "preferred_agent": "<claude-worker|gpt-worker|any>",
+      "preferred_agent": "<codex-worker|any>",
       "depends_on": [],
       "expected_output": "<description of what success looks like>",
       "context_hint": "<optional: file paths, constraints, examples>"
@@ -235,20 +236,17 @@ class Orchestrator:
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _assign_worker(self, step: Step) -> tuple[str, BaseAgent]:
-        if step.preferred_agent != "any" and step.preferred_agent in self.worker_agents:
-            return step.preferred_agent, self.worker_agents[step.preferred_agent]
+        # Direct match by exact key name
+        if step.preferred_agent not in ("any", "codex-worker", "claude-worker"):
+            if step.preferred_agent in self.worker_agents:
+                return step.preferred_agent, self.worker_agents[step.preferred_agent]
 
-        # Heuristic: Claude for code/design, GPT for tests/config/boilerplate
-        if step.type in ("code", "refactor", "review", "docs"):
-            for name in ("claude-worker", "gpt-worker"):
-                if name in self.worker_agents:
-                    return name, self.worker_agents[name]
-        else:
-            for name in ("gpt-worker", "claude-worker"):
-                if name in self.worker_agents:
-                    return name, self.worker_agents[name]
+        # Always prefer Codex workers — keep Claude for orchestration only
+        for name, agent in self.worker_agents.items():
+            if "claude" not in name.lower():
+                return name, agent
 
-        # Fallback
+        # Fallback: use whatever is available
         name, agent = next(iter(self.worker_agents.items()))
         return name, agent
 

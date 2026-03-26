@@ -73,7 +73,7 @@ class GenesisREPL:
                 AgentInfo(
                     "claude-cli-orchestrator",
                     "claude-cli",
-                    cfg.orchestrator.model if self._orch_provider == "claude-cli" else "claude-opus-4-6",
+                    cfg.orchestrator.model if self._orch_provider == "claude-cli" else "claude-sonnet-4-6",
                     max_tokens=8096,
                 ),
                 command=cmd,
@@ -149,7 +149,7 @@ class GenesisREPL:
         return None
 
     def _get_workers(self) -> dict[str, BaseAgent]:
-        return {k: v for k, v in self._agents.items() if "worker" in k}
+        return {k: v for k, v in self._agents.items() if "orchestrator" not in k}
 
     def _make_orchestrator(self) -> Orchestrator | None:
         orch = self._get_orchestrator()

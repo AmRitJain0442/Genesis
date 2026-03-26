@@ -8,7 +8,7 @@ class Step(BaseModel):
     title: str
     description: str
     type: Literal["code", "docs", "review", "research", "test", "config", "refactor"]
-    preferred_agent: Literal["claude-worker", "gpt-worker", "any"] = "any"
+    preferred_agent: str = "any"
     depends_on: list[str] = Field(default_factory=list)
     expected_output: str
     context_hint: str = ""

@@ -37,7 +37,7 @@ _PLAN_SCHEMA = json.dumps({
                     "title":          {"type": "string"},
                     "description":    {"type": "string"},
                     "type":           {"type": "string"},
-                    "preferred_agent":{"type": "string"},
+                    "preferred_agent":{"type": "string", "default": "any"},
                     "depends_on":     {"type": "array", "items": {"type": "string"}},
                     "expected_output":{"type": "string"},
                     "context_hint":   {"type": "string"},
