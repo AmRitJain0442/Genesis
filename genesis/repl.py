@@ -174,8 +174,10 @@ class GenesisREPL:
             )
             return
 
-        state = DashboardState()
-        state.task_name = task[:70] + ("…" if len(task) > 70 else "")
+        from datetime import datetime as _dt
+        all_agent_names = list(self._agents.keys())
+        state = DashboardState(agent_names=all_agent_names)
+        state.task_name = task[:80] + ("..." if len(task) > 80 else "")
 
         # ── Callback closures ────────────────────────────────────────────
         def on_plan(plan):
@@ -186,43 +188,53 @@ class GenesisREPL:
 
         def on_step_start(step, idx, total):
             state.current_step = step.step_id
+            state.step_start = _dt.now()
             state.step_statuses[step.step_id] = "running"
-            state.add_output(f"[cyan]→[/cyan] [bold]{step.step_id}[/bold]: {step.title}")
+            state.add_output(f"[cyan]>[/cyan] [bold]{step.step_id}[/bold]: {step.title}")
 
         def on_worker_assigned(step, worker_name):
-            state.add_output(f"  [dim]assigned → {worker_name}[/dim]")
+            state.current_worker = worker_name
+            state.add_output(f"  [dim]worker: {worker_name}[/dim]")
 
         def on_step_result(step, result, worker_name):
             if result.files_written:
-                flist = ", ".join(result.files_written)
-                state.add_output(f"  [green]wrote:[/green] {flist}")
+                for f in result.files_written:
+                    state.add_output(f"  [green]+[/green] {f}")
 
         def on_review(step, review):
             color = "green" if review.verdict == "approved" else "yellow" if review.verdict == "needs_revision" else "red"
-            icon = "✓" if review.verdict == "approved" else "⚠" if review.verdict == "needs_revision" else "✗"
+            icon  = "+" if review.verdict == "approved" else "~" if review.verdict == "needs_revision" else "x"
             state.add_output(
-                f"  [{color}]{icon}[/{color}] {review.verdict} "
-                f"[dim]({review.quality_score}/10)[/dim]"
+                f"  [{color}]{icon} {review.verdict}[/{color}] "
+                f"[dim]score:{review.quality_score}/10[/dim]"
             )
             state.step_statuses[step.step_id] = review.verdict
 
         def on_commit(step, sha):
             if sha:
                 state.git_sha = sha
-                state.add_output(f"  [dim]committed {sha}[/dim]")
+                state.add_output(f"  [dim]git:{sha}[/dim]")
 
         def on_step_complete(step, review, completed, total):
             state.completed = completed
+            if state.step_start:
+                elapsed = (_dt.now() - state.step_start).total_seconds()
+                state.step_elapsed[step.step_id] = elapsed
+            state.step_start = None
+            state.current_worker = ""
 
         def on_status(msg):
             state.add_output(f"[dim]{msg}[/dim]")
 
         def on_error(step, error):
-            state.add_output(f"  [red]✗ {error}[/red]")
+            state.add_output(f"  [red]x {error}[/red]")
             state.step_statuses[step.step_id] = "rejected"
+            state.current_worker = ""
 
         def on_task_complete(plan):
-            state.add_output(f"\n[bold green]✓ Task complete — {state.completed}/{state.total} steps[/bold green]")
+            state.add_output(
+                f"\n[bold green]+ Task complete  {state.completed}/{state.total} steps[/bold green]"
+            )
 
         # ── Wire callbacks to also refresh the Live display ──────────────
         raw_callbacks = {
@@ -253,10 +265,12 @@ class GenesisREPL:
 
                 callbacks = {k: make_cb(v) for k, v in raw_callbacks.items()}
 
-                # on_output fires very frequently (every streaming line) — just
-                # update state without forcing a redraw; Live's timer handles it.
+                # on_output fires on every streaming line — update state only;
+                # Live's timer handles redraw. Also extract token counts.
                 def on_output(line: str) -> None:
                     state.add_output(f"  {line}")
+                    if "Tokens:" in line:
+                        state.record_token_line(line)
 
                 callbacks["on_output"] = on_output
 
