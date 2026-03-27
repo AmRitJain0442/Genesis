@@ -240,8 +240,7 @@ class ClaudeCodeCLIAgent(BaseAgent):
                     output_callback(
                         f"[dim]Tokens: in={inp} out={out} | ${cost:.4f}[/dim]"
                     )
-                    # Fall back to accumulated text blocks if result field is empty
-                    result_text = event.get("result", "") or "".join(accumulated_text)
+                    result_text = event.get("result") or ""
         finally:
             try:
                 proc.wait(timeout=10)
@@ -249,8 +248,15 @@ class ClaudeCodeCLIAgent(BaseAgent):
                 proc.kill()
                 proc.wait()
 
-        if proc.returncode != 0 and not result_text:
+        # Always prefer the joined text blocks — they are the raw model output and
+        # avoid any post-processing the CLI applies to the result field.
+        # Fall back to result field if no text blocks were collected.
+        final_text = "".join(accumulated_text) or result_text
+
+        if proc.returncode != 0 and not final_text:
             err = proc.stderr.read().strip()
             raise RuntimeError(f"Claude CLI exited {proc.returncode}: {err[:400]}")
 
-        return result_text
+        logger.debug("_call_streaming: accumulated=%d chars, result=%d chars",
+                     len("".join(accumulated_text)), len(result_text))
+        return final_text

@@ -110,21 +110,43 @@ class Orchestrator:
 
     def plan(self, task: str) -> Plan:
         mem = self.memory.get_summary(self.config.memory.max_context_chars)
-        msg = (
+        base_msg = (
             f"CURRENT MEMORY CONTEXT:\n{mem}\n\n---\n\n"
             f"TASK TO PLAN:\n{task}\n\n"
-            f"Return the plan as JSON."
+            f"Return the plan as JSON. Output ONLY the JSON object — "
+            f"start your response with {{ and end with }}. No preamble, no explanation."
         )
-        if hasattr(self.agent, "chat_plan"):
-            raw = self.agent.chat_plan(_SYSTEM, [{"role": "user", "content": msg}])
-        else:
-            raw = self.agent.chat(_SYSTEM, [{"role": "user", "content": msg}])
-        if not raw or not raw.strip():
-            raise ValueError("Orchestrator returned empty plan response — check Claude CLI connection")
-        data = self._extract_json(raw)
-        if not data.get("task_id"):
-            data["task_id"] = str(uuid.uuid4())[:8]
-        return Plan(**data)
+
+        last_err: Exception | None = None
+        for attempt in range(2):
+            msg = base_msg if attempt == 0 else (
+                base_msg + "\n\nIMPORTANT: your previous response could not be parsed. "
+                "Output ONLY the raw JSON object. No prose, no markdown fences, no code blocks. "
+                "Begin with { and end with }."
+            )
+            if hasattr(self.agent, "chat_plan"):
+                raw = self.agent.chat_plan(_SYSTEM, [{"role": "user", "content": msg}])
+            else:
+                raw = self.agent.chat(_SYSTEM, [{"role": "user", "content": msg}])
+
+            if not raw or not raw.strip():
+                last_err = ValueError("Empty plan response from orchestrator")
+                logger.warning("Empty plan response on attempt %d", attempt + 1)
+                continue
+
+            try:
+                data = self._extract_json(raw)
+            except ValueError as e:
+                last_err = e
+                logger.warning("Plan JSON parse failed (attempt %d): %s", attempt + 1, e)
+                self._dump_debug("plan_raw", raw)
+                continue
+
+            if not data.get("task_id"):
+                data["task_id"] = str(uuid.uuid4())[:8]
+            return Plan(**data)
+
+        raise ValueError(f"Could not parse plan after 2 attempts: {last_err}")
 
     def review(self, step: Step, result: WorkerResult) -> Review:
         # Read actual file contents so Claude reviews real code, not just a summary.
@@ -280,6 +302,20 @@ class Orchestrator:
         # Fallback: use whatever is available
         name, agent = next(iter(self.worker_agents.items()))
         return name, agent
+
+    @staticmethod
+    def _dump_debug(label: str, content: str) -> None:
+        """Write full content to genesis_debug.txt for diagnosis."""
+        import os, datetime
+        path = os.path.join(os.getcwd(), "genesis_debug.txt")
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*60}\n[{ts}] {label} ({len(content)} chars)\n{'='*60}\n")
+                f.write(content)
+                f.write("\n")
+        except OSError:
+            pass
 
     @staticmethod
     def _extract_json(raw: str) -> dict:
