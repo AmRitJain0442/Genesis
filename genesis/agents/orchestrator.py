@@ -162,6 +162,9 @@ class Orchestrator:
         plan = self.plan(task)
         fire("on_plan", plan)
 
+        if not plan.steps:
+            raise ValueError("Orchestrator returned an empty plan — no steps to execute.")
+
         if self.config.memory.auto_append_plan:
             self.memory.append_plan(plan)
 
@@ -206,6 +209,7 @@ class Orchestrator:
                     )
                 })
                 result = worker.execute(revised)
+                fire("on_step_result", step, result, worker_name)
                 review = self.review(revised, result)
                 fire("on_review", step, review)
 
@@ -236,6 +240,9 @@ class Orchestrator:
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _assign_worker(self, step: Step) -> tuple[str, BaseAgent]:
+        if not self.worker_agents:
+            raise RuntimeError("No worker agents available")
+
         # Direct match by exact key name
         if step.preferred_agent not in ("any", "codex-worker", "claude-worker"):
             if step.preferred_agent in self.worker_agents:
@@ -266,24 +273,33 @@ class Orchestrator:
         # Find the outermost braces
         start = text.find("{")
         end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            text = text[start:end]
+        if start < 0 or end <= start:
+            raise ValueError(f"No JSON object found in response: {raw[:300]!r}")
+        text = text[start:end]
 
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in response: {e}. Raw: {raw[:300]!r}") from e
 
 
 def _topo_sort(steps: list[Step]) -> list[Step]:
-    """Return steps in dependency order via iterative DFS."""
+    """Return steps in dependency order via DFS with cycle detection."""
     by_id = {s.step_id: s for s in steps}
     result: list[Step] = []
     visited: set[str] = set()
+    visiting: set[str] = set()  # current DFS path — detects cycles
 
     def visit(step: Step) -> None:
         if step.step_id in visited:
             return
+        if step.step_id in visiting:
+            raise ValueError(f"Circular dependency detected involving step '{step.step_id}'")
+        visiting.add(step.step_id)
         for dep_id in step.depends_on:
             if dep := by_id.get(dep_id):
                 visit(dep)
+        visiting.discard(step.step_id)
         visited.add(step.step_id)
         result.append(step)
 

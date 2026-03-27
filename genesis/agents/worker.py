@@ -133,6 +133,9 @@ class Worker:
             lang, filename, content = match.group(1), match.group(2), match.group(3)
             # Strip one leading newline that models typically add after the tag
             content = content.lstrip("\n")
+            if not content.strip():
+                logger.warning("Skipping empty code block for %s", filename)
+                continue
             code_blocks.append(CodeBlock(language=lang, filename=filename, content=content))
 
             dest = self.work_dir / filename

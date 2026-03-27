@@ -235,7 +235,11 @@ class ClaudeCodeCLIAgent(BaseAgent):
                     )
                     result_text = event.get("result", "")
         finally:
-            proc.wait()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
         if proc.returncode != 0 and not result_text:
             err = proc.stderr.read().strip()

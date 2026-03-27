@@ -113,6 +113,9 @@ class CodexCLIAgent(BaseAgent):
         ) as tmp:
             output_file = tmp.name
 
+        # Escape single quotes in work_dir so they don't break the -c config string
+        safe_work_dir = self.work_dir.replace("'", "\\'")
+
         cmd = [
             self.command, "exec",
             "--full-auto",
@@ -126,7 +129,7 @@ class CodexCLIAgent(BaseAgent):
 
         # Trust the working directory so Codex doesn't prompt for confirmation
         # when running in a repo it hasn't seen before
-        cmd += ["-c", f"projects.'{self.work_dir}'.trust_level=trusted"]
+        cmd += ["-c", f"projects.'{safe_work_dir}'.trust_level=trusted"]
 
         # Only override model if explicitly set (let Codex pick its default otherwise)
         if self.model and self.model not in ("auto", "default"):
@@ -148,33 +151,32 @@ class CodexCLIAgent(BaseAgent):
 
         logger.debug("codex cmd: %s (home=%s)", " ".join(cmd[:6]), self.codex_home or "default")
 
-        try:
-            result = subprocess.run(
-                cmd,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                encoding="utf-8",
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"Codex timed out after {self.timeout}s")
-
-        # Read the last-message output file
         output_path = Path(output_file)
-        last_message = ""
-        if output_path.exists():
-            last_message = output_path.read_text(encoding="utf-8").strip()
+        try:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    encoding="utf-8",
+                    env=env,
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"Codex timed out after {self.timeout}s")
+
+            last_message = ""
+            if output_path.exists():
+                last_message = output_path.read_text(encoding="utf-8").strip()
+
+            if result.returncode != 0 and not last_message:
+                stderr = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(f"Codex exited {result.returncode}: {stderr[:400]}")
+
+            return last_message or result.stdout.strip()
+        finally:
             output_path.unlink(missing_ok=True)
-
-        if result.returncode != 0 and not last_message:
-            stderr = result.stderr.strip() or result.stdout.strip()
-            raise RuntimeError(
-                f"Codex exited {result.returncode}: {stderr[:400]}"
-            )
-
-        return last_message or result.stdout.strip()
 
     def _run_streaming(
         self,
@@ -186,6 +188,8 @@ class CodexCLIAgent(BaseAgent):
         Run `codex exec --json` and stream JSONL events to output_callback.
         Returns the last agent_message content as the final result.
         """
+        safe_work_dir = self.work_dir.replace("'", "\\'")
+
         cmd = [
             self.command, "exec",
             "--full-auto",
@@ -197,7 +201,7 @@ class CodexCLIAgent(BaseAgent):
         if not allow_writes:
             cmd.append("--ephemeral")
 
-        cmd += ["-c", f"projects.'{self.work_dir}'.trust_level=trusted"]
+        cmd += ["-c", f"projects.'{safe_work_dir}'.trust_level=trusted"]
 
         if self.model and self.model not in ("auto", "default"):
             cmd += ["--model", self.model]
@@ -225,10 +229,14 @@ class CodexCLIAgent(BaseAgent):
             encoding="utf-8",
             env=env,
         )
+
+        # Write prompt and close stdin — guard against broken pipe on early exit
         try:
-            proc.stdin.write(prompt)
-            proc.stdin.close()
-        except BrokenPipeError:
+            try:
+                proc.stdin.write(prompt)
+            finally:
+                proc.stdin.close()
+        except (BrokenPipeError, OSError):
             pass
 
         last_message = ""
@@ -242,37 +250,42 @@ class CodexCLIAgent(BaseAgent):
                 except json.JSONDecodeError:
                     continue
 
+                if not isinstance(event, dict):
+                    continue
+
                 event_type = event.get("type", "")
 
                 if event_type == "item.completed":
-                    item = event.get("item", {})
+                    item = event.get("item")
+                    if not isinstance(item, dict):
+                        continue
                     item_type = item.get("type", "")
 
                     if item_type == "agent_message":
-                        content = item.get("content", "")
-                        if content:
+                        content = item.get("content") or ""
+                        if isinstance(content, str) and content:
                             last_message = content
                             output_callback(content)
 
                     elif item_type == "command_execution":
-                        cmd_str = item.get("cmd", "")
-                        agg_out = item.get("aggregated_output", "").strip()
+                        cmd_str = item.get("cmd") or ""
+                        agg_out = item.get("aggregated_output") or ""
                         exit_code = item.get("exit_code", 0)
                         output_callback(f"[bold yellow]$ {cmd_str}[/bold yellow]")
-                        if agg_out:
-                            for out_line in agg_out.splitlines()[:5]:
+                        if isinstance(agg_out, str) and agg_out.strip():
+                            for out_line in agg_out.strip().splitlines()[:5]:
                                 output_callback(f"  [dim]{out_line}[/dim]")
                         if exit_code != 0:
                             output_callback(f"  [red]exit {exit_code}[/red]")
 
                     elif item_type == "file_change":
-                        path = item.get("path", "")
-                        mode = item.get("mode", "")
+                        path = item.get("path") or ""
+                        mode = item.get("mode") or ""
                         icon = "+" if mode == "create" else "~"
                         output_callback(f"[green]{icon} {path}[/green]")
 
                 elif event_type == "turn.completed":
-                    usage = event.get("usage", {})
+                    usage = event.get("usage") or {}
                     inp = usage.get("input_tokens", 0)
                     cached = usage.get("cached_input_tokens", 0)
                     out = usage.get("output_tokens", 0)
@@ -280,7 +293,11 @@ class CodexCLIAgent(BaseAgent):
                         f"[dim]Tokens: in={inp} (cached={cached}) out={out}[/dim]"
                     )
         finally:
-            proc.wait()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
         if proc.returncode != 0 and not last_message:
             stderr = proc.stderr.read().strip()

@@ -25,15 +25,19 @@ class MemoryManager:
         return self.path.read_text(encoding="utf-8")
 
     def get_summary(self, max_chars: int = 6000) -> str:
-        """Return the last `max_chars` characters, trimmed to a line boundary."""
+        """Return the last `max_chars` characters, trimmed to a paragraph boundary."""
         content = self.read()
         if len(content) <= max_chars:
             return content
         truncated = content[-max_chars:]
-        # Trim to the next newline so we don't start mid-sentence
-        idx = truncated.find("\n")
+        # Prefer a paragraph break (double newline) to avoid splitting mid-section
+        idx = truncated.find("\n\n")
         if idx > 0:
-            truncated = truncated[idx + 1:]
+            truncated = truncated[idx + 2:]
+        else:
+            idx = truncated.find("\n")
+            if idx > 0:
+                truncated = truncated[idx + 1:]
         return "[...earlier context truncated...]\n\n" + truncated
 
     def append_plan(self, plan: Plan) -> None:

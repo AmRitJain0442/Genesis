@@ -45,10 +45,13 @@ class GitManager:
             return None
 
     def push(self) -> bool:
-        if not self._available:
+        if not self._available or self.repo is None:
             return False
         try:
-            remote = self.repo.remotes[self.config.remote]
+            if self.config.remote not in [r.name for r in self.repo.remotes]:
+                logger.warning("Remote '%s' not found — skipping push", self.config.remote)
+                return False
+            remote = self.repo.remote(self.config.remote)
             remote.push(self.config.branch)
             return True
         except Exception as e:
