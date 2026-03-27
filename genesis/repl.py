@@ -1,6 +1,5 @@
 from __future__ import annotations
 import os
-import shlex
 import logging
 from pathlib import Path
 
@@ -524,37 +523,49 @@ class GenesisREPL:
             if not line:
                 continue
 
-            try:
-                parts = shlex.split(line)
-            except ValueError:
-                parts = line.split()
+            # Split only on the first word — everything after is raw text.
+            # This lets users paste prompts with quotes, apostrophes, etc.
+            first_space = line.find(" ")
+            if first_space == -1:
+                cmd = line.lower()
+                rest = ""
+            else:
+                cmd = line[:first_space].lower()
+                rest = line[first_space + 1:].strip()
 
-            if not parts:
-                continue
-
-            cmd, args = parts[0].lower(), parts[1:]
+            # For sub-commands that need a second word (memory, config, git, switch)
+            # split just that second word off the rest.
+            def _split_sub(text: str) -> tuple[str, str]:
+                i = text.find(" ")
+                if i == -1:
+                    return text.lower(), ""
+                return text[:i].lower(), text[i + 1:].strip()
 
             if cmd in ("exit", "quit", "q"):
                 console.print("[dim]Goodbye.[/dim]")
                 break
             elif cmd == "run":
-                self.cmd_run(" ".join(args))
+                self.cmd_run(rest)
             elif cmd == "plan":
-                self.cmd_plan(" ".join(args))
+                self.cmd_plan(rest)
             elif cmd == "status":
                 self.cmd_status()
             elif cmd == "memory":
-                self.cmd_memory(args)
+                sub, sub_rest = _split_sub(rest)
+                self.cmd_memory([sub] + ([sub_rest] if sub_rest else []))
             elif cmd == "config":
-                self.cmd_config(args)
+                sub, _ = _split_sub(rest)
+                self.cmd_config([sub] if sub else [])
             elif cmd == "git":
-                self.cmd_git(args)
+                sub, sub_rest = _split_sub(rest)
+                self.cmd_git([sub] + ([sub_rest] if sub_rest else []))
             elif cmd in ("agents", "agent"):
                 self.cmd_agents()
             elif cmd in ("add-account", "add_account", "addaccount"):
-                self.cmd_add_account(args)
+                self.cmd_add_account([])
             elif cmd == "switch":
-                self.cmd_switch(args)
+                sub, sub_rest = _split_sub(rest)
+                self.cmd_switch([sub] + ([sub_rest] if sub_rest else []))
             elif cmd == "clear":
                 console.clear()
             elif cmd == "help":

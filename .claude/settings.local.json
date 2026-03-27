@@ -13,7 +13,8 @@
       "Bash(PYTHONUTF8=1 genesis)",
       "Bash(echo \"Reply with the JSON: {\"\"test\"\": true}\")",
       "Bash(claude --print --model claude-opus-4-6 --output-format json)",
-      "Bash(claude --print --model claude-opus-4-6 --output-format json --json-schema '{\"\"\"\"type\"\"\"\":\"\"\"\"object\"\"\"\",\"\"\"\"properties\"\"\"\":{\"\"\"\"foo\"\"\"\":{\"\"\"\"type\"\"\"\":\"\"\"\"string\"\"\"\"}},\"\"\"\"required\"\"\"\":[\"\"\"\"foo\"\"\"\"]}')"
+      "Bash(claude --print --model claude-opus-4-6 --output-format json --json-schema '{\"\"\"\"type\"\"\"\":\"\"\"\"object\"\"\"\",\"\"\"\"properties\"\"\"\":{\"\"\"\"foo\"\"\"\":{\"\"\"\"type\"\"\"\":\"\"\"\"string\"\"\"\"}},\"\"\"\"required\"\"\"\":[\"\"\"\"foo\"\"\"\"]}')",
+      "Bash(echo \"run create a file called ''''hello.py'''' that prints \"\"Hello, World!\"\" and it''''s simple\")"
     ]
   }
 }
