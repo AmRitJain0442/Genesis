@@ -16,21 +16,79 @@ When you type `run <task>`, Genesis:
 4. Approved steps are committed to git automatically
 5. Progress is written to `GENESIS_MEMORY.md` in the repository so the context accumulates across steps
 
-While workers execute you see a live four-panel terminal dashboard: the plan with step statuses, streaming agent output (shell commands, file writes, token counts), agent roster, and cumulative usage metrics.
+While workers execute you see a live terminal dashboard: the plan with step statuses, streaming agent output (shell commands, file writes, token counts), agent roster, and cumulative usage metrics.
 
 ---
 
-## Requirements
+## Setup
 
-- Windows 10 or 11
-- Python 3.10 or later
-- [Claude Code CLI](https://claude.ai/download) installed and logged in (`claude login`)
-- [Codex CLI](https://github.com/openai/codex) installed and logged in (`codex login`)
-- A git repository to work in (Genesis operates on the current directory)
+Follow these steps in order. Do not skip any step.
+
+### Step 1 — Install Python
+
+Download and install Python 3.10 or later from https://python.org/downloads
+
+During installation, check the box that says **"Add Python to PATH"**.
+
+Verify it works:
+
+```
+python --version
+```
+
+You should see `Python 3.10.x` or higher.
 
 ---
 
-## Installation
+### Step 2 — Install Claude Code CLI
+
+Claude Code is the CLI for your Claude Pro subscription.
+
+Download and install it from https://claude.ai/download
+
+After installation, log in with your Claude account:
+
+```
+claude login
+```
+
+A browser window will open. Sign in with the same account that has your Claude Pro subscription.
+
+Verify it works:
+
+```
+claude --version
+```
+
+---
+
+### Step 3 — Install Codex CLI
+
+Codex is the CLI for your ChatGPT Pro subscription.
+
+Install it via npm (requires Node.js 18+):
+
+```
+npm install -g @openai/codex
+```
+
+After installation, log in with your ChatGPT account:
+
+```
+codex login
+```
+
+A browser window will open. Sign in with the account that has your ChatGPT Pro subscription.
+
+Verify it works:
+
+```
+codex --version
+```
+
+---
+
+### Step 4 — Clone and install Genesis
 
 ```
 git clone https://github.com/yourname/genesis
@@ -38,62 +96,97 @@ cd genesis
 pip install -e .
 ```
 
-This installs a global `genesis` command available from any terminal.
+This installs a global `genesis` command. Verify it installed:
+
+```
+genesis --help
+```
 
 ---
 
-## Setup
-
-Initialize the config file:
+### Step 5 — Create the config file
 
 ```
 genesis init
 ```
 
-This creates `~/.genesis/config.toml`. Open it and verify the orchestrator model:
+This creates `~/.genesis/config.toml` with default settings. Open it in any text editor.
+
+Find the `[orchestrator]` section and make sure the model is set to `claude-sonnet-4-6`:
 
 ```toml
 [orchestrator]
 provider = "claude-cli"
 model    = "claude-sonnet-4-6"
+```
 
+Sonnet is recommended over Opus for the orchestrator because it has higher rate limits on Claude Pro.
+
+The `[worker]` section should be set to Codex:
+
+```toml
 [worker]
 provider = "codex-cli"
 model    = "auto"
 ```
 
-`claude-sonnet-4-6` is recommended for the orchestrator. It has higher rate limits on Claude Pro than Opus and is fast enough for planning and reviewing.
+Save and close the file.
 
 ---
 
-## Multiple Codex accounts
+### Step 6 — Verify everything is connected
 
-Each ChatGPT Pro account can be registered as a separate worker. Genesis isolates accounts using the `CODEX_HOME` environment variable, which points each Codex process at its own directory containing a separate `auth.json`.
+```
+genesis status
+```
 
-To add an account interactively:
+You should see output like:
+
+```
+Agents:   Claude Code  ·  Codex
+Active:   claude-cli-orchestrator, claude-cli-worker, codex-main
+```
+
+If Claude Code or Codex shows as missing, re-run `claude login` or `codex login` in the same terminal and try again.
+
+---
+
+### Step 7 (optional) — Add more Codex accounts
+
+If you have multiple ChatGPT Pro accounts, you can register each one as a separate worker. Each account runs in parallel on different steps, which speeds up execution.
+
+Inside the Genesis REPL:
 
 ```
 genesis> add-account
 ```
 
-You will be prompted for a name and a home directory path. Genesis will run `codex login` scoped to that directory. After login, the account is appended to `~/.genesis/config.toml` and immediately available as a worker.
+You will be asked for:
+- A name for the account (e.g. `codex-2`)
+- A directory path where this account's login will be stored (e.g. `C:/Users/yourname/.codex-2`)
 
-Manual config entry:
+Genesis will open a browser window for you to log in with the second account. After login, the account is saved to `~/.genesis/config.toml` and available immediately as a worker.
 
-```toml
-[[codex_cli.accounts]]
-name = "codex-work"
-home = "C:/Users/yourname/.codex-work"
-model = "auto"
-```
-
-All registered accounts appear in the AGENTS panel and are used as workers in round-robin order. The first account listed is also registered as the `codex-orchestrator` fallback.
+Repeat this for each additional account.
 
 ---
 
-## Usage
+### Step 8 — Fix character rendering (if needed)
 
-Navigate to any git repository and start Genesis:
+If the terminal shows garbled symbols or boxes instead of the dashboard, set the UTF-8 environment variable before running Genesis:
+
+```
+set PYTHONUTF8=1
+genesis
+```
+
+To make this permanent, add `PYTHONUTF8=1` to your system environment variables in Windows Settings > System > Advanced system settings > Environment Variables.
+
+---
+
+## Running Genesis
+
+Navigate to any git repository and start the REPL:
 
 ```
 cd C:\Projects\my-app
@@ -103,13 +196,24 @@ genesis
 If the folder is not yet a git repository, initialise it first:
 
 ```
+cd C:\Projects\my-app
 git init
 git add .
-git commit -m "initial"
+git commit -m "initial commit"
 genesis
 ```
 
-### Commands
+Then give it a task:
+
+```
+genesis> run build a REST API with user auth, a PostgreSQL backend, and pytest tests
+```
+
+Genesis will plan the work, assign steps to Codex workers, and commit each approved step to git automatically.
+
+---
+
+## Commands
 
 ```
 run <task>                 Execute a task through the AI orchestrator
@@ -130,18 +234,6 @@ help                       Show all commands
 exit                       Quit Genesis
 ```
 
-### Example session
-
-```
-genesis> run build a REST API with user auth, a PostgreSQL backend, and pytest tests
-
-genesis> plan add rate limiting to the existing API endpoints
-
-genesis> memory show
-
-genesis> status
-```
-
 ---
 
 ## Dashboard
@@ -149,23 +241,19 @@ genesis> status
 The terminal dashboard refreshes 8 times per second and shows:
 
 - **Header** — animated spinner, task name, active worker, current step progress, elapsed time
-- **PLAN** (left) — all steps with status icons, per-step elapsed time
+- **PLAN** (left) — all steps with status icons and per-step elapsed time
 - **AGENT OUTPUT** (center) — live streaming from the active worker: shell commands and their output, files written, thinking previews, token counts per turn
-- **AGENTS** (top right) — full roster of registered agents, with the active worker highlighted
-- **USAGE** (bottom right) — cumulative input/output/cached tokens and cost, broken down per worker
+- **AGENTS** (top right) — full roster of registered agents with the active worker highlighted
+- **USAGE** (bottom right) — cumulative input/output/cached tokens and cost broken down per worker
 - **Footer** — progress bar, step count, latest git SHA, session cost
 
 ---
 
 ## Memory
 
-Genesis writes a `GENESIS_MEMORY.md` file to the root of your repository. This file records:
+Genesis writes a `GENESIS_MEMORY.md` file to the root of your repository. This file records the plan for each task, the outcome of each step, review verdicts, and completion timestamps.
 
-- The plan for each task (step IDs, titles, types, assigned agents)
-- The outcome of each step (what was built, review verdict, quality score)
-- Task completion timestamps
-
-This memory is injected into every planning and review prompt so the orchestrator understands what already exists before planning new work. It persists across sessions, so running `genesis` in the same repository later will pick up the context from previous tasks.
+This memory is injected into every planning and review prompt so the orchestrator understands what already exists before planning new work. It persists across sessions, so running `genesis` in the same repository later will pick up context from previous tasks.
 
 Clear memory when starting a conceptually new project:
 
@@ -177,19 +265,14 @@ genesis> memory clear
 
 ## Git integration
 
-With `auto_commit = true` (default), Genesis commits after every approved step using the message format:
+With `auto_commit = true` (default), Genesis commits after every approved step:
 
 ```
 [genesis] step-2: Implement authentication middleware
-```
-
-A final commit is added when the task completes:
-
-```
 [genesis] task-complete: Build REST API with auth and tests
 ```
 
-Auto-push is disabled by default. To enable it:
+Auto-push is disabled by default. To enable it, edit `~/.genesis/config.toml`:
 
 ```toml
 [git]
@@ -264,28 +347,23 @@ genesis/
   main.py              Entry point
 ```
 
-The orchestrator makes two types of Claude calls per task:
-
-- One `plan()` call using `--json-schema` to get a validated JSON execution plan
-- One `review()` call per step using `--json-schema` to get a structured verdict
-
-All code execution goes to Codex workers, which run inside the repository with `--sandbox workspace-write`. Codex writes files directly; Genesis detects changes using an mtime snapshot diff before and after execution.
-
-Streaming output from both CLIs is parsed as JSONL and forwarded to the dashboard in real time:
-
-- Claude: `--output-format stream-json --verbose` — emits `assistant` events with `thinking` and `text` blocks, and a `result` event with usage
-- Codex: `--json` — emits `item.completed` events for agent messages, command executions, and file changes, plus `turn.completed` with token counts
+Claude makes two calls per task: one `plan()` call using `--json-schema` to get a validated JSON execution plan, and one `review()` call per step to get a structured verdict. All code execution goes to Codex workers, which write files directly into the repository. Genesis detects what changed using an mtime snapshot diff before and after each execution.
 
 ---
 
 ## Troubleshooting
 
-**"You've hit your limit"** — Claude Pro rate limit reached. Genesis will automatically retry after the reset time shown. To reduce usage, ensure the orchestrator model is `claude-sonnet-4-6` (higher limits than Opus).
+**"You've hit your limit"**
+Claude Pro rate limit reached. Wait for the reset time shown in the message (usually less than an hour). To reduce how often this happens, make sure the orchestrator model is `claude-sonnet-4-6` and not `claude-opus-4-6`. Sonnet has significantly higher rate limits.
 
-**Codex exits with code 1** — Usually means the Codex account is not logged in. Run `codex login` (or for a secondary account: `CODEX_HOME=C:/path/to/account codex login`).
+**Codex exits with code 1**
+The Codex account is not logged in, or the session expired. Run `codex login` and try again. For a secondary account: `set CODEX_HOME=C:/Users/yourname/.codex-2` then `codex login`.
 
-**TOML parse error after add-account** — Path backslashes in TOML strings are interpreted as escape sequences. Genesis writes forward slashes automatically. If you edit `config.toml` manually, use forward slashes in all paths: `C:/Users/name/.codex-work`.
+**"No worker agents available"**
+Neither Claude Code nor Codex was detected in PATH. Open a new terminal, confirm `claude --version` and `codex --version` both print a version number, then run `genesis` from that same terminal.
 
-**Dashboard renders garbage characters** — Run with `PYTHONUTF8=1` prefix or set the environment variable permanently in Windows system settings.
+**TOML parse error after editing config.toml**
+Windows path backslashes in TOML strings are treated as escape sequences. Use forward slashes in all paths inside the config file. Correct: `C:/Users/yourname/.codex-2`. Incorrect: `C:\Users\yourname\.codex-2`. Genesis writes forward slashes automatically when you use `add-account`, so this only affects manual edits.
 
-**"No worker agents available"** — Neither Claude Code nor Codex was detected in PATH. Confirm `claude --version` and `codex --version` work in the same terminal before running `genesis`.
+**Dashboard shows boxes or garbled characters**
+Set `PYTHONUTF8=1` before running Genesis. See Step 8 in the setup section above.
