@@ -41,7 +41,7 @@ class GitManager:
             logger.info("Committed %s: %s", sha, message)
             return sha
         except Exception as e:
-            logger.warning("Commit failed: %s", e)
+            logger.warning("Commit failed: %s", e, exc_info=True)
             return None
 
     def push(self) -> bool:

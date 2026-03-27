@@ -80,8 +80,14 @@ class MemoryManager:
         self.path.write_text(_HEADER, encoding="utf-8")
 
     def _append(self, text: str) -> None:
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(text)
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(text)
+        except OSError as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Could not write to memory file %s: %s", self.path, e
+            )
 
 
 def _now() -> str:

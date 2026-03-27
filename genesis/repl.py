@@ -322,15 +322,13 @@ class GenesisREPL:
         tbl.add_column("Provider")
         tbl.add_column("Model")
         tbl.add_column("Role")
-        tbl.add_column("API Key")
 
         for name, agent in self._agents.items():
-            has_key = "[green]✓[/green]"
             role = "orchestrator" if "orchestrator" in name else "worker"
-            tbl.add_row(name, agent.provider, agent.model, role, has_key)
+            tbl.add_row(name, agent.provider, agent.model, role)
 
         if not self._agents:
-            tbl.add_row("[dim]none[/dim]", "—", "—", "—", "[red]✗[/red]")
+            tbl.add_row("[dim]none[/dim]", "—", "—", "—")
 
         console.print(tbl)
 
@@ -523,9 +521,24 @@ class GenesisREPL:
 
     # ── Main loop ──────────────────────────────────────────────────────────
 
+    def _cleanup(self) -> None:
+        """Close any browser agents that were opened."""
+        for agent in self._agents.values():
+            if hasattr(agent, "close"):
+                try:
+                    agent.close()
+                except Exception:
+                    pass
+
     def run(self) -> None:
         self._print_banner()
 
+        try:
+            self._run_loop()
+        finally:
+            self._cleanup()
+
+    def _run_loop(self) -> None:
         while True:
             try:
                 console.print("[bold cyan]genesis[/bold cyan][dim]>[/dim] ", end="")

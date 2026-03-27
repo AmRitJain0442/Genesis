@@ -80,7 +80,7 @@ class CodexWorker:
         try:
             summary = self.agent.execute_task(prompt, output_callback=self.output_callback)
         except Exception as e:
-            logger.error("CodexWorker error on %s: %s", step.step_id, e)
+            logger.error("CodexWorker error on %s: %s", step.step_id, e, exc_info=True)
             return WorkerResult(
                 step_id=step.step_id,
                 raw_response="",

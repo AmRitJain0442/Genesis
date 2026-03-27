@@ -93,7 +93,7 @@ class Worker:
             )
             return self._parse(raw, step)
         except Exception as e:
-            logger.error("Worker error on %s: %s", step.step_id, e)
+            logger.error("Worker error on %s: %s", step.step_id, e, exc_info=True)
             return WorkerResult(
                 step_id=step.step_id,
                 raw_response="",

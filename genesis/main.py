@@ -53,7 +53,7 @@ def _init_config() -> None:
     path = init_config()
     if path.exists():
         print(f"Config ready: {path}")
-        print("Edit it to add your API keys, then run 'genesis' to start.")
+        print("Edit it to configure your agents, then run 'genesis' to start.")
     else:
         print(f"Created: {path}")
 

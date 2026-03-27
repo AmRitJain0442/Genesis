@@ -62,7 +62,7 @@ class ChatGPTBrowserAgent(BaseAgent):
 
     # ── Public ──────────────────────────────────────────────────────────────
 
-    def chat(self, system: str, messages: list[dict]) -> str:
+    def chat(self, system: str, messages: list[dict], output_callback=None) -> str:
         if not _playwright_available():
             raise RuntimeError(
                 "Playwright is not installed. Run:\n"

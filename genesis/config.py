@@ -22,7 +22,7 @@ _DEFAULT_CONFIG = """\
 [orchestrator]
 # The director agent: plans tasks, assigns workers, reviews results.
 provider = "claude-cli"          # "claude-cli" | "chatgpt-browser"
-model = "claude-opus-4-6"        # alias "opus" also works
+model = "claude-sonnet-4-6"      # sonnet has higher Pro rate limits than opus
 
 [worker]
 # The executor agents: write code, docs, tests, configs.
@@ -59,7 +59,7 @@ auto_append_plan = true          # write the task plan to memory at start
 @dataclass
 class OrchestratorConfig:
     provider: str = "claude-cli"
-    model: str = "claude-opus-4-6"
+    model: str = "claude-sonnet-4-6"
 
 
 @dataclass
