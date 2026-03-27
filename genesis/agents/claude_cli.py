@@ -98,14 +98,15 @@ class ClaudeCodeCLIAgent(BaseAgent):
     # ── Specialised methods for orchestrator use ───────────────────────────
 
     def chat_plan(self, system: str, messages: list[dict]) -> str:
-        """Chat with --json-schema for Plan output. Falls back to plain chat."""
+        """Generate a plan using streaming to avoid output truncation on long JSON."""
         prompt = self._build_prompt(system, messages)
-        return self._call(prompt, json_schema=_PLAN_SCHEMA)
+        # --json-schema (batch) truncates long plans; streaming reads every token
+        return self._call_streaming(prompt, lambda _: None)
 
     def chat_review(self, system: str, messages: list[dict]) -> str:
-        """Chat with --json-schema for Review output. Falls back to plain chat."""
+        """Generate a review using streaming to avoid output truncation."""
         prompt = self._build_prompt(system, messages)
-        return self._call(prompt, json_schema=_REVIEW_SCHEMA)
+        return self._call_streaming(prompt, lambda _: None)
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -156,6 +157,10 @@ class ClaudeCodeCLIAgent(BaseAgent):
         if json_schema:
             structured = envelope.get("structured_output")
             if structured is not None:
+                # Already a JSON string (CLI pre-encoded it) — return as-is to avoid
+                # double-encoding which breaks _extract_json (escaped quotes at char 1)
+                if isinstance(structured, str):
+                    return structured
                 return json.dumps(structured)
 
         raw_result = envelope.get("result", "")
@@ -199,6 +204,7 @@ class ClaudeCodeCLIAgent(BaseAgent):
             pass
 
         result_text = ""
+        accumulated_text: list[str] = []
         try:
             for raw_line in proc.stdout:
                 line = raw_line.strip()
@@ -218,11 +224,12 @@ class ClaudeCodeCLIAgent(BaseAgent):
                             thinking = block.get("thinking", "")
                             if thinking:
                                 preview = thinking[:120].replace("\n", " ")
-                                suffix = "…" if len(thinking) > 120 else ""
-                                output_callback(f"[dim]💭 {preview}{suffix}[/dim]")
+                                suffix = "..." if len(thinking) > 120 else ""
+                                output_callback(f"[dim]Thinking: {preview}{suffix}[/dim]")
                         elif btype == "text":
                             text = block.get("text", "")
                             if text:
+                                accumulated_text.append(text)
                                 output_callback(text)
 
                 elif event_type == "result":
@@ -233,7 +240,8 @@ class ClaudeCodeCLIAgent(BaseAgent):
                     output_callback(
                         f"[dim]Tokens: in={inp} out={out} | ${cost:.4f}[/dim]"
                     )
-                    result_text = event.get("result", "")
+                    # Fall back to accumulated text blocks if result field is empty
+                    result_text = event.get("result", "") or "".join(accumulated_text)
         finally:
             try:
                 proc.wait(timeout=10)

@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import uuid
 import logging
+from pathlib import Path
 from typing import Callable, TYPE_CHECKING
 
 from genesis.schemas.plan import Plan, Step
@@ -114,23 +115,45 @@ class Orchestrator:
             f"TASK TO PLAN:\n{task}\n\n"
             f"Return the plan as JSON."
         )
-        # Use chat_plan if available (ClaudeCodeCLIAgent with --json-schema)
         if hasattr(self.agent, "chat_plan"):
             raw = self.agent.chat_plan(_SYSTEM, [{"role": "user", "content": msg}])
         else:
             raw = self.agent.chat(_SYSTEM, [{"role": "user", "content": msg}])
+        if not raw or not raw.strip():
+            raise ValueError("Orchestrator returned empty plan response — check Claude CLI connection")
         data = self._extract_json(raw)
         if not data.get("task_id"):
             data["task_id"] = str(uuid.uuid4())[:8]
         return Plan(**data)
 
     def review(self, step: Step, result: WorkerResult) -> Review:
-        files_summary = (
-            "Files written: " + ", ".join(result.files_written)
-            if result.files_written
-            else "No files written."
-        )
-        result_preview = result.result_text[:3000]
+        # Read actual file contents so Claude reviews real code, not just a summary.
+        # Cap per-file at 3 KB and total file content at 10 KB.
+        _PER_FILE = 3000
+        _TOTAL_CAP = 10000
+        file_sections: list[str] = []
+        total = 0
+        for fname in result.files_written:
+            fpath = Path(self.work_dir) / fname
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                content = "<file not readable>"
+            snippet = content[:_PER_FILE]
+            truncated = len(content) > _PER_FILE
+            header = f"--- {fname} ({len(content)} chars{', truncated' if truncated else ''}) ---"
+            section = f"{header}\n{snippet}"
+            file_sections.append(section)
+            total += len(section)
+            if total >= _TOTAL_CAP:
+                file_sections.append("... (additional files omitted — total cap reached)")
+                break
+
+        if file_sections:
+            files_block = "\n\n".join(file_sections)
+        else:
+            files_block = result.result_text[:3000] or "No output captured."
+
         msg = (
             f"Review this step result.\n\n"
             f"STEP:\n"
@@ -138,14 +161,15 @@ class Orchestrator:
             f"  Title: {step.title}\n"
             f"  Type: {step.type}\n"
             f"  Expected Output: {step.expected_output}\n\n"
-            f"WORKER RESULT:\n{files_summary}\n\n{result_preview}\n\n"
+            f"FILES WRITTEN ({len(result.files_written)}):\n\n{files_block}\n\n"
             f"Return your review as JSON."
         )
-        # Use chat_review if available (ClaudeCodeCLIAgent with --json-schema)
         if hasattr(self.agent, "chat_review"):
             raw = self.agent.chat_review(_SYSTEM, [{"role": "user", "content": msg}])
         else:
             raw = self.agent.chat(_SYSTEM, [{"role": "user", "content": msg}])
+        if not raw or not raw.strip():
+            raise ValueError(f"Orchestrator returned empty review response for {step.step_id}")
         data = self._extract_json(raw)
         return Review(**data)
 
@@ -262,25 +286,72 @@ class Orchestrator:
         """Robustly extract a JSON object from an LLM response."""
         text = raw.strip()
 
-        # Strip markdown code fences
-        if "```json" in text:
-            text = text.split("```json", 1)[1].split("```", 1)[0].strip()
-        elif "```" in text:
-            parts = text.split("```")
-            if len(parts) >= 3:
-                text = parts[1].strip()
-
-        # Find the outermost braces
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start < 0 or end <= start:
-            raise ValueError(f"No JSON object found in response: {raw[:300]!r}")
-        text = text[start:end]
-
+        # Fast path: raw is already valid JSON
         try:
-            return json.loads(text)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in response: {e}. Raw: {raw[:300]!r}") from e
+            result = json.loads(text)
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        # Strip markdown code fences — only when the text is fence-wrapped.
+        # Do NOT split on backticks when text starts with "{": step descriptions
+        # often contain {PRODUCT_NAME} or `file.py` patterns that would corrupt it.
+        if not text.startswith("{"):
+            if "```json" in text:
+                text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+            elif "```" in text:
+                parts = text.split("```")
+                if len(parts) >= 3:
+                    text = parts[1].strip()
+
+        # Scan every "{" in the text until one yields valid JSON.
+        # This handles preamble content containing {PRODUCT} patterns before the plan.
+        last_err: json.JSONDecodeError | None = None
+        search_from = 0
+        while True:
+            start = text.find("{", search_from)
+            if start < 0:
+                break
+
+            # Depth-count to find the matching "}" for this "{"
+            depth = 0
+            in_string = False
+            escape_next = False
+            end = -1
+            for i, ch in enumerate(text[start:], start):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == "\\" and in_string:
+                    escape_next = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+
+            if end < 0:
+                # No matching "}" — the rest of the text is truncated
+                break
+
+            try:
+                return json.loads(text[start:end])
+            except json.JSONDecodeError as e:
+                last_err = e
+                search_from = start + 1  # try next "{"
+
+        if last_err:
+            raise ValueError(f"Invalid JSON in response: {last_err}. Raw: {raw[:300]!r}")
+        raise ValueError(f"No JSON object found in response: {raw[:300]!r}")
 
 
 def _topo_sort(steps: list[Step]) -> list[Step]:
