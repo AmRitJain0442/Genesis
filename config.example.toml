@@ -59,7 +59,25 @@ remote        = "origin"
 branch        = "main"
 commit_prefix = "[genesis]"
 
+[runtime]
+state_db = ""              # empty = ~/.genesis/state/genesis.db
+retry_budget = 1
+max_parallel_workers = 1   # reserved for dependency-aware parallel execution
+checkpoint_mode = "always"
+
 [memory]
 file              = "GENESIS_MEMORY.md"
 max_context_chars = 6000
 auto_append_plan  = true
+palace_enabled    = true   # store searchable verbatim memories in SQLite
+
+[verification]
+commands = []              # e.g. ["python -m compileall genesis", "python -m unittest discover"]
+timeout = 300
+require_for_commit = true
+
+[policy]
+file = "genesis.policy.toml"
+protected_paths = [".git/", ".genesis/state/"]
+blocked_commands = ["git reset --hard", "git checkout --", "Remove-Item -Recurse -Force", "rm -rf /"]
+allowed_commands = []      # empty = allow all except blocked

@@ -30,11 +30,51 @@ class GitManager:
         except Exception:
             return False
 
+    def changed_files(self) -> list[str]:
+        """Return tracked and untracked files currently changed in the repo."""
+        if not self._available:
+            return []
+        try:
+            changed = set(self.repo.git.diff("--name-only").splitlines())
+            changed.update(self.repo.git.diff("--name-only", "--cached").splitlines())
+            changed.update(self.repo.untracked_files)
+            return sorted(p for p in changed if p)
+        except Exception as e:
+            logger.warning("Could not read changed files: %s", e)
+            return []
+
+    def diff_text(self, paths: list[str] | None = None, max_chars: int = 20000) -> str:
+        """Return a bounded git diff for review/memory context."""
+        if not self._available:
+            return ""
+        try:
+            args = ["--"]
+            if paths:
+                args.extend(paths)
+            diff = self.repo.git.diff(*args)
+            if paths:
+                # Include new untracked files as small synthetic sections because
+                # plain git diff omits them until they are staged.
+                for path in paths:
+                    p = Path(self.repo.working_tree_dir or ".") / path
+                    if p.exists() and path in self.repo.untracked_files:
+                        try:
+                            content = p.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            content = "<unreadable>"
+                        diff += f"\n--- untracked: {path} ---\n{content}\n"
+            if len(diff) > max_chars:
+                return diff[:max_chars].rstrip() + "\n... (diff truncated)"
+            return diff
+        except Exception as e:
+            logger.warning("Could not read diff: %s", e)
+            return ""
+
     def commit_step(self, step_id: str, title: str) -> str | None:
         if not self._available or not self.has_changes():
             return None
         try:
-            self.repo.git.add("-A")
+            self.repo.git.add("-A", "--", ".", ":(exclude).genesis")
             message = f"{self.config.commit_prefix} {step_id}: {title}"
             self.repo.index.commit(message)
             sha = self.repo.head.commit.hexsha[:7]
@@ -66,3 +106,10 @@ class GitManager:
             return [f"{c.hexsha[:7]}  {c.message.strip()[:72]}" for c in commits]
         except Exception:
             return []
+
+    def close(self) -> None:
+        if self.repo is not None and hasattr(self.repo, "close"):
+            try:
+                self.repo.close()
+            except Exception:
+                pass

@@ -11,7 +11,7 @@ No API keys required. Authentication is handled through your existing Claude Cod
 When you type `run <task>`, Genesis:
 
 1. Sends the task to Claude (orchestrator), which produces a JSON execution plan breaking the work into concrete steps
-2. Assigns each step to a Codex worker agent, which writes files and runs shell commands autonomously inside your repository
+2. Assigns each step to a Codex worker agent, which writes files and runs shell commands inside an isolated git worktree
 3. After each step, Claude reviews the result and either approves it, requests a revision, or rejects it
 4. Approved steps are committed to git automatically
 5. Progress is written to `GENESIS_MEMORY.md` in the repository so the context accumulates across steps
@@ -217,16 +217,23 @@ Genesis will plan the work, assign steps to Codex workers, and commit each appro
 
 ```
 run <task>                 Execute a task through the AI orchestrator
+resume <run_id>            Resume a durable run from stored step state
+retry <run_id> <step_id>   Retry a blocked step, then continue the run
 plan <task>                Generate and preview a plan without executing it
 status                     Show agents, config, and recent git log
 agents                     List all registered agents and their status
 memory show                Print the shared memory file
+memory search <query>      Search the SQLite memory palace
+memory mine                Import GENESIS_MEMORY.md into palace memory
 memory clear               Reset memory for a new project
 memory append <text>       Add a manual note to memory
 config show                Print the active configuration
 config edit                Open the config file in your editor
 git log                    Show recent Genesis commits
 git commit [message]       Manually commit current changes
+runs                       Show recent durable runs
+inspect <run_id>           Show run state and event trace
+cleanup <run_id>           Remove stale isolated worktrees for a run
 switch orchestrator <name> Hot-swap the orchestrator agent
 switch worker <name>       Hot-swap the default worker agent
 add-account                Add a Codex account interactively
@@ -255,6 +262,20 @@ Genesis writes a `GENESIS_MEMORY.md` file to the root of your repository. This f
 
 This memory is injected into every planning and review prompt so the orchestrator understands what already exists before planning new work. It persists across sessions, so running `genesis` in the same repository later will pick up context from previous tasks.
 
+Genesis also keeps a local SQLite state database at `~/.genesis/state/genesis.db` by default. This database stores durable run events, checkpoints, verification results, and searchable verbatim "memory palace" drawers. Markdown memory remains the human-readable project log; SQLite is the operational memory and trace store.
+
+Search memory:
+
+```
+genesis> memory search authentication middleware
+```
+
+Import an existing Markdown memory file into the palace store:
+
+```
+genesis> memory mine
+```
+
 Clear memory when starting a conceptually new project:
 
 ```
@@ -265,7 +286,7 @@ genesis> memory clear
 
 ## Git integration
 
-With `auto_commit = true` (default), Genesis commits after every approved step:
+With `auto_commit = true` (default), Genesis commits only after a step is approved by review and verification gates pass:
 
 ```
 [genesis] step-2: Implement authentication middleware
@@ -280,6 +301,10 @@ auto_push = true
 remote    = "origin"
 branch    = "main"
 ```
+
+Genesis runs workers in isolated git worktrees under `~/.genesis/worktrees/`. A worker patch is captured and stored in SQLite, reviewed, verified in the isolated worktree, checked with `git apply --check`, then applied to the main repository and committed. Rejected or failed steps leave the main repository unchanged and can be inspected or retried with `inspect`, `resume`, and `retry`.
+
+Because each accepted step becomes the base for the next worktree, isolated execution requires `git.auto_commit = true` and a clean main worktree apart from Genesis-managed memory/state files.
 
 ---
 
@@ -320,6 +345,24 @@ commit_prefix = "[genesis]"
 file              = "GENESIS_MEMORY.md"
 max_context_chars = 6000         # chars of memory injected per prompt
 auto_append_plan  = true
+palace_enabled    = true
+
+[runtime]
+state_db = ""                    # empty = ~/.genesis/state/genesis.db
+retry_budget = 1
+max_parallel_workers = 1
+checkpoint_mode = "always"
+
+[verification]
+commands = []                    # e.g. ["python -m compileall genesis"]
+timeout = 300
+require_for_commit = true
+
+[policy]
+file = "genesis.policy.toml"
+protected_paths = [".git/", ".genesis/state/"]
+blocked_commands = ["git reset --hard", "git checkout --", "Remove-Item -Recurse -Force", "rm -rf /"]
+allowed_commands = []
 ```
 
 ---
@@ -333,7 +376,7 @@ genesis/
     claude_cli.py      ClaudeCodeCLIAgent — drives `claude --print`
     codex_cli.py       CodexCLIAgent — drives `codex exec`
     worker.py          Worker — Claude worker, parses XML code blocks
-    codex_worker.py    CodexWorker — Codex worker, detects file changes via mtime diff
+    codex_worker.py    CodexWorker — Codex worker, detects content-hash file changes
   schemas/
     plan.py            Plan and Step Pydantic models
     review.py          Review Pydantic model
@@ -341,13 +384,18 @@ genesis/
     dashboard.py       Rich Live layout — DashboardState, make_layout()
     console.py         Shared Rich Console singleton
   config.py            TOML config loader, dataclasses
+  palace.py            SQLite verbatim memory palace + FTS search
+  runtime.py           Durable run events, checkpoints, artifacts
+  worktree.py          Isolated git worktrees and patch application
+  policy.py            Protected path and command policy checks
+  verifier.py          Configurable verification gates before commit
   memory.py            MemoryManager — reads/writes GENESIS_MEMORY.md
   git_ops.py           GitManager — wraps GitPython
   repl.py              GenesisREPL — main REPL loop, command dispatch
   main.py              Entry point
 ```
 
-Claude makes two calls per task: one `plan()` call using `--json-schema` to get a validated JSON execution plan, and one `review()` call per step to get a structured verdict. All code execution goes to Codex workers, which write files directly into the repository. Genesis detects what changed using an mtime snapshot diff before and after each execution.
+Claude makes two calls per task: one `plan()` call to get a validated JSON execution plan, and one `review()` call per step to get a structured verdict. Codex workers execute in isolated git worktrees, not the main repository. Genesis captures a patch, records durable checkpoints in SQLite, verifies the patch in isolation, and commits only approved, verified steps.
 
 ---
 

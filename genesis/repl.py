@@ -14,6 +14,10 @@ from genesis import __version__
 from genesis.config import get_config, CONFIG_FILE, CodexAccount
 from genesis.memory import MemoryManager
 from genesis.git_ops import GitManager
+from genesis.palace import PalaceStore, resolve_state_db
+from genesis.policy import ExecutionPolicy
+from genesis.runtime import RuntimeStore
+from genesis.worktree import WorktreeManager
 from genesis.agents.base import AgentInfo, BaseAgent
 from genesis.agents.claude_cli import ClaudeCodeCLIAgent, find_claude_binary
 from genesis.agents.codex_cli import CodexCLIAgent, find_codex_binary
@@ -27,11 +31,18 @@ _HELP = """\
 [bold]GENESIS COMMANDS[/bold]
 
   [bold cyan]run[/bold cyan] [dim]<task>[/dim]                       Execute a task through the AI orchestrator
+  [bold cyan]resume[/bold cyan] [dim]<run_id>[/dim]                  Resume a durable run
+  [bold cyan]retry[/bold cyan] [dim]<run_id> <step_id>[/dim]         Retry a blocked step, then resume
   [bold cyan]plan[/bold cyan] [dim]<task>[/dim]                      Generate and preview a plan (no execution)
   [bold cyan]status[/bold cyan]                            Show agent info and recent git log
   [bold cyan]memory show[/bold cyan]                       Display the shared memory file
+  [bold cyan]memory search[/bold cyan] [dim]<query>[/dim]            Search SQLite palace memory
+  [bold cyan]memory mine[/bold cyan]                       Import GENESIS_MEMORY.md into palace memory
   [bold cyan]memory clear[/bold cyan]                      Reset the memory file
   [bold cyan]memory append[/bold cyan] [dim]<text>[/dim]             Manually add a note to memory
+  [bold cyan]runs[/bold cyan]                              Show recent durable runs
+  [bold cyan]inspect[/bold cyan] [dim]<run_id>[/dim]                 Show run state and events
+  [bold cyan]cleanup[/bold cyan] [dim]<run_id>[/dim]                 Remove stale worktrees for a run
   [bold cyan]config show[/bold cyan]                       Display current configuration
   [bold cyan]config edit[/bold cyan]                       Open config in your editor
   [bold cyan]git log[/bold cyan]                           Show recent Genesis commits
@@ -54,6 +65,9 @@ class GenesisREPL:
             str(Path(self.work_dir) / self.config.memory.file)
         )
         self.git = GitManager(self.work_dir, self.config.git)
+        self.runtime = RuntimeStore.from_config(self.config)
+        self.palace = PalaceStore.from_config(self.config) if self.config.memory.palace_enabled else None
+        self.policy = ExecutionPolicy.load(self.work_dir, self.config)
         self._orch_provider = self.config.orchestrator.provider
         self._worker_provider = self.config.worker.provider
         self._agents: dict[str, BaseAgent] = {}
@@ -63,6 +77,7 @@ class GenesisREPL:
 
     def _build_agents(self) -> None:
         """Detect available providers and create agent instances."""
+        self._agents = {}
         cfg = self.config
         cmd = find_claude_binary() or cfg.claude_cli.command
 
@@ -155,7 +170,17 @@ class GenesisREPL:
         workers = self._get_workers()
         if not orch or not workers:
             return None
-        return Orchestrator(orch, workers, self.memory, self.git, self.config, self.work_dir)
+        return Orchestrator(
+            orch,
+            workers,
+            self.memory,
+            self.git,
+            self.config,
+            self.work_dir,
+            runtime=self.runtime,
+            palace=self.palace,
+            policy=self.policy,
+        )
 
     # ── Commands ───────────────────────────────────────────────────────────
 
@@ -338,11 +363,51 @@ class GenesisREPL:
             for entry in log:
                 console.print(f"  [dim]{entry}[/dim]")
 
+        runs = self.runtime.latest_runs(5)
+        if runs:
+            console.print("\n[bold]Recent runs:[/bold]")
+            for run in runs:
+                console.print(
+                    f"  [dim]{run.run_id}[/dim] {run.status:10} {run.task[:72]}"
+                )
+        console.print(f"\n[dim]State DB: {resolve_state_db(self.config)}[/dim]")
+
     def cmd_memory(self, args: list[str]) -> None:
         sub = args[0] if args else "show"
 
         if sub == "show":
             console.print(Markdown(self.memory.read()))
+        elif sub == "search" and len(args) > 1:
+            if not self.palace:
+                console.print("[yellow]Palace memory is disabled.[/yellow]")
+                return
+            query = " ".join(args[1:])
+            hits = self.palace.search(query, wing=str(Path(self.work_dir).resolve()), limit=8)
+            if not hits:
+                console.print("[dim]No memory hits.[/dim]")
+                return
+            tbl = Table(title=f"Memory search: {query}", box=box.ROUNDED)
+            tbl.add_column("When", style="dim", width=20)
+            tbl.add_column("Scope", style="cyan", width=24)
+            tbl.add_column("Title")
+            tbl.add_column("Kind", width=16)
+            for hit in hits:
+                tbl.add_row(
+                    hit.created_at[:19],
+                    f"{hit.room}/{hit.closet}",
+                    hit.title[:60],
+                    hit.kind,
+                )
+            console.print(tbl)
+        elif sub == "mine":
+            if not self.palace:
+                console.print("[yellow]Palace memory is disabled.[/yellow]")
+                return
+            count = self.palace.import_markdown(
+                Path(self.work_dir) / self.config.memory.file,
+                wing=str(Path(self.work_dir).resolve()),
+            )
+            console.print(f"[green]Imported {count} memory document(s).[/green]")
         elif sub == "clear":
             console.print("[yellow]Reset GENESIS_MEMORY.md? This cannot be undone. (y/N): [/yellow]", end="")
             if input().strip().lower() == "y":
@@ -351,9 +416,19 @@ class GenesisREPL:
         elif sub == "append" and len(args) > 1:
             note = " ".join(args[1:])
             self.memory.append_note(note)
+            if self.palace:
+                self.palace.add_drawer(
+                    wing=str(Path(self.work_dir).resolve()),
+                    room="manual",
+                    closet="notes",
+                    kind="manual-note",
+                    title="Manual note",
+                    content=note,
+                    source="genesis-repl",
+                )
             console.print("[green]Note added.[/green]")
         else:
-            console.print("Usage: memory [show | clear | append <text>]")
+            console.print("Usage: memory [show | search <query> | mine | clear | append <text>]")
 
     def cmd_config(self, args: list[str]) -> None:
         sub = args[0] if args else "show"
@@ -378,8 +453,13 @@ class GenesisREPL:
                 ("git.auto_commit", str(cfg.git.auto_commit)),
                 ("git.auto_push", str(cfg.git.auto_push)),
                 ("git.commit_prefix", cfg.git.commit_prefix),
+                ("runtime.state_db", str(resolve_state_db(cfg))),
+                ("runtime.retry_budget", str(cfg.runtime.retry_budget)),
                 ("memory.file", cfg.memory.file),
                 ("memory.max_context_chars", str(cfg.memory.max_context_chars)),
+                ("memory.palace_enabled", str(cfg.memory.palace_enabled)),
+                ("verification.commands", ", ".join(cfg.verification.commands) or "[dim]none[/dim]"),
+                ("policy.file", cfg.policy.file),
             ]
             for k, v in rows:
                 tbl.add_row(k, v)
@@ -412,6 +492,158 @@ class GenesisREPL:
 
     def cmd_agents(self) -> None:
         self.cmd_status()
+
+    def cmd_runs(self) -> None:
+        runs = self.runtime.latest_runs(20)
+        if not runs:
+            console.print("[dim]No durable runs recorded yet.[/dim]")
+            return
+        tbl = Table(title="Recent Genesis Runs", box=box.ROUNDED)
+        tbl.add_column("Run ID", style="cyan", width=14)
+        tbl.add_column("Status", width=12)
+        tbl.add_column("Updated", style="dim", width=20)
+        tbl.add_column("Task")
+        for run in runs:
+            tbl.add_row(run.run_id, run.status, run.updated_at[:19], run.task[:80])
+        console.print(tbl)
+
+    def cmd_resume(self, run_id: str) -> None:
+        if not run_id:
+            console.print("[red]Usage: resume <run_id>[/red]")
+            return
+        orchestrator = self._make_orchestrator()
+        if not orchestrator:
+            console.print("[red]No agents available.[/red]")
+            return
+        callbacks = self._simple_callbacks()
+        try:
+            orchestrator.resume_task(run_id, callbacks)
+        except Exception as e:
+            console.print(f"[red]Resume failed:[/red] {e}")
+
+    def cmd_retry(self, args: list[str]) -> None:
+        if len(args) < 2:
+            console.print("[red]Usage: retry <run_id> <step_id>[/red]")
+            return
+        run_id, step_id = args[0], args[1]
+        orchestrator = self._make_orchestrator()
+        if not orchestrator:
+            console.print("[red]No agents available.[/red]")
+            return
+        callbacks = self._simple_callbacks()
+        try:
+            orchestrator.resume_task(run_id, callbacks, retry_step_id=step_id)
+        except Exception as e:
+            console.print(f"[red]Retry failed:[/red] {e}")
+
+    def cmd_cleanup(self, run_id: str) -> None:
+        if not run_id:
+            console.print("[red]Usage: cleanup <run_id>[/red]")
+            return
+        try:
+            removed = WorktreeManager(self.work_dir).cleanup_run(run_id)
+        except Exception as e:
+            console.print(f"[red]Cleanup failed:[/red] {e}")
+            return
+        console.print(f"[green]Removed {removed} worktree(s).[/green]")
+
+    def cmd_inspect(self, run_id: str) -> None:
+        if not run_id:
+            console.print("[red]Usage: inspect <run_id>[/red]")
+            return
+        run = self.runtime.get_run(run_id)
+        if not run:
+            console.print(f"[red]Run not found:[/red] {run_id}")
+            return
+        console.print(
+            Panel(
+                f"[bold]{run.task}[/bold]\n\n"
+                f"[cyan]Run:[/cyan] {run.run_id}\n"
+                f"[cyan]Status:[/cyan] {run.status}\n"
+                f"[cyan]Created:[/cyan] {run.created_at}\n"
+                f"[cyan]Updated:[/cyan] {run.updated_at}",
+                title="Run",
+                border_style="blue",
+            )
+        )
+        steps = self.runtime.steps(run_id)
+        if steps:
+            step_tbl = Table(title="Steps", box=box.ROUNDED)
+            step_tbl.add_column("Step", style="cyan", width=12)
+            step_tbl.add_column("Status", width=12)
+            step_tbl.add_column("Worker", width=18)
+            step_tbl.add_column("Commit", width=10)
+            step_tbl.add_column("Patch", width=18)
+            step_tbl.add_column("Title")
+            for step in steps:
+                step_tbl.add_row(
+                    step.step_id,
+                    step.status,
+                    step.worker,
+                    step.commit_sha,
+                    step.patch_artifact_id,
+                    step.title[:60],
+                )
+            console.print(step_tbl)
+        events = self.runtime.events(run_id, limit=80)
+        tbl = Table(title="Events", box=box.ROUNDED)
+        tbl.add_column("#", style="dim", width=5)
+        tbl.add_column("Time", style="dim", width=20)
+        tbl.add_column("Step", style="cyan", width=12)
+        tbl.add_column("Type", width=20)
+        tbl.add_column("Payload")
+        for event in events:
+            payload = str(event.payload)
+            tbl.add_row(
+                str(event.id),
+                event.created_at[:19],
+                event.step_id,
+                event.event_type,
+                payload[:90],
+            )
+        console.print(tbl)
+
+    def _simple_callbacks(self) -> dict:
+        def on_plan(plan):
+            console.print(f"[bold]Plan:[/bold] {plan.task_summary} ({len(plan.steps)} steps)")
+
+        def on_step_start(step, idx, total):
+            console.print(f"[cyan]>[/cyan] {step.step_id}: {step.title}")
+
+        def on_worker_assigned(step, worker_name):
+            console.print(f"  [dim]worker: {worker_name}[/dim]")
+
+        def on_step_result(step, result, worker_name):
+            if result.files_written:
+                console.print(f"  [green]+[/green] {', '.join(result.files_written)}")
+
+        def on_review(step, review):
+            console.print(f"  review: {review.verdict} score:{review.quality_score}/10")
+
+        def on_commit(step, sha):
+            if sha:
+                console.print(f"  commit: {sha}")
+
+        def on_status(msg):
+            console.print(f"[dim]{msg}[/dim]")
+
+        def on_error(step, error):
+            console.print(f"  [red]x {error}[/red]")
+
+        def on_task_complete(plan):
+            console.print("[green]Run complete.[/green]")
+
+        return {
+            "on_plan": on_plan,
+            "on_step_start": on_step_start,
+            "on_worker_assigned": on_worker_assigned,
+            "on_step_result": on_step_result,
+            "on_review": on_review,
+            "on_commit": on_commit,
+            "on_status": on_status,
+            "on_error": on_error,
+            "on_task_complete": on_task_complete,
+        }
 
     def cmd_add_account(self, args: list[str]) -> None:
         """
@@ -573,6 +805,11 @@ class GenesisREPL:
                 break
             elif cmd == "run":
                 self.cmd_run(rest)
+            elif cmd == "resume":
+                self.cmd_resume(rest)
+            elif cmd == "retry":
+                sub, sub_rest = _split_sub(rest)
+                self.cmd_retry([sub] + ([sub_rest] if sub_rest else []))
             elif cmd == "plan":
                 self.cmd_plan(rest)
             elif cmd == "status":
@@ -588,6 +825,12 @@ class GenesisREPL:
                 self.cmd_git([sub] + ([sub_rest] if sub_rest else []))
             elif cmd in ("agents", "agent"):
                 self.cmd_agents()
+            elif cmd == "runs":
+                self.cmd_runs()
+            elif cmd == "inspect":
+                self.cmd_inspect(rest)
+            elif cmd == "cleanup":
+                self.cmd_cleanup(rest)
             elif cmd in ("add-account", "add_account", "addaccount"):
                 self.cmd_add_account([])
             elif cmd == "switch":

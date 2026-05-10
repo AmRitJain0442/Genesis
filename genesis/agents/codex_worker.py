@@ -7,6 +7,7 @@ reads the git diff to discover which files were created or modified.
 """
 from __future__ import annotations
 import logging
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -74,7 +75,8 @@ class CodexWorker:
             context_hint=step.context_hint or "None",
         )
 
-        # Snapshot files before execution
+        # Snapshot file content before execution. This is more reliable than
+        # mtimes and catches quick rewrites on filesystems with coarse clocks.
         before = self._snapshot()
 
         try:
@@ -103,23 +105,25 @@ class CodexWorker:
 
     # ── File change detection ──────────────────────────────────────────────
 
-    def _snapshot(self) -> dict[str, float]:
-        """Return {relative_path: mtime} for all non-hidden files in work_dir."""
-        snap: dict[str, float] = {}
+    def _snapshot(self) -> dict[str, str]:
+        """Return {relative_path: sha256} for all relevant files in work_dir."""
+        snap: dict[str, str] = {}
         for p in self.work_dir.rglob("*"):
             if p.is_file() and not _is_ignored(p, self.work_dir):
                 try:
-                    snap[str(p.relative_to(self.work_dir))] = p.stat().st_mtime
+                    snap[str(p.relative_to(self.work_dir))] = hashlib.sha256(
+                        p.read_bytes()
+                    ).hexdigest()
                 except Exception:
                     pass
         return snap
 
-    def _diff(self, before: dict[str, float]) -> list[str]:
+    def _diff(self, before: dict[str, str]) -> list[str]:
         """Return files that are new or modified since the snapshot."""
         after = self._snapshot()
         changed = []
-        for path, mtime in after.items():
-            if path not in before or before[path] != mtime:
+        for path, digest in after.items():
+            if path not in before or before[path] != digest:
                 changed.append(path)
         return sorted(changed)
 
@@ -127,7 +131,7 @@ class CodexWorker:
 def _is_ignored(path: Path, root: Path) -> bool:
     """Skip git internals, caches, and binary blobs."""
     rel = str(path.relative_to(root))
-    skip_prefixes = (".git", "__pycache__", "node_modules", ".venv", "venv")
+    skip_prefixes = (".git", ".genesis/state", "__pycache__", "node_modules", ".venv", "venv")
     skip_suffixes = (".pyc", ".pyo", ".egg-info")
     return (
         any(rel.startswith(p) for p in skip_prefixes)

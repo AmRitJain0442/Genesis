@@ -26,14 +26,24 @@ model = "claude-sonnet-4-6"      # sonnet has higher Pro rate limits than opus
 
 [worker]
 # The executor agents: write code, docs, tests, configs.
-provider = "claude-cli"          # "claude-cli" | "chatgpt-browser"
-model = "claude-sonnet-4-6"      # alias "sonnet" also works
+provider = "codex-cli"           # "codex-cli" | "claude-cli" | "chatgpt-browser"
+model = "auto"
 
 [claude_cli]
 # Settings for the Claude Code CLI agent.
 # Requires: `claude` is installed and you are logged in (`claude login`).
 command = "claude"               # path to the claude binary (auto-detected if in PATH)
 timeout = 300                    # seconds to wait for a response
+
+[codex_cli]
+command = "codex"
+timeout = 600
+model = "auto"
+
+[[codex_cli.accounts]]
+name = "codex-main"
+home = ""
+model = "auto"
 
 [chatgpt_browser]
 # Settings for the optional ChatGPT browser agent.
@@ -49,10 +59,28 @@ remote = "origin"
 branch = "main"
 commit_prefix = "[genesis]"
 
+[runtime]
+state_db = ""                    # empty = ~/.genesis/state/genesis.db
+retry_budget = 1                 # max automatic retries per failed review
+max_parallel_workers = 1         # reserved for dependency-aware parallel runs
+checkpoint_mode = "always"
+
 [memory]
 file = "GENESIS_MEMORY.md"       # created in the current working directory
 max_context_chars = 6000         # max memory chars injected into prompts
 auto_append_plan = true          # write the task plan to memory at start
+palace_enabled = true            # persist searchable verbatim memory in SQLite
+
+[verification]
+commands = []                    # e.g. ["python -m compileall genesis"]
+timeout = 300
+require_for_commit = true
+
+[policy]
+file = "genesis.policy.toml"
+protected_paths = [".git/", ".genesis/state/"]
+blocked_commands = ["git reset --hard", "git checkout --", "Remove-Item -Recurse -Force", "rm -rf /"]
+allowed_commands = []            # empty = allow all except blocked
 """
 
 
@@ -64,8 +92,8 @@ class OrchestratorConfig:
 
 @dataclass
 class WorkerConfig:
-    provider: str = "claude-cli"
-    model: str = "claude-sonnet-4-6"
+    provider: str = "codex-cli"
+    model: str = "auto"
 
 
 @dataclass
@@ -107,10 +135,41 @@ class GitConfig:
 
 
 @dataclass
+class RuntimeConfig:
+    state_db: str = ""
+    retry_budget: int = 1
+    max_parallel_workers: int = 1
+    checkpoint_mode: str = "always"
+
+
+@dataclass
 class MemoryConfig:
     file: str = "GENESIS_MEMORY.md"
     max_context_chars: int = 6000
     auto_append_plan: bool = True
+    palace_enabled: bool = True
+
+
+@dataclass
+class VerificationConfig:
+    commands: list[str] = field(default_factory=list)
+    timeout: int = 300
+    require_for_commit: bool = True
+
+
+@dataclass
+class PolicyConfig:
+    file: str = "genesis.policy.toml"
+    protected_paths: list[str] = field(default_factory=lambda: [".git/", ".genesis/state/"])
+    blocked_commands: list[str] = field(
+        default_factory=lambda: [
+            "git reset --hard",
+            "git checkout --",
+            "Remove-Item -Recurse -Force",
+            "rm -rf /",
+        ]
+    )
+    allowed_commands: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -121,7 +180,10 @@ class GenesisConfig:
     codex_cli: CodexCLIConfig = field(default_factory=CodexCLIConfig)
     chatgpt_browser: ChatGPTBrowserConfig = field(default_factory=ChatGPTBrowserConfig)
     git: GitConfig = field(default_factory=GitConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    verification: VerificationConfig = field(default_factory=VerificationConfig)
+    policy: PolicyConfig = field(default_factory=PolicyConfig)
 
 
 def load_config() -> GenesisConfig:
@@ -136,7 +198,7 @@ def load_config() -> GenesisConfig:
     if o := data.get("orchestrator"):
         cfg.orchestrator = OrchestratorConfig(
             provider=o.get("provider", "claude-cli"),
-            model=o.get("model", "claude-opus-4-6"),
+            model=o.get("model", "claude-sonnet-4-6"),
         )
 
     if w := data.get("worker"):
@@ -184,11 +246,45 @@ def load_config() -> GenesisConfig:
             commit_prefix=g.get("commit_prefix", "[genesis]"),
         )
 
+    if r := data.get("runtime"):
+        cfg.runtime = RuntimeConfig(
+            state_db=r.get("state_db", ""),
+            retry_budget=r.get("retry_budget", 1),
+            max_parallel_workers=r.get("max_parallel_workers", 1),
+            checkpoint_mode=r.get("checkpoint_mode", "always"),
+        )
+
     if m := data.get("memory"):
         cfg.memory = MemoryConfig(
             file=m.get("file", "GENESIS_MEMORY.md"),
             max_context_chars=m.get("max_context_chars", 6000),
             auto_append_plan=m.get("auto_append_plan", True),
+            palace_enabled=m.get("palace_enabled", True),
+        )
+
+    if v := data.get("verification"):
+        cfg.verification = VerificationConfig(
+            commands=list(v.get("commands", [])),
+            timeout=v.get("timeout", 300),
+            require_for_commit=v.get("require_for_commit", True),
+        )
+
+    if p := data.get("policy"):
+        cfg.policy = PolicyConfig(
+            file=p.get("file", "genesis.policy.toml"),
+            protected_paths=list(p.get("protected_paths", [".git/", ".genesis/state/"])),
+            blocked_commands=list(
+                p.get(
+                    "blocked_commands",
+                    [
+                        "git reset --hard",
+                        "git checkout --",
+                        "Remove-Item -Recurse -Force",
+                        "rm -rf /",
+                    ],
+                )
+            ),
+            allowed_commands=list(p.get("allowed_commands", [])),
         )
 
     return cfg
