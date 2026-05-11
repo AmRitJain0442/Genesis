@@ -1,34 +1,26 @@
 from __future__ import annotations
+
 import re
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from rich import box
 from rich.layout import Layout
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.columns import Columns
-from rich import box
+
+from genesis.ui.theme import command_panel, markup, progress_bar, role_label, status_label, trim
 
 if TYPE_CHECKING:
     from genesis.schemas.plan import Plan
 
-_STEP_ICONS = {
-    "pending":        ("[dim][ ][/dim]",        "dim"),
-    "running":        ("[bold cyan][>][/bold cyan]", "bold cyan"),
-    "approved":       ("[green][+][/green]",     "green"),
-    "needs_revision": ("[yellow][~][~][/yellow]","yellow"),
-    "rejected":       ("[red][x][/red]",         "red"),
-}
 
 _SPINNER = ["|", "/", "-", "\\"]
-
-_TOKEN_RE_CLAUDE = re.compile(
-    r"Tokens:\s*in=(\d+)\s+out=(\d+)\s*\|\s*\$([0-9.]+)"
-)
-_TOKEN_RE_CODEX = re.compile(
-    r"Tokens:\s*in=(\d+)\s+\(cached=(\d+)\)\s+out=(\d+)"
-)
+_TOKEN_RE_CLAUDE = re.compile(r"Tokens:\s*in=(\d+)\s+out=(\d+)\s*\|\s*\$([0-9.]+)")
+_TOKEN_RE_CODEX = re.compile(r"Tokens:\s*in=(\d+)\s+\(cached=(\d+)\)\s+out=(\d+)")
+_RICH_TAG_RE = re.compile(r"\[/?[^\]]*\]")
 
 
 class UsageStats:
@@ -41,17 +33,14 @@ class UsageStats:
         self.cost_usd = 0.0
 
     def absorb_line(self, line: str) -> None:
-        """Parse a streaming token line and add to accumulators."""
-        plain = re.sub(r"\[/?[^\]]*\]", "", line)  # strip Rich markup
-        m = _TOKEN_RE_CLAUDE.search(plain)
-        if m:
-            self.input_tokens  += int(m.group(1))
+        plain = _RICH_TAG_RE.sub("", line)
+        if m := _TOKEN_RE_CLAUDE.search(plain):
+            self.input_tokens += int(m.group(1))
             self.output_tokens += int(m.group(2))
-            self.cost_usd      += float(m.group(3))
+            self.cost_usd += float(m.group(3))
             return
-        m = _TOKEN_RE_CODEX.search(plain)
-        if m:
-            self.input_tokens  += int(m.group(1))
+        if m := _TOKEN_RE_CODEX.search(plain):
+            self.input_tokens += int(m.group(1))
             self.cached_tokens += int(m.group(2))
             self.output_tokens += int(m.group(3))
 
@@ -61,33 +50,45 @@ class DashboardState:
 
     def __init__(self, agent_names: list[str] | None = None) -> None:
         self.task_name: str = ""
+        self.run_phase: str = "idle"
         self.plan: Plan | None = None
         self.step_statuses: dict[str, str] = {}
+        self.step_workers: dict[str, str] = {}
+        self.step_scopes: dict[str, str] = {}
+        self.step_repairs: dict[str, int] = {}
+        self.step_reviewers: dict[str, str] = {}
+        self.step_verification: dict[str, str] = {}
         self.current_step: str = ""
         self.current_worker: str = ""
+        self.current_reviewer: str = ""
+        self.blocked_reason: str = ""
         self.output_lines: list[str] = []
+        self.recent_events: list[tuple[str, str, str]] = []
         self.completed: int = 0
         self.total: int = 0
         self.git_sha: str = "-"
         self.start_time: datetime = datetime.now()
         self.step_start: datetime | None = None
-        self.step_elapsed: dict[str, float] = {}   # step_id -> seconds
+        self.step_elapsed: dict[str, float] = {}
         self.agent_names: list[str] = agent_names or []
-        # per-agent usage (keyed by worker name)
         self.usage: dict[str, UsageStats] = {}
 
-    def add_output(self, line: str) -> None:
-        self.output_lines.append(line)
-        if len(self.output_lines) > 200:
-            self.output_lines = self.output_lines[-200:]
+    def add_output(self, line: str, *, trusted_markup: bool = False) -> None:
+        text = str(line)
+        self.output_lines.append(text if trusted_markup else escape(text))
+        if len(self.output_lines) > 240:
+            self.output_lines = self.output_lines[-240:]
+
+    def add_event(self, label: str, detail: str = "", style: str = "cyan") -> None:
+        self.recent_events.append((label.upper()[:10], detail, style))
+        if len(self.recent_events) > 80:
+            self.recent_events = self.recent_events[-80:]
 
     def record_token_line(self, raw_line: str) -> None:
         key = self.current_worker or "__orch__"
         if key not in self.usage:
             self.usage[key] = UsageStats()
         self.usage[key].absorb_line(raw_line)
-
-    # ── Aggregate helpers ───────────────────────────────────────────────
 
     def total_input(self) -> int:
         return sum(u.input_tokens for u in self.usage.values())
@@ -102,15 +103,17 @@ class DashboardState:
         return sum(u.cost_usd for u in self.usage.values())
 
 
-# ── Rendering helpers ───────────────────────────────────────────────────────
-
 def _spinner_frame() -> str:
-    idx = int(datetime.now().timestamp() * 6) % len(_SPINNER)
+    idx = int(datetime.now().timestamp() * 8) % len(_SPINNER)
     return _SPINNER[idx]
 
 
 def _elapsed(start: datetime) -> str:
-    s = int((datetime.now() - start).total_seconds())
+    return _fmt_duration((datetime.now() - start).total_seconds())
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = max(0, int(seconds))
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
     if h:
@@ -119,201 +122,220 @@ def _elapsed(start: datetime) -> str:
 
 
 def _fmt_tokens(n: int) -> str:
-    return f"{n:,}" if n < 1_000_000 else f"{n/1_000_000:.1f}M"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 10_000:
+        return f"{n / 1_000:.1f}k"
+    return f"{n:,}"
 
 
-# ── Header ──────────────────────────────────────────────────────────────────
+def _step_scope(step, state: DashboardState) -> str:
+    if step.step_id in state.step_scopes:
+        return state.step_scopes[step.step_id]
+    scope = getattr(step, "file_scope", []) or []
+    return ", ".join(scope) if scope else getattr(step, "context_hint", "") or "*"
+
+
+def _status_style(status: str) -> str:
+    return {
+        "running": "bold cyan",
+        "approved": "green",
+        "committed": "bold green",
+        "completed": "bold green",
+        "needs_revision": "yellow",
+        "reviewing": "magenta",
+        "verifying": "blue",
+        "blocked": "red",
+        "rejected": "red",
+    }.get(status, "dim")
+
 
 def _header(state: DashboardState) -> Panel:
-    spin = _spinner_frame() if state.current_step else "-"
-    step_info = ""
-    if state.current_step and state.total:
-        step_info = f"  step {state.completed + 1}/{state.total}"
-        if state.step_start:
-            step_info += f" [{_elapsed(state.step_start)}]"
-
-    t = Text()
-    t.append(f" {spin} ", style="bold cyan")
-    t.append("GENESIS", style="bold white on dark_magenta")
-    t.append("  ", style="")
-    task_display = state.task_name or "No active task"
-    t.append(task_display[:80], style="bold")
-    if state.current_worker:
-        t.append(f"  [worker: {state.current_worker}]", style="dim cyan")
-    t.append(step_info, style="bold yellow")
+    spin = _spinner_frame() if state.current_step and state.run_phase != "completed" else "-"
+    task = trim(state.task_name or "No active task", 86)
+    active = state.current_worker or state.current_reviewer or "-"
+    step = state.current_step or "-"
     elapsed = _elapsed(state.start_time)
-    t.append(f"  {elapsed}", style="dim")
+    bar = progress_bar(state.completed, state.total, width=30)
 
-    return Panel(t, style="on grey7", padding=(0, 1), box=box.HORIZONTALS)
+    grid = Table.grid(expand=True)
+    grid.add_column(ratio=3)
+    grid.add_column(justify="right", ratio=2)
+    grid.add_row(
+        f"[bold cyan]{spin} GENESIS COMMAND CENTER[/bold cyan] {status_label(state.run_phase, width=8)} [bold]{markup(task)}[/bold]",
+        f"[dim]elapsed[/dim] [bold]{elapsed}[/bold]  [dim]git[/dim] [cyan]{markup(state.git_sha)}[/cyan]",
+    )
+    grid.add_row(
+        f"[cyan]{bar}[/cyan] [bold]{state.completed}/{state.total}[/bold] [dim]steps[/dim]",
+        f"[dim]active[/dim] [bold cyan]{markup(active, 28)}[/bold cyan]  [dim]step[/dim] [yellow]{markup(step, 18)}[/yellow]",
+    )
+    return Panel(grid, border_style="cyan", box=box.HORIZONTALS, padding=(0, 1))
 
-
-# ── Plan panel ──────────────────────────────────────────────────────────────
 
 def _plan_panel(state: DashboardState) -> Panel:
     if state.plan is None:
-        inner = Text("Waiting for plan...", style="dim")
-        return Panel(inner, title="[bold]PLAN[/bold]", border_style="blue",
-                     box=box.ROUNDED)
+        return command_panel(Text("Waiting for planner output...", style="dim"), "EXECUTION PLAN")
 
-    tbl = Table(box=None, show_header=False, padding=(0, 1), expand=True,
-                show_edge=False)
-    tbl.add_column("ic", width=4, no_wrap=True)
-    tbl.add_column("id", width=7, no_wrap=True)
-    tbl.add_column("title")
-    tbl.add_column("t", width=6, no_wrap=True, justify="right")
+    tbl = Table(box=None, show_header=True, header_style="bold cyan", expand=True, pad_edge=False)
+    tbl.add_column("State", width=9, no_wrap=True)
+    tbl.add_column("Step", width=7, no_wrap=True)
+    tbl.add_column("Fx", width=3, justify="right")
+    tbl.add_column("Title / Scope", overflow="fold")
 
     for step in state.plan.steps:
         status = state.step_statuses.get(step.step_id, "pending")
-        icon_markup, row_style = _STEP_ICONS.get(status, ("[dim][ ][/dim]", "dim"))
-        elapsed_str = ""
-        if step.step_id in state.step_elapsed:
-            sec = state.step_elapsed[step.step_id]
-            elapsed_str = f"{int(sec)}s"
-        elif status == "running" and state.step_start:
-            sec = (datetime.now() - state.step_start).total_seconds()
-            elapsed_str = f"[cyan]{int(sec)}s[/cyan]"
-
+        repairs = state.step_repairs.get(step.step_id, 0)
+        title = Text(trim(step.title, 40), style=_status_style(status))
+        title.append("\n")
+        title.append(trim(_step_scope(step, state), 40), style="dim")
         tbl.add_row(
-            icon_markup,
-            Text(step.step_id, style="dim"),
-            Text(step.title[:34], style=row_style),
-            elapsed_str,
+            status_label(status),
+            markup(step.step_id, 7),
+            str(repairs) if repairs else "",
+            title,
         )
 
-    done = state.completed
-    total = state.total
-    subtitle = f"[dim]{done}/{total} done[/dim]"
-    return Panel(tbl, title=f"[bold]PLAN[/bold]  {subtitle}",
-                 border_style="blue", box=box.ROUNDED)
+    subtitle = f"{state.completed}/{state.total} done"
+    return command_panel(tbl, "EXECUTION PLAN", border_style="blue", subtitle=subtitle)
 
 
-# ── Output panel ─────────────────────────────────────────────────────────────
+def _style_output_line(line: str) -> str:
+    plain = _RICH_TAG_RE.sub("", line).strip()
+    if plain.startswith("$") or plain.startswith("verify $"):
+        return f"[bold yellow]{line}[/bold yellow]"
+    if plain.startswith("+") or " file_change" in plain:
+        return f"[green]{line}[/green]"
+    if "review:" in plain or "approved" in plain:
+        return f"[cyan]{line}[/cyan]"
+    if "Retrying" in plain or "Repairing" in plain or "needs_revision" in plain:
+        return f"[yellow]{line}[/yellow]"
+    if "exit " in plain or "failed" in plain.lower() or plain.startswith("x "):
+        return f"[red]{line}[/red]"
+    return line
+
 
 def _output_panel(state: DashboardState) -> Panel:
-    lines = state.output_lines[-30:] if state.output_lines else ["[dim]Waiting...[/dim]"]
-    content = "\n".join(lines)
-    title = "[bold]AGENT OUTPUT[/bold]"
-    if state.current_worker:
-        title += f"  [dim cyan]{state.current_worker}[/dim cyan]"
-    return Panel(content, title=title, border_style="green", box=box.ROUNDED)
+    lines = state.output_lines[-34:] if state.output_lines else ["[dim]No agent output yet.[/dim]"]
+    content = "\n".join(_style_output_line(line) for line in lines)
+    title = "AGENT OUTPUT"
+    subtitle = state.current_worker or state.current_reviewer
+    return command_panel(content, title, border_style="green", subtitle=subtitle)
 
 
-# ── Agents panel ─────────────────────────────────────────────────────────────
-
-def _agents_panel(state: DashboardState) -> Panel:
-    tbl = Table(box=None, show_header=False, padding=(0, 1), expand=True,
-                show_edge=False)
-    tbl.add_column("dot", width=3, no_wrap=True)
-    tbl.add_column("name")
+def _team_panel(state: DashboardState) -> Panel:
+    tbl = Table(box=None, show_header=True, header_style="bold magenta", expand=True, pad_edge=False)
+    tbl.add_column("Role", width=7, no_wrap=True)
+    tbl.add_column("Agent", overflow="ellipsis")
+    tbl.add_column("State", width=9, no_wrap=True)
 
     for name in state.agent_names:
-        is_active = name == state.current_worker
-        if is_active:
-            dot = "[bold green]>[/bold green]"
-            style = "bold green"
-        else:
-            dot = "[dim]o[/dim]"
-            style = "dim"
-        tbl.add_row(dot, Text(name[:20], style=style))
+        role = "orchestrator" if "orchestrator" in name else "worker"
+        active = name == state.current_worker or name == state.current_reviewer
+        state_text = "[bold green]ACTIVE[/bold green]" if active else "[dim]READY[/dim]"
+        tbl.add_row(role_label(role), markup(name, 28), state_text)
 
     if not state.agent_names:
-        tbl.add_row("[dim]o[/dim]", Text("none", style="dim"))
+        tbl.add_row(role_label("worker"), "[dim]none[/dim]", status_label("blocked"))
 
-    return Panel(tbl, title="[bold]AGENTS[/bold]", border_style="magenta",
-                 box=box.ROUNDED)
+    return command_panel(tbl, "TEAM", border_style="magenta")
 
 
-# ── Metrics panel ────────────────────────────────────────────────────────────
+def _events_panel(state: DashboardState) -> Panel:
+    tbl = Table(box=None, show_header=False, expand=True, pad_edge=False)
+    tbl.add_column("Kind", width=10, no_wrap=True)
+    tbl.add_column("Detail", overflow="ellipsis")
+    events = state.recent_events[-8:] if state.recent_events else [("WAIT", "No runtime events yet", "dim")]
+    for label, detail, style in events:
+        tbl.add_row(f"[{style}]{markup(label, 10)}[/]", markup(detail, 42))
+    return command_panel(tbl, "EVENT TRACE", border_style="cyan")
+
 
 def _metrics_panel(state: DashboardState) -> Panel:
-    tbl = Table(box=None, show_header=False, padding=(0, 0), expand=True,
-                show_edge=False)
-    tbl.add_column("k", style="dim", width=8)
-    tbl.add_column("v", justify="right")
+    tbl = Table(box=None, show_header=False, padding=(0, 0), expand=True, pad_edge=False)
+    tbl.add_column("Metric", style="dim", width=9)
+    tbl.add_column("Value", justify="right")
 
-    tot_in  = state.total_input()
-    tot_out = state.total_output()
-    tot_cac = state.total_cached()
-    cost    = state.total_cost()
-
-    tbl.add_row("in",     Text(_fmt_tokens(tot_in),  style="cyan"))
-    tbl.add_row("out",    Text(_fmt_tokens(tot_out), style="green"))
-    if tot_cac:
-        tbl.add_row("cached", Text(_fmt_tokens(tot_cac), style="dim cyan"))
-    tbl.add_row("cost",   Text(f"${cost:.4f}", style="bold yellow" if cost > 0 else "dim"))
+    tbl.add_row("input", f"[cyan]{_fmt_tokens(state.total_input())}[/cyan]")
+    tbl.add_row("output", f"[green]{_fmt_tokens(state.total_output())}[/green]")
+    tbl.add_row("cached", f"[dim cyan]{_fmt_tokens(state.total_cached())}[/dim cyan]")
+    cost = state.total_cost()
+    tbl.add_row("cost", f"[bold yellow]${cost:.4f}[/bold yellow]" if cost else "[dim]$0.0000[/dim]")
     tbl.add_row("", "")
 
-    # Per-worker breakdown
-    for worker, u in state.usage.items():
-        if worker == "__orch__":
-            label = "orch"
-        else:
-            label = worker[:7]
-        is_active = worker == state.current_worker
-        style = "bold cyan" if is_active else "dim"
+    for worker, usage in state.usage.items():
+        label = "orch" if worker == "__orch__" else trim(worker, 9)
+        style = "bold cyan" if worker == state.current_worker else "dim"
         tbl.add_row(
-            Text(label, style=style),
-            Text(f"{_fmt_tokens(u.input_tokens)}/{_fmt_tokens(u.output_tokens)}",
-                 style=style),
+            f"[{style}]{markup(label, 9)}[/]",
+            f"[{style}]{_fmt_tokens(usage.input_tokens)}/{_fmt_tokens(usage.output_tokens)}[/]",
         )
 
-    return Panel(tbl, title="[bold]USAGE[/bold]", border_style="yellow",
-                 box=box.ROUNDED)
+    return command_panel(tbl, "TELEMETRY", border_style="yellow")
 
 
-# ── Footer ───────────────────────────────────────────────────────────────────
+def _verification_panel(state: DashboardState) -> Panel:
+    tbl = Table(box=None, show_header=True, header_style="bold blue", expand=True, pad_edge=False)
+    tbl.add_column("Step", width=8, no_wrap=True)
+    tbl.add_column("Review", width=9, no_wrap=True)
+    tbl.add_column("Verify", width=9, no_wrap=True)
+    tbl.add_column("Reviewer", overflow="ellipsis")
+
+    if state.plan:
+        for step in state.plan.steps[-6:]:
+            review = state.step_statuses.get(step.step_id, "pending")
+            verify = state.step_verification.get(step.step_id, "")
+            reviewer = state.step_reviewers.get(step.step_id, "")
+            tbl.add_row(markup(step.step_id, 8), status_label(review), markup(verify, 9), markup(reviewer, 22))
+    else:
+        tbl.add_row("-", status_label("pending"), "-", "-")
+
+    return command_panel(tbl, "QUALITY GATES", border_style="blue")
+
 
 def _footer(state: DashboardState) -> Table:
-    total = max(state.total, 1)
-    filled = int((state.completed / total) * 28)
-    bar = "#" * filled + "." * (28 - filled)
-
-    cost = state.total_cost()
-    cost_str = f"${cost:.4f}" if cost > 0 else ""
-
     tbl = Table(box=None, show_header=False, padding=(0, 1), expand=True)
-    tbl.add_column("bar", ratio=3)
-    tbl.add_column("steps", ratio=1, justify="center")
-    tbl.add_column("git", ratio=1, justify="center")
-    tbl.add_column("cost", ratio=1, justify="right")
+    tbl.add_column("progress", ratio=3)
+    tbl.add_column("phase", ratio=1, justify="center")
+    tbl.add_column("blocked", ratio=2)
+    tbl.add_column("usage", ratio=1, justify="right")
+
+    blocked = trim(state.blocked_reason, 64, placeholder="")
+    usage = f"{_fmt_tokens(state.total_input())}/{_fmt_tokens(state.total_output())} tok"
     tbl.add_row(
-        Text(f"[{bar}]", style="cyan"),
-        Text(f"{state.completed}/{state.total} steps", style="bold"),
-        Text(f"git:{state.git_sha}", style="dim"),
-        Text(cost_str, style="yellow"),
+        f"[cyan]{progress_bar(state.completed, state.total, width=34)}[/cyan]",
+        status_label(state.run_phase, width=8),
+        f"[red]{markup(blocked)}[/red]" if blocked else "[dim]no blockers[/dim]",
+        f"[yellow]{usage}[/yellow]",
     )
     return tbl
 
 
-# ── Top-level layout builder ─────────────────────────────────────────────────
-
 def make_layout(state: DashboardState) -> Layout:
     layout = Layout()
-
     layout.split_column(
-        Layout(name="header", size=3),
+        Layout(name="header", size=4),
         Layout(name="body", ratio=1),
         Layout(name="footer", size=3),
     )
 
     layout["header"].update(_header(state))
-
     layout["body"].split_row(
-        Layout(name="plan",   ratio=30),
-        Layout(name="output", ratio=47),
-        Layout(name="right",  ratio=23),
+        Layout(name="plan", ratio=34),
+        Layout(name="output", ratio=42),
+        Layout(name="right", ratio=24),
+    )
+    layout["right"].split_column(
+        Layout(name="team", ratio=26),
+        Layout(name="quality", ratio=27),
+        Layout(name="events", ratio=24),
+        Layout(name="metrics", ratio=23),
     )
 
     layout["plan"].update(_plan_panel(state))
     layout["output"].update(_output_panel(state))
-
-    layout["right"].split_column(
-        Layout(name="agents",  ratio=45),
-        Layout(name="metrics", ratio=55),
-    )
-    layout["right"]["agents"].update(_agents_panel(state))
+    layout["right"]["team"].update(_team_panel(state))
+    layout["right"]["quality"].update(_verification_panel(state))
+    layout["right"]["events"].update(_events_panel(state))
     layout["right"]["metrics"].update(_metrics_panel(state))
-
     layout["footer"].update(_footer(state))
-
     return layout

@@ -4,11 +4,8 @@ import logging
 from pathlib import Path
 
 from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
 from rich.markdown import Markdown
-from rich import box
+from rich.console import Group
 
 from genesis import __version__
 from genesis.config import get_config, CONFIG_FILE, CodexAccount
@@ -24,6 +21,7 @@ from genesis.agents.codex_cli import CodexCLIAgent, find_codex_binary
 from genesis.agents.orchestrator import Orchestrator
 from genesis.ui.console import console
 from genesis.ui.dashboard import DashboardState, make_layout
+from genesis.ui.theme import command_panel, command_table, kv_table, markup, progress_bar, status_label, trim
 
 logger = logging.getLogger(__name__)
 
@@ -206,60 +204,106 @@ class GenesisREPL:
 
         # ── Callback closures ────────────────────────────────────────────
         def on_plan(plan):
+            state.run_phase = "planning"
             state.plan = plan
             state.total = len(plan.steps)
             for s in plan.steps:
                 state.step_statuses[s.step_id] = "pending"
+                scope = ", ".join(getattr(s, "file_scope", []) or []) or s.context_hint or "*"
+                state.step_scopes[s.step_id] = scope
+            state.add_event("plan", f"{len(plan.steps)} steps", "cyan")
 
         def on_step_start(step, idx, total):
+            state.run_phase = "running"
             state.current_step = step.step_id
             state.step_start = _dt.now()
             state.step_statuses[step.step_id] = "running"
-            state.add_output(f"[cyan]>[/cyan] [bold]{step.step_id}[/bold]: {step.title}")
+            state.add_event("start", f"{step.step_id} {step.title}", "cyan")
+            state.add_output(
+                f"[cyan]STEP[/cyan] [bold]{markup(step.step_id)}[/bold] {markup(step.title)}",
+                trusted_markup=True,
+            )
 
         def on_worker_assigned(step, worker_name):
             state.current_worker = worker_name
-            state.add_output(f"  [dim]worker: {worker_name}[/dim]")
+            state.step_workers[step.step_id] = worker_name
+            state.add_event("lease", f"{worker_name} -> {step.step_id}", "green")
+            state.add_output(
+                f"  [dim]worker[/dim] [cyan]{markup(worker_name)}[/cyan]",
+                trusted_markup=True,
+            )
 
         def on_step_result(step, result, worker_name):
             if result.files_written:
+                state.add_event("files", f"{step.step_id}: {len(result.files_written)} changed", "green")
                 for f in result.files_written:
-                    state.add_output(f"  [green]+[/green] {f}")
+                    state.add_output(f"  [green]+[/green] {markup(f)}", trusted_markup=True)
 
         def on_review(step, review):
+            state.run_phase = "reviewing"
+            state.current_reviewer = "independent-reviewer"
+            state.step_reviewers[step.step_id] = "independent-reviewer"
             color = "green" if review.verdict == "approved" else "yellow" if review.verdict == "needs_revision" else "red"
             icon  = "+" if review.verdict == "approved" else "~" if review.verdict == "needs_revision" else "x"
             state.add_output(
                 f"  [{color}]{icon} {review.verdict}[/{color}] "
-                f"[dim]score:{review.quality_score}/10[/dim]"
+                f"[dim]score:{review.quality_score}/10[/dim]",
+                trusted_markup=True,
             )
             state.step_statuses[step.step_id] = review.verdict
+            state.add_event("review", f"{step.step_id}: {review.verdict} {review.quality_score}/10", color)
 
         def on_commit(step, sha):
+            state.run_phase = "committing"
             if sha:
                 state.git_sha = sha
-                state.add_output(f"  [dim]git:{sha}[/dim]")
+                state.add_output(f"  [dim]git:{markup(sha)}[/dim]", trusted_markup=True)
+                state.add_event("commit", f"{step.step_id}: {sha}", "green")
+            state.step_statuses[step.step_id] = "committed"
 
         def on_step_complete(step, review, completed, total):
             state.completed = completed
+            state.step_statuses[step.step_id] = "committed"
             if state.step_start:
                 elapsed = (_dt.now() - state.step_start).total_seconds()
                 state.step_elapsed[step.step_id] = elapsed
             state.step_start = None
             state.current_worker = ""
+            state.current_reviewer = ""
+            state.step_verification[step.step_id] = "passed"
+            state.add_event("done", f"{step.step_id} complete", "green")
 
         def on_status(msg):
-            state.add_output(f"[dim]{msg}[/dim]")
+            lowered = str(msg).lower()
+            if "planning" in lowered:
+                state.run_phase = "planning"
+            elif "executing" in lowered:
+                state.run_phase = "running"
+            elif "repair" in lowered or "retry" in lowered:
+                state.run_phase = "repairing"
+                if state.current_step:
+                    state.step_repairs[state.current_step] = state.step_repairs.get(state.current_step, 0) + 1
+            elif "blocked" in lowered or "no runnable" in lowered:
+                state.run_phase = "blocked"
+                state.blocked_reason = msg
+            state.add_event("status", trim(msg, 80), "dim")
+            state.add_output(f"[dim]{markup(msg)}[/dim]", trusted_markup=True)
 
         def on_error(step, error):
-            state.add_output(f"  [red]x {error}[/red]")
-            state.step_statuses[step.step_id] = "rejected"
+            state.run_phase = "blocked"
+            state.blocked_reason = error
+            state.add_output(f"  [red]x {markup(error)}[/red]", trusted_markup=True)
+            state.step_statuses[step.step_id] = "blocked"
             state.current_worker = ""
+            state.add_event("error", f"{step.step_id}: {error}", "red")
 
         def on_task_complete(plan):
+            state.run_phase = "completed"
             state.add_output(
-                f"\n[bold green]+ Task complete  {state.completed}/{state.total} steps[/bold green]"
+                f"\n[bold green]+ Task complete  {state.completed}/{state.total} steps[/bold green]",
+                trusted_markup=True,
             )
+            state.add_event("release", "run complete", "green")
 
         # ── Wire callbacks to also refresh the Live display ──────────────
         raw_callbacks = {
@@ -293,6 +337,17 @@ class GenesisREPL:
                 # on_output fires on every streaming line — update state only;
                 # Live's timer handles redraw. Also extract token counts.
                 def on_output(line: str) -> None:
+                    lowered = str(line).lower()
+                    if "verify $" in lowered:
+                        state.run_phase = "verifying"
+                        if state.current_step:
+                            state.step_verification[state.current_step] = "running"
+                        state.add_event("verify", trim(line, 80), "blue")
+                    elif "retrying" in lowered or "repairing" in lowered:
+                        state.run_phase = "repairing"
+                        if state.current_step:
+                            state.step_repairs[state.current_step] = state.step_repairs.get(state.current_step, 0) + 1
+                        state.add_event("repair", trim(line, 80), "yellow")
                     state.add_output(f"  {line}")
                     if "Tokens:" in line:
                         state.record_token_line(line)
@@ -317,60 +372,96 @@ class GenesisREPL:
             console.print("[red]No agents available.[/red]")
             return
 
-        console.print(f"[dim]Planning:[/dim] {task}\n")
+        console.print(command_panel(f"[bold]{markup(task, 120)}[/bold]", "PLAN PREVIEW", border_style="cyan"))
         try:
             plan = orchestrator.plan(task)
         except Exception as e:
             console.print(f"[red]Planning failed: {e}[/red]")
             return
 
-        tbl = Table(
-            title=f"[bold]{plan.task_summary}[/bold]  [dim](id: {plan.task_id})[/dim]",
-            box=box.ROUNDED,
-            show_lines=True,
-        )
-        tbl.add_column("#", style="dim", width=8)
+        tbl = command_table(f"Plan: {plan.task_summary}", border_style="blue", show_lines=True)
+        tbl.add_column("#", style="dim", width=8, no_wrap=True)
         tbl.add_column("Title", width=32)
         tbl.add_column("Type", width=10)
         tbl.add_column("Agent", width=16)
         tbl.add_column("Depends On", width=14)
+        tbl.add_column("Scope", width=24)
 
         for s in plan.steps:
-            deps = ", ".join(s.depends_on) if s.depends_on else "—"
-            tbl.add_row(s.step_id, s.title, s.type, s.preferred_agent, deps)
+            deps = ", ".join(s.depends_on) if s.depends_on else "-"
+            scope = ", ".join(s.file_scope) if getattr(s, "file_scope", []) else s.context_hint or "*"
+            tbl.add_row(
+                markup(s.step_id),
+                markup(s.title),
+                markup(s.type),
+                markup(s.preferred_agent),
+                markup(deps),
+                markup(scope, 24),
+            )
 
         console.print(tbl)
 
     def cmd_status(self) -> None:
-        tbl = Table(title="Configured Agents", box=box.ROUNDED)
-        tbl.add_column("Name", style="cyan")
-        tbl.add_column("Provider")
-        tbl.add_column("Model")
-        tbl.add_column("Role")
+        agent_tbl = command_table("Agent Roster", border_style="magenta")
+        agent_tbl.add_column("Role", width=12)
+        agent_tbl.add_column("Name", style="cyan")
+        agent_tbl.add_column("Provider", width=14)
+        agent_tbl.add_column("Model", width=22)
+        agent_tbl.add_column("State", width=10)
 
         for name, agent in self._agents.items():
             role = "orchestrator" if "orchestrator" in name else "worker"
-            tbl.add_row(name, agent.provider, agent.model, role)
+            agent_tbl.add_row(
+                "ORCH" if role == "orchestrator" else "WORK",
+                markup(name),
+                markup(agent.provider),
+                markup(agent.model),
+                status_label("idle"),
+            )
 
         if not self._agents:
-            tbl.add_row("[dim]none[/dim]", "—", "—", "—")
+            agent_tbl.add_row("-", "[dim]none[/dim]", "-", "-", status_label("blocked"))
 
-        console.print(tbl)
+        cfg = self.config
+        ops_tbl = kv_table(
+            [
+                ("work_dir", self.work_dir),
+                ("state_db", resolve_state_db(cfg)),
+                ("max_parallel", cfg.runtime.max_parallel_workers),
+                ("retry_budget", cfg.runtime.retry_budget),
+                ("verification", ", ".join(cfg.verification.commands) or "not configured"),
+                ("auto_commit", cfg.git.auto_commit),
+                ("auto_push", cfg.git.auto_push),
+            ],
+            title="Runtime Controls",
+            border_style="cyan",
+        )
+
+        console.print(Group(agent_tbl, ops_tbl))
 
         log = self.git.get_log(5)
         if log:
-            console.print("\n[bold]Recent commits:[/bold]")
+            commit_tbl = command_table("Recent Commits", border_style="green")
+            commit_tbl.add_column("Commit")
             for entry in log:
-                console.print(f"  [dim]{entry}[/dim]")
+                commit_tbl.add_row(markup(entry))
+            console.print(commit_tbl)
 
         runs = self.runtime.latest_runs(5)
         if runs:
-            console.print("\n[bold]Recent runs:[/bold]")
+            run_tbl = command_table("Recent Runs", border_style="blue")
+            run_tbl.add_column("Run", style="cyan", width=14)
+            run_tbl.add_column("State", width=11)
+            run_tbl.add_column("Updated", style="dim", width=20)
+            run_tbl.add_column("Task")
             for run in runs:
-                console.print(
-                    f"  [dim]{run.run_id}[/dim] {run.status:10} {run.task[:72]}"
+                run_tbl.add_row(
+                    markup(run.run_id),
+                    status_label(run.status),
+                    markup(run.updated_at[:19]),
+                    markup(run.task, 84),
                 )
-        console.print(f"\n[dim]State DB: {resolve_state_db(self.config)}[/dim]")
+            console.print(run_tbl)
 
     def cmd_memory(self, args: list[str]) -> None:
         sub = args[0] if args else "show"
@@ -386,17 +477,17 @@ class GenesisREPL:
             if not hits:
                 console.print("[dim]No memory hits.[/dim]")
                 return
-            tbl = Table(title=f"Memory search: {query}", box=box.ROUNDED)
+            tbl = command_table(f"Memory Search: {query}", border_style="cyan")
             tbl.add_column("When", style="dim", width=20)
             tbl.add_column("Scope", style="cyan", width=24)
             tbl.add_column("Title")
             tbl.add_column("Kind", width=16)
             for hit in hits:
                 tbl.add_row(
-                    hit.created_at[:19],
-                    f"{hit.room}/{hit.closet}",
-                    hit.title[:60],
-                    hit.kind,
+                    markup(hit.created_at[:19]),
+                    markup(f"{hit.room}/{hit.closet}", 24),
+                    markup(hit.title, 70),
+                    markup(hit.kind),
                 )
             console.print(tbl)
         elif sub == "mine":
@@ -435,7 +526,7 @@ class GenesisREPL:
 
         if sub == "show":
             cfg = self.config
-            tbl = Table(title="Genesis Configuration", box=box.ROUNDED)
+            tbl = command_table("Genesis Configuration", border_style="cyan")
             tbl.add_column("Setting", style="cyan")
             tbl.add_column("Value")
 
@@ -463,10 +554,10 @@ class GenesisREPL:
                 ("policy.file", cfg.policy.file),
             ]
             for k, v in rows:
-                tbl.add_row(k, v)
+                tbl.add_row(markup(k), str(v))
 
             console.print(tbl)
-            console.print(f"\n[dim]Config file: {CONFIG_FILE}[/dim]")
+            console.print(command_panel(markup(CONFIG_FILE), "CONFIG FILE", border_style="blue"))
 
         elif sub == "edit":
             editor = os.environ.get("EDITOR", "notepad")
@@ -499,13 +590,26 @@ class GenesisREPL:
         if not runs:
             console.print("[dim]No durable runs recorded yet.[/dim]")
             return
-        tbl = Table(title="Recent Genesis Runs", box=box.ROUNDED)
+        tbl = command_table("Mission Control: Recent Runs", border_style="blue")
         tbl.add_column("Run ID", style="cyan", width=14)
         tbl.add_column("Status", width=12)
+        tbl.add_column("Progress", width=12)
         tbl.add_column("Updated", style="dim", width=20)
+        tbl.add_column("Blocker", width=26)
         tbl.add_column("Task")
         for run in runs:
-            tbl.add_row(run.run_id, run.status, run.updated_at[:19], run.task[:80])
+            completed = run.metadata.get("completed_steps", 0)
+            total = run.metadata.get("total_steps", run.metadata.get("estimated_steps", 0))
+            progress = f"{completed}/{total}" if total else "-"
+            blocker = run.metadata.get("reason") or run.metadata.get("blocked_step") or ""
+            tbl.add_row(
+                markup(run.run_id),
+                status_label(run.status),
+                markup(progress),
+                markup(run.updated_at[:19]),
+                markup(blocker, 26),
+                markup(run.task, 80),
+            )
         console.print(tbl)
 
     def cmd_resume(self, run_id: str) -> None:
@@ -556,20 +660,31 @@ class GenesisREPL:
         if not run:
             console.print(f"[red]Run not found:[/red] {run_id}")
             return
+        progress = f"{run.metadata.get('completed_steps', 0)}/{run.metadata.get('total_steps', run.metadata.get('estimated_steps', 0))}"
         console.print(
-            Panel(
-                f"[bold]{run.task}[/bold]\n\n"
-                f"[cyan]Run:[/cyan] {run.run_id}\n"
-                f"[cyan]Status:[/cyan] {run.status}\n"
-                f"[cyan]Created:[/cyan] {run.created_at}\n"
-                f"[cyan]Updated:[/cyan] {run.updated_at}",
-                title="Run",
+            command_panel(
+                Group(
+                    kv_table(
+                        [
+                            ("run", run.run_id),
+                            ("status", run.status),
+                            ("progress", progress),
+                            ("created", run.created_at),
+                            ("updated", run.updated_at),
+                            ("blocked", run.metadata.get("reason", "")),
+                        ],
+                        title="Run Metadata",
+                        border_style="blue",
+                    ),
+                    command_panel(f"[bold]{markup(run.task, 140)}[/bold]", "TASK", border_style="cyan"),
+                ),
+                "RUN INSPECTOR",
                 border_style="blue",
             )
         )
         steps = self.runtime.steps(run_id)
         if steps:
-            step_tbl = Table(title="Steps", box=box.ROUNDED)
+            step_tbl = command_table("Step Handoff Matrix", border_style="cyan")
             step_tbl.add_column("Step", style="cyan", width=12)
             step_tbl.add_column("Status", width=12)
             step_tbl.add_column("Worker", width=18)
@@ -588,21 +703,21 @@ class GenesisREPL:
                 else:
                     scope_text = str(scope)
                 step_tbl.add_row(
-                    step.step_id,
-                    step.status,
-                    step.worker,
-                    str(step.metadata.get("reviewer", "")),
-                    str(step.metadata.get("lease", "")),
-                    str(step.metadata.get("repair_attempts", "")),
-                    scope_text[:24],
-                    step.commit_sha,
-                    step.patch_artifact_id,
-                    str(step.metadata.get("blocked_reason", ""))[:24],
-                    step.title[:60],
+                    markup(step.step_id),
+                    status_label(step.status),
+                    markup(step.worker, 18),
+                    markup(step.metadata.get("reviewer", ""), 18),
+                    markup(step.metadata.get("lease", ""), 10),
+                    markup(step.metadata.get("repair_attempts", ""), 7),
+                    markup(scope_text, 24),
+                    markup(step.commit_sha, 10),
+                    markup(step.patch_artifact_id, 18),
+                    markup(step.metadata.get("blocked_reason", ""), 24),
+                    markup(step.title, 60),
                 )
             console.print(step_tbl)
         events = self.runtime.events(run_id, limit=80)
-        tbl = Table(title="Events", box=box.ROUNDED)
+        tbl = command_table("Runtime Event Trace", border_style="magenta")
         tbl.add_column("#", style="dim", width=5)
         tbl.add_column("Time", style="dim", width=20)
         tbl.add_column("Step", style="cyan", width=12)
@@ -611,11 +726,11 @@ class GenesisREPL:
         for event in events:
             payload = str(event.payload)
             tbl.add_row(
-                str(event.id),
-                event.created_at[:19],
-                event.step_id,
-                event.event_type,
-                payload[:90],
+                markup(event.id),
+                markup(event.created_at[:19]),
+                markup(event.step_id),
+                markup(event.event_type),
+                markup(payload, 110),
             )
         console.print(tbl)
 
@@ -855,7 +970,7 @@ class GenesisREPL:
             elif cmd == "clear":
                 console.clear()
             elif cmd == "help":
-                console.print(_HELP)
+                console.print(command_panel(Markdown(_HELP), "COMMAND INDEX", border_style="cyan"))
             else:
                 console.print(
                     f"[yellow]Unknown command '{cmd}'.[/yellow] "
@@ -863,34 +978,44 @@ class GenesisREPL:
                 )
 
     def _print_banner(self) -> None:
-        key_status = []
-        if find_claude_binary():
-            key_status.append("[green]Claude Code ✓[/green]")
-        else:
-            key_status.append("[red]Claude Code ✗[/red]")
-        if find_codex_binary():
-            key_status.append("[green]Codex ✓[/green]")
-        else:
-            key_status.append("[dim]Codex —[/dim]")
+        systems = [
+            ("Claude Code", "online" if find_claude_binary() else "missing"),
+            ("Codex", "online" if find_codex_binary() else "missing"),
+        ]
         if self.config.chatgpt_browser.enabled:
-            key_status.append("[cyan]ChatGPT browser ✓[/cyan]")
+            systems.append(("ChatGPT browser", "online"))
 
-        agents_line = "  ·  ".join(key_status)
-        agent_names = ", ".join(self._agents.keys()) or "[red]none available[/red]"
+        sys_tbl = command_table("Subsystems", border_style="magenta")
+        sys_tbl.add_column("System")
+        sys_tbl.add_column("State", width=12)
+        for name, state in systems:
+            sys_tbl.add_row(markup(name), status_label(state))
+
+        ops_tbl = kv_table(
+            [
+                ("version", __version__),
+                ("work_dir", self.work_dir),
+                ("memory", self.config.memory.file),
+                ("agents", ", ".join(self._agents.keys()) or "none available"),
+                ("parallelism", self.config.runtime.max_parallel_workers),
+                ("state_db", resolve_state_db(self.config)),
+            ],
+            title="Command Center",
+            border_style="cyan",
+        )
 
         console.print()
         console.print(
-            Panel(
-                f"[bold white]GENESIS[/bold white] [dim]v{__version__}[/dim]\n"
-                f"[dim]AI Software Development Firm · Terminal Edition[/dim]\n\n"
-                f"[cyan]Work dir:[/cyan]  {self.work_dir}\n"
-                f"[cyan]Memory:[/cyan]    {self.config.memory.file}\n"
-                f"[cyan]Agents:[/cyan]    {agents_line}\n"
-                f"[cyan]Active:[/cyan]    {agent_names}\n\n"
-                f"[dim]Type [bold]help[/bold] · [bold]run <task>[/bold] to start · [bold]exit[/bold] to quit[/dim]",
-                title="[bold magenta]* GENESIS[/bold magenta]",
+            command_panel(
+                Group(
+                    ops_tbl,
+                    sys_tbl,
+                    "[dim]Commands: run <task> | runs | inspect <run_id> | status | help | exit[/dim]",
+                ),
+                "GENESIS",
                 border_style="magenta",
-                padding=(1, 3),
+                subtitle="terminal command center",
+                padding=(1, 2),
             )
         )
         console.print()

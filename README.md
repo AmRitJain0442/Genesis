@@ -17,7 +17,7 @@ When you type `run <task>`, Genesis:
 5. Approved, verified steps are committed to git automatically, then a release summary is recorded
 6. Progress is written to `GENESIS_MEMORY.md` in the repository so the context accumulates across steps
 
-While workers execute you see a live terminal dashboard: the plan with step statuses, streaming agent output (shell commands, file writes, token counts), agent roster, and cumulative usage metrics.
+While workers execute you see a live command-center dashboard: scoped plan state, active worker/reviewer handoffs, streaming agent output, repair and verification activity, recent runtime events, agent roster, and cumulative usage metrics.
 
 ---
 
@@ -244,16 +244,19 @@ exit                       Quit Genesis
 
 ---
 
-## Dashboard
+## Command-center UI
 
-The terminal dashboard refreshes 8 times per second and shows:
+The terminal dashboard refreshes 8 times per second and is designed as an operator console:
 
-- **Header** — animated spinner, task name, active worker, current step progress, elapsed time
-- **PLAN** (left) — all steps with status icons and per-step elapsed time
-- **AGENT OUTPUT** (center) — live streaming from the active worker: shell commands and their output, files written, thinking previews, token counts per turn
-- **AGENTS** (top right) — full roster of registered agents with the active worker highlighted
-- **USAGE** (bottom right) — cumulative input/output/cached tokens and cost broken down per worker
-- **Footer** — progress bar, step count, latest git SHA, session cost
+- **Header** - task, phase, elapsed time, active worker/reviewer, current step, latest git SHA, and progress.
+- **Execution plan** - step status, declared/effective scope, repair count, title, and completion progress.
+- **Agent output** - streaming worker commands, file changes, review results, repair attempts, verification output, commits, and errors.
+- **Team** - configured agents with role and active state.
+- **Quality gates** - review and verification state per step.
+- **Event trace** - recent orchestration handoffs such as leases, reviews, repairs, verification, and release summary.
+- **Telemetry** - input/output/cached tokens, cost, and per-agent usage.
+
+Static REPL views use the same command-center styling. `status` shows agent roster and runtime controls, `runs` is the recent mission list, `inspect <run_id>` is the detailed diagnostic view, and `plan <task>` previews dependencies and file scopes before execution.
 
 ---
 
