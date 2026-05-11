@@ -61,8 +61,8 @@ commit_prefix = "[genesis]"
 
 [runtime]
 state_db = ""              # empty = ~/.genesis/state/genesis.db
-retry_budget = 1
-max_parallel_workers = 1   # reserved for dependency-aware parallel execution
+retry_budget = 1           # bounded self-repair attempts per failed review/verification
+max_parallel_workers = 1   # safe parallel worker leases; increase when multiple workers exist
 checkpoint_mode = "always"
 
 [memory]

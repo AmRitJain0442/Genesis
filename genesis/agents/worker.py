@@ -111,6 +111,7 @@ class Worker:
             f"Title: {step.title}\n"
             f"Type: {step.type}\n"
             f"Description: {step.description}\n"
+            f"File Scope: {', '.join(step.file_scope) if step.file_scope else 'Unspecified'}\n"
             f"Expected Output: {step.expected_output}\n"
             f"Context Hint: {step.context_hint or 'None'}\n\n"
             f"Execute this step now. Remember to wrap your full response in <result> tags."

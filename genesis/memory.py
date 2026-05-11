@@ -46,11 +46,12 @@ class MemoryManager:
             f"\n## Task: {plan.task_summary}",
             f"*Started: {ts}* · Task ID: `{plan.task_id}`\n",
             f"### Plan ({plan.estimated_steps} steps)\n",
-            "| Step | Title | Type | Agent |",
-            "|------|-------|------|-------|",
+            "| Step | Title | Type | Agent | Scope |",
+            "|------|-------|------|-------|-------|",
         ]
         for s in plan.steps:
-            lines.append(f"| {s.step_id} | {s.title} | {s.type} | {s.preferred_agent} |")
+            scope = ", ".join(s.file_scope) if s.file_scope else ""
+            lines.append(f"| {s.step_id} | {s.title} | {s.type} | {s.preferred_agent} | {scope} |")
         lines.append("\n### Progress\n")
         self._append("\n".join(lines) + "\n")
 

@@ -35,6 +35,7 @@ Type:            {type}
 Description:
 {description}
 
+File scope:      {file_scope}
 Expected output: {expected_output}
 Context hint:    {context_hint}
 
@@ -71,6 +72,7 @@ class CodexWorker:
             title=step.title,
             type=step.type,
             description=step.description,
+            file_scope=", ".join(step.file_scope) if step.file_scope else "Unspecified",
             expected_output=step.expected_output,
             context_hint=step.context_hint or "None",
         )

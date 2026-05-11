@@ -57,7 +57,7 @@ class PalaceStore:
         return cls(resolve_state_db(config))
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.db_path)
+        con = sqlite3.connect(self.db_path, timeout=30.0)
         con.row_factory = sqlite3.Row
         return con
 

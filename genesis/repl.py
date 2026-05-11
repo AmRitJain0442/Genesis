@@ -455,6 +455,7 @@ class GenesisREPL:
                 ("git.commit_prefix", cfg.git.commit_prefix),
                 ("runtime.state_db", str(resolve_state_db(cfg))),
                 ("runtime.retry_budget", str(cfg.runtime.retry_budget)),
+                ("runtime.max_parallel_workers", str(cfg.runtime.max_parallel_workers)),
                 ("memory.file", cfg.memory.file),
                 ("memory.max_context_chars", str(cfg.memory.max_context_chars)),
                 ("memory.palace_enabled", str(cfg.memory.palace_enabled)),
@@ -572,16 +573,31 @@ class GenesisREPL:
             step_tbl.add_column("Step", style="cyan", width=12)
             step_tbl.add_column("Status", width=12)
             step_tbl.add_column("Worker", width=18)
+            step_tbl.add_column("Reviewer", width=18)
+            step_tbl.add_column("Lease", width=10)
+            step_tbl.add_column("Repairs", width=7)
+            step_tbl.add_column("Scope", width=24)
             step_tbl.add_column("Commit", width=10)
             step_tbl.add_column("Patch", width=18)
+            step_tbl.add_column("Blocker", width=24)
             step_tbl.add_column("Title")
             for step in steps:
+                scope = step.metadata.get("effective_scope", step.metadata.get("scope", []))
+                if isinstance(scope, list):
+                    scope_text = ", ".join(scope)
+                else:
+                    scope_text = str(scope)
                 step_tbl.add_row(
                     step.step_id,
                     step.status,
                     step.worker,
+                    str(step.metadata.get("reviewer", "")),
+                    str(step.metadata.get("lease", "")),
+                    str(step.metadata.get("repair_attempts", "")),
+                    scope_text[:24],
                     step.commit_sha,
                     step.patch_artifact_id,
+                    str(step.metadata.get("blocked_reason", ""))[:24],
                     step.title[:60],
                 )
             console.print(step_tbl)

@@ -1,8 +1,11 @@
 from __future__ import annotations
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 import json
 import uuid
 import logging
 from pathlib import Path
+from threading import Lock
 from typing import Callable, TYPE_CHECKING
 
 from genesis.schemas.plan import Plan, Step
@@ -14,6 +17,13 @@ from genesis.config import GenesisConfig
 from genesis.palace import PalaceStore
 from genesis.policy import ExecutionPolicy
 from genesis.runtime import RuntimeStore
+from genesis.scheduler import (
+    DependencyScheduler,
+    ScheduledStep,
+    StepScope,
+    declared_step_scope,
+    infer_step_scope,
+)
 from genesis.verifier import Verifier, VerificationResult
 from genesis.worktree import WorktreeManager, WorktreePatch
 
@@ -35,6 +45,27 @@ def _make_worker(agent: BaseAgent, memory_summary: str, work_dir: str,
     return Worker(agent, memory_summary, work_dir, output_callback=output_callback)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _StepExecution:
+    step: Step
+    worker_name: str
+    worktree_path: Path | None = None
+    result: WorkerResult | None = None
+    patch: WorktreePatch | None = None
+    patch_id: str = ""
+    review: Review | None = None
+    verification: VerificationResult | None = None
+    repair_attempts: int = 0
+    reviewer_name: str = ""
+    failed_agent: str = ""
+    failed_reason: str = ""
+    memory_note: str = ""
+
+    @property
+    def failed(self) -> bool:
+        return bool(self.failed_reason)
 
 _SYSTEM = """\
 You are Genesis Orchestrator — the director of an AI software development firm.
@@ -61,6 +92,7 @@ When asked to plan a task, return ONLY a JSON object — no prose before or afte
       "type": "<code|docs|review|research|test|config|refactor>",
       "preferred_agent": "<codex-worker|any>",
       "depends_on": [],
+      "file_scope": ["<paths this step is expected to change, or * for broad repo work>"],
       "expected_output": "<description of what success looks like>",
       "context_hint": "<optional: file paths, constraints, examples>"
     }
@@ -70,6 +102,7 @@ When asked to plan a task, return ONLY a JSON object — no prose before or afte
 Planning rules:
 - Break tasks into 3–10 concrete, atomic steps — each must produce a real artifact.
 - Use depends_on to express ordering (step-2 depends on step-1 means step-1 runs first).
+- Fill file_scope with concrete files/directories whenever known; use ["*"] for unclear, dependency, config, or repo-wide work.
 - Write description as if briefing a senior engineer: precise, complete, unambiguous.
 - Study the memory context and do NOT re-plan work that is already done.
 
@@ -91,6 +124,31 @@ Review rules:
 - Never approve code with syntax errors, incomplete stubs, or missing imports.
 - memory_note must be factual (what was built), not aspirational (what was attempted).
 - should_retry = true only when the fix is clear and a retry would plausibly succeed.
+"""
+
+_REVIEW_SYSTEM = """\
+You are Genesis Independent Reviewer - a senior engineer doing final acceptance.
+
+You did not write the implementation. Review the step result against the stated
+expected output, changed files, and diff. Be concrete and strict.
+
+Return ONLY a JSON object:
+
+{
+  "step_id": "<id>",
+  "verdict": "<approved|needs_revision|rejected>",
+  "quality_score": <1-10>,
+  "feedback": "<specific actionable feedback if not approved, else empty string>",
+  "memory_note": "<1-2 factual sentences about what changed>",
+  "should_retry": <true|false>,
+  "suggested_revision": "<if retryable: exact implementation instructions>"
+}
+
+Rules:
+- Approve only complete, runnable work that matches the step.
+- Use needs_revision only when the worker can likely repair it with one focused retry.
+- Use rejected for unsafe, unrelated, or fundamentally wrong work.
+- Never approve syntax errors, broken imports, failing tests, placeholders, or unreviewable output.
 """
 
 
@@ -216,15 +274,16 @@ class Orchestrator:
             f"  ID: {step.step_id}\n"
             f"  Title: {step.title}\n"
             f"  Type: {step.type}\n"
+            f"  Declared File Scope: {', '.join(step.file_scope) if step.file_scope else 'None'}\n"
             f"  Expected Output: {step.expected_output}\n\n"
             f"FILES WRITTEN ({len(result.files_written)}):\n\n{files_block}\n\n"
             f"GIT DIFF:\n\n{diff_block}\n\n"
             f"Return your review as JSON."
         )
         if hasattr(self.agent, "chat_review"):
-            raw = self.agent.chat_review(_SYSTEM, [{"role": "user", "content": msg}])
+            raw = self.agent.chat_review(_REVIEW_SYSTEM, [{"role": "user", "content": msg}])
         else:
-            raw = self.agent.chat(_SYSTEM, [{"role": "user", "content": msg}])
+            raw = self.agent.chat(_REVIEW_SYSTEM, [{"role": "user", "content": msg}])
         if not raw or not raw.strip():
             raise ValueError(f"Orchestrator returned empty review response for {step.step_id}")
         data = self._extract_json(raw)
@@ -293,11 +352,14 @@ class Orchestrator:
         plan_payload = self.runtime.get_checkpoint(run_id, "plan_created")
         if not plan_payload:
             raise RuntimeError(f"No stored plan found for run {run_id}.")
+        plan = Plan(**plan_payload)
         if retry_step_id:
-            self.runtime.reset_step_for_retry(run_id, retry_step_id)
+            for step_id in self._retry_step_ids(plan, retry_step_id):
+                record = self.runtime.get_step(run_id, step_id)
+                if record and record.status != "committed":
+                    self.runtime.reset_step_for_retry(run_id, step_id)
         else:
             self.runtime.update_run_status(run_id, "running")
-        plan = Plan(**plan_payload)
         if callbacks and (fn := callbacks.get("on_plan")):
             fn(plan)
         self._execute_plan_isolated(plan, callbacks=callbacks)
@@ -310,46 +372,318 @@ class Orchestrator:
     ) -> None:
         cb = callbacks or {}
         output_callback = cb.get("on_output")
+        output_lock = Lock()
+        worktree_lock = Lock()
 
         def fire(name: str, *args, **kwargs) -> None:
             if fn := cb.get(name):
                 fn(*args, **kwargs)
+
+        def guarded_output(text: str) -> None:
+            if output_callback:
+                with output_lock:
+                    output_callback(text)
 
         if not self.config.git.auto_commit:
             raise RuntimeError(
                 "Isolated execution requires git.auto_commit=true so each accepted "
                 "step becomes the base for the next worktree."
             )
+        if not self.worker_agents:
+            raise RuntimeError("No worker agents available")
 
         run_id = plan.task_id
         steps = _topo_sort(plan.steps)
+        scheduler = DependencyScheduler(steps)
+        max_parallel = max(1, min(
+            self.config.runtime.max_parallel_workers,
+            len(self.worker_agents) or 1,
+            len(steps) or 1,
+        ))
         worktrees = WorktreeManager(self.work_dir)
         worktrees.ensure_clean_main(ignore_paths=[self.config.memory.file, ".genesis/"])
-        completed = sum(
-            1
-            for step in steps
-            if self.runtime
-            and (record := self.runtime.get_step(run_id, step.step_id))
-            and record.status == "committed"
-        )
-        blocked = False
 
-        for i, step in enumerate(steps):
+        committed_ids: set[str] = set()
+        blocked_ids: set[str] = set()
+        for step in steps:
             record = self.runtime.get_step(run_id, step.step_id) if self.runtime else None
-            if record and record.status == "committed":
-                fire("on_status", f"Skipping committed {step.step_id}")
+            if not record:
                 continue
+            if record.status == "committed":
+                committed_ids.add(step.step_id)
+                fire("on_status", f"Skipping committed {step.step_id}")
+            elif record.status == "blocked":
+                blocked_ids.add(step.step_id)
+            elif record.status in {"running", "reviewing", "verifying"}:
+                if self.runtime:
+                    self.runtime.upsert_step(
+                        run_id,
+                        step.step_id,
+                        title=step.title,
+                        status="pending",
+                        metadata={"resumed_from": record.status},
+                    )
 
-            fire("on_step_start", step, i, len(steps))
+        completed = len(committed_ids)
+        active: dict[Future[_StepExecution], tuple[ScheduledStep, str]] = {}
+        active_scopes: dict[str, StepScope] = {}
+        active_workers: set[str] = set()
+        halted_new_work = False
+
+        fire(
+            "on_status",
+            f"Executing {len(steps)} steps with up to {max_parallel} parallel worker(s)...",
+        )
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            while completed < len(steps):
+                if not halted_new_work:
+                    open_slots = max_parallel - len(active)
+                    available_workers = len(self.worker_agents) - len(active_workers)
+                    batch = scheduler.select_ready(
+                        committed_ids=committed_ids,
+                        unavailable_ids=blocked_ids | set(active_scopes),
+                        active_scopes=active_scopes.values(),
+                        limit=min(open_slots, available_workers),
+                    )
+                    for scheduled in batch:
+                        step = scheduled.step
+                        worker_name, worker_agent = self._assign_worker(step, unavailable=active_workers)
+                        active_workers.add(worker_name)
+                        active_scopes[step.step_id] = scheduled.scope
+                        fire("on_step_start", step, completed + len(active), len(steps))
+                        fire("on_worker_assigned", step, worker_name)
+                        if self.runtime:
+                            self.runtime.upsert_step(
+                                run_id,
+                                step.step_id,
+                                title=step.title,
+                                status="running",
+                                worker=worker_name,
+                                metadata=self._scope_metadata(scheduled.step, scheduled.scope, lease="active"),
+                            )
+                            self.runtime.record_event(
+                                run_id,
+                                "step_leased",
+                                step_id=step.step_id,
+                                payload={
+                                    "worker": worker_name,
+                                    "effective_scope": list(scheduled.scope.paths),
+                                    "scope_source": scheduled.scope.source,
+                                    "max_parallel": max_parallel,
+                                },
+                            )
+                        future = executor.submit(
+                            self._run_step_in_worktree,
+                            run_id,
+                            step,
+                            worker_name,
+                            worker_agent,
+                            worktrees,
+                            guarded_output,
+                            worktree_lock,
+                        )
+                        active[future] = (scheduled, worker_name)
+
+                if not active:
+                    reason = (
+                        "No runnable steps remain. Pending steps are waiting on "
+                        "blocked dependencies or conservative file-scope locks."
+                    )
+                    if self.runtime:
+                        self.runtime.update_run_status(
+                            run_id,
+                            "blocked",
+                            metadata={
+                                "completed_steps": completed,
+                                "total_steps": len(steps),
+                                "blocked_steps": sorted(blocked_ids),
+                                "reason": reason,
+                            },
+                        )
+                    fire("on_status", reason)
+                    break
+
+                done, _ = wait(active, return_when=FIRST_COMPLETED)
+                for future in done:
+                    scheduled, worker_name = active.pop(future)
+                    step = scheduled.step
+                    active_workers.discard(worker_name)
+                    active_scopes.pop(step.step_id, None)
+                    try:
+                        execution = future.result()
+                    except Exception as e:
+                        logger.exception("Unhandled step execution error for %s", step.step_id)
+                        execution = _StepExecution(
+                            step=step,
+                            worker_name=worker_name,
+                            failed_agent="worker-runtime",
+                            failed_reason=str(e),
+                            memory_note=f"Execution failed: {e}",
+                        )
+
+                    if execution.result:
+                        fire("on_step_result", step, execution.result, execution.worker_name)
+                    if execution.review:
+                        fire("on_review", step, execution.review)
+                        if execution.patch:
+                            self.memory.append_step(
+                                step.step_id,
+                                step.title,
+                                execution.worker_name,
+                                execution.review.memory_note,
+                                execution.review.verdict,
+                            )
+                            self._remember_step(
+                                run_id,
+                                step,
+                                execution.worker_name,
+                                execution.review,
+                                execution.patch,
+                            )
+
+                    if execution.failed:
+                        self._block_step(
+                            run_id,
+                            step,
+                            execution.failed_agent or execution.worker_name,
+                            execution.memory_note or execution.failed_reason,
+                            execution.failed_reason,
+                            fire,
+                        )
+                        blocked_ids.add(step.step_id)
+                        halted_new_work = True
+                        continue
+
+                    if not execution.patch:
+                        self._block_step(
+                            run_id,
+                            step,
+                            "worker-runtime",
+                            "Step completed without a captured patch.",
+                            "missing patch",
+                            fire,
+                        )
+                        blocked_ids.add(step.step_id)
+                        halted_new_work = True
+                        continue
+
+                    try:
+                        worktrees.apply_check(execution.patch.patch_text)
+                        worktrees.apply_patch(execution.patch.patch_text)
+                    except Exception as e:
+                        self._block_step(run_id, step, "git-apply", f"Patch apply failed: {e}", str(e), fire)
+                        blocked_ids.add(step.step_id)
+                        halted_new_work = True
+                        continue
+
+                    sha = self.git.commit_step(step.step_id, step.title)
+                    if not sha and execution.patch.has_changes:
+                        self._block_step(
+                            run_id,
+                            step,
+                            "git",
+                            "Commit failed after applying approved patch.",
+                            "commit failed",
+                            fire,
+                        )
+                        blocked_ids.add(step.step_id)
+                        halted_new_work = True
+                        continue
+                    if sha and self.config.git.auto_push:
+                        self.git.push()
+                    fire("on_commit", step, sha)
+                    if self.runtime:
+                        self.runtime.upsert_step(
+                            run_id,
+                            step.step_id,
+                            title=step.title,
+                            status="committed",
+                            commit_sha=sha or "",
+                            metadata=self._scope_metadata(
+                                step,
+                                scheduled.scope,
+                                lease="released",
+                                extra={
+                                    "reviewer": execution.reviewer_name,
+                                    "review_verdict": execution.review.verdict if execution.review else "",
+                                    "repair_attempts": execution.repair_attempts,
+                                },
+                            ),
+                        )
+                    if execution.worktree_path:
+                        try:
+                            worktrees.remove(execution.worktree_path)
+                        except Exception as e:
+                            logger.warning("Could not remove worktree %s: %s", execution.worktree_path, e)
+
+                    committed_ids.add(step.step_id)
+                    completed += 1
+                    fire("on_step_complete", step, execution.review, completed, len(steps))
+
+                if halted_new_work and not active:
+                    break
+
+        if completed == len(steps) and not blocked_ids:
+            release_summary = self._release_summary(plan, completed, len(steps))
+            self.memory.complete_task(plan.task_id)
             if self.runtime:
-                self.runtime.upsert_step(run_id, step.step_id, title=step.title, status="running")
+                self.runtime.record_event(
+                    run_id,
+                    "release_summary",
+                    payload={"summary": release_summary},
+                )
+                self.runtime.update_run_status(
+                    run_id,
+                    "completed",
+                    metadata={
+                        "completed_steps": completed,
+                        "total_steps": len(steps),
+                        "release_summary": release_summary,
+                    },
+                )
+            self._palace_add(
+                run_id=run_id,
+                step_id="",
+                closet="runs",
+                kind="run-summary",
+                title=f"Completed: {plan.task_summary}",
+                content=release_summary,
+                status="completed",
+            )
+            sha = self.git.commit_step("task-complete", plan.task_summary[:60])
+            if sha and self.config.git.auto_push:
+                self.git.push()
+            fire("on_task_complete", plan)
+        elif self.runtime:
+            self.runtime.update_run_status(
+                run_id,
+                "blocked",
+                metadata={
+                    "completed_steps": completed,
+                    "total_steps": len(steps),
+                    "blocked_steps": sorted(blocked_ids),
+                },
+            )
 
-            worker_name, worker_agent = self._assign_worker(step)
-            fire("on_worker_assigned", step, worker_name)
-
+    def _run_step_in_worktree(
+        self,
+        run_id: str,
+        step: Step,
+        worker_name: str,
+        worker_agent: BaseAgent,
+        worktrees: WorktreeManager,
+        output_callback: Callable[[str], None] | None,
+        worktree_lock,
+    ) -> _StepExecution:
+        execution = _StepExecution(step=step, worker_name=worker_name)
+        execution.reviewer_name = self._reviewer_name()
+        try:
+            record = self.runtime.get_step(run_id, step.step_id) if self.runtime else None
             worktree_path = Path(record.worktree_path) if record and record.worktree_path else None
             if not worktree_path or not worktree_path.exists():
-                worktree_path = worktrees.create(run_id, step.step_id)
+                with worktree_lock:
+                    worktree_path = worktrees.create(run_id, step.step_id)
+            execution.worktree_path = worktree_path
             if self.runtime:
                 self.runtime.upsert_step(
                     run_id,
@@ -367,34 +701,45 @@ class Orchestrator:
                 output_callback=output_callback,
             )
             result = worker.execute(step)
+            execution.result = result
             if not result.success:
-                self._block_step(run_id, step, worker_name, f"FAILED: {result.error}", result.error, fire)
-                blocked = True
-                break
+                execution.failed_agent = worker_name
+                execution.failed_reason = result.error or "worker failed"
+                execution.memory_note = f"FAILED: {execution.failed_reason}"
+                return execution
 
             patch = worktrees.capture_patch(worktree_path)
             if patch.changed_files:
                 result.files_written = patch.changed_files
-            patch_id = self._store_patch(run_id, step.step_id, patch)
-            fire("on_step_result", step, result, worker_name)
+            execution.patch = patch
+            execution.patch_id = self._store_patch(run_id, step.step_id, patch)
             if self.runtime:
                 self.runtime.upsert_step(
                     run_id,
                     step.step_id,
                     title=step.title,
                     status="reviewing",
-                    patch_artifact_id=patch_id,
+                    patch_artifact_id=execution.patch_id,
                     metadata={"changed_files": patch.changed_files},
                 )
+                self.runtime.record_event(
+                    run_id,
+                    "worker_finished",
+                    step_id=step.step_id,
+                    payload={
+                        "worker": worker_name,
+                        "changed_files": patch.changed_files,
+                        "repair_attempts": execution.repair_attempts,
+                    },
+                )
 
-            fire("on_status", f"Reviewing {step.step_id}...")
             review = self.review(
                 step,
                 result,
                 work_dir=worktree_path,
                 diff_text=patch.patch_text or "No git diff available.",
             )
-            fire("on_review", step, review)
+            execution.review = review
             if self.runtime:
                 self.runtime.upsert_step(
                     run_id,
@@ -402,16 +747,38 @@ class Orchestrator:
                     title=step.title,
                     status="reviewing",
                     review=review.model_dump(),
+                    metadata={
+                        "reviewer": execution.reviewer_name,
+                        "review_verdict": review.verdict,
+                        "repair_attempts": execution.repair_attempts,
+                    },
                 )
+
+            self._record_review(
+                run_id,
+                step,
+                review,
+                reviewer=execution.reviewer_name,
+                repair_attempts=execution.repair_attempts,
+            )
 
             retries_left = max(0, self.config.runtime.retry_budget)
             while review.verdict == "needs_revision" and review.should_retry and retries_left:
                 retries_left -= 1
-                fire("on_status", f"Retrying {step.step_id} with feedback...")
-                revised = step.model_copy(update={
-                    "description": step.description + f"\n\nREVISION REQUIRED: {review.suggested_revision}"
-                })
+                execution.repair_attempts += 1
+                reason = review.suggested_revision or review.feedback or review.verdict
+                if output_callback:
+                    output_callback(f"Retrying {step.step_id}: {reason}")
+                self._record_repair_attempt(
+                    run_id,
+                    step,
+                    reason=reason,
+                    attempts_used=execution.repair_attempts,
+                    attempts_left=retries_left,
+                )
+                revised = self._revision_step(step, reason)
                 result = worker.execute(revised)
+                execution.result = result
                 if not result.success:
                     review = review.model_copy(update={
                         "verdict": "rejected",
@@ -420,42 +787,57 @@ class Orchestrator:
                         "memory_note": f"Revision failed: {result.error}",
                         "should_retry": False,
                     })
+                    execution.review = review
                     break
                 patch = worktrees.capture_patch(worktree_path)
                 if patch.changed_files:
                     result.files_written = patch.changed_files
-                patch_id = self._store_patch(run_id, step.step_id, patch)
-                fire("on_step_result", step, result, worker_name)
+                execution.patch = patch
+                execution.patch_id = self._store_patch(run_id, step.step_id, patch)
+                if self.runtime:
+                    self.runtime.record_event(
+                        run_id,
+                        "worker_finished",
+                        step_id=step.step_id,
+                        payload={
+                            "worker": worker_name,
+                            "changed_files": patch.changed_files,
+                            "repair_attempts": execution.repair_attempts,
+                        },
+                    )
                 review = self.review(
                     revised,
                     result,
                     work_dir=worktree_path,
                     diff_text=patch.patch_text or "No git diff available.",
                 )
-                fire("on_review", step, review)
+                execution.review = review
                 if self.runtime:
                     self.runtime.upsert_step(
                         run_id,
                         step.step_id,
                         title=step.title,
                         status="reviewing",
-                        patch_artifact_id=patch_id,
+                        patch_artifact_id=execution.patch_id,
                         review=review.model_dump(),
+                        metadata={
+                            "changed_files": patch.changed_files,
+                            "repair_attempts": execution.repair_attempts,
+                        },
                     )
-
-            self.memory.append_step(step.step_id, step.title, worker_name, review.memory_note, review.verdict)
-            self._remember_step(run_id, step, worker_name, review, patch)
-            if review.verdict != "approved":
-                self._block_step(
+                self._record_review(
                     run_id,
                     step,
-                    worker_name,
-                    review.memory_note,
-                    review.feedback or review.verdict,
-                    fire,
+                    review,
+                    reviewer=execution.reviewer_name,
+                    repair_attempts=execution.repair_attempts,
                 )
-                blocked = True
-                break
+
+            if review.verdict != "approved":
+                execution.failed_agent = worker_name
+                execution.failed_reason = review.feedback or review.verdict
+                execution.memory_note = review.memory_note
+                return execution
 
             if self.runtime:
                 self.runtime.upsert_step(run_id, step.step_id, title=step.title, status="verifying")
@@ -465,7 +847,8 @@ class Orchestrator:
                 str(worktree_path),
                 output_callback=output_callback,
             )
-            verification = verifier.verify(changed_files=patch.changed_files)
+            verification = verifier.verify(changed_files=execution.patch.changed_files if execution.patch else [])
+            execution.verification = verification
             self._record_verification(run_id, step.step_id, verification)
             if self.runtime:
                 self.runtime.upsert_step(
@@ -474,79 +857,160 @@ class Orchestrator:
                     title=step.title,
                     status="verifying",
                     verification=self._verification_payload(verification),
+                    metadata={"repair_attempts": execution.repair_attempts},
                 )
             if not verification.passed:
-                self._block_step(
-                    run_id,
-                    step,
-                    "verifier",
-                    f"Verification failed: {verification.reason}",
-                    verification.reason,
-                    fire,
-                )
-                blocked = True
-                break
+                while retries_left:
+                    retries_left -= 1
+                    execution.repair_attempts += 1
+                    reason = self._verification_summary(verification)
+                    if output_callback:
+                        output_callback(f"Repairing {step.step_id} after verification failure")
+                    self._record_repair_attempt(
+                        run_id,
+                        step,
+                        reason=reason,
+                        attempts_used=execution.repair_attempts,
+                        attempts_left=retries_left,
+                    )
+                    revised = self._revision_step(step, reason)
+                    result = worker.execute(revised)
+                    execution.result = result
+                    if not result.success:
+                        execution.failed_agent = worker_name
+                        execution.failed_reason = result.error or "worker failed during verification repair"
+                        execution.memory_note = f"Verification repair failed: {execution.failed_reason}"
+                        return execution
 
-            try:
-                worktrees.apply_check(patch.patch_text)
-                worktrees.apply_patch(patch.patch_text)
-            except Exception as e:
-                self._block_step(run_id, step, "git-apply", f"Patch apply failed: {e}", str(e), fire)
-                blocked = True
-                break
+                    patch = worktrees.capture_patch(worktree_path)
+                    if patch.changed_files:
+                        result.files_written = patch.changed_files
+                    execution.patch = patch
+                    execution.patch_id = self._store_patch(run_id, step.step_id, patch)
+                    if self.runtime:
+                        self.runtime.record_event(
+                            run_id,
+                            "worker_finished",
+                            step_id=step.step_id,
+                            payload={
+                                "worker": worker_name,
+                                "changed_files": patch.changed_files,
+                                "repair_attempts": execution.repair_attempts,
+                            },
+                        )
+                        self.runtime.upsert_step(
+                            run_id,
+                            step.step_id,
+                            title=step.title,
+                            status="reviewing",
+                            patch_artifact_id=execution.patch_id,
+                            metadata={
+                                "changed_files": patch.changed_files,
+                                "repair_attempts": execution.repair_attempts,
+                            },
+                        )
 
-            sha = self.git.commit_step(step.step_id, step.title)
-            if not sha and patch.has_changes:
-                self._block_step(
-                    run_id,
-                    step,
-                    "git",
-                    "Commit failed after applying approved patch.",
-                    "commit failed",
-                    fire,
-                )
-                blocked = True
-                break
-            if sha and self.config.git.auto_push:
-                self.git.push()
-            fire("on_commit", step, sha)
-            if self.runtime:
-                self.runtime.upsert_step(
-                    run_id,
-                    step.step_id,
-                    title=step.title,
-                    status="committed",
-                    commit_sha=sha or "",
-                )
-            try:
-                worktrees.remove(worktree_path)
-            except Exception as e:
-                logger.warning("Could not remove worktree %s: %s", worktree_path, e)
+                    review = self.review(
+                        revised,
+                        result,
+                        work_dir=worktree_path,
+                        diff_text=patch.patch_text or "No git diff available.",
+                    )
+                    execution.review = review
+                    if self.runtime:
+                        self.runtime.upsert_step(
+                            run_id,
+                            step.step_id,
+                            title=step.title,
+                            status="reviewing",
+                            review=review.model_dump(),
+                        )
+                    self._record_review(
+                        run_id,
+                        step,
+                        review,
+                        reviewer=execution.reviewer_name,
+                        repair_attempts=execution.repair_attempts,
+                    )
+                    if review.verdict != "approved":
+                        execution.failed_agent = worker_name
+                        execution.failed_reason = review.feedback or review.verdict
+                        execution.memory_note = review.memory_note
+                        return execution
 
-            completed += 1
-            fire("on_step_complete", step, review, completed, len(steps))
+                    if self.runtime:
+                        self.runtime.upsert_step(run_id, step.step_id, title=step.title, status="verifying")
+                    verification = verifier.verify(changed_files=execution.patch.changed_files if execution.patch else [])
+                    execution.verification = verification
+                    self._record_verification(run_id, step.step_id, verification)
+                    if self.runtime:
+                        self.runtime.upsert_step(
+                            run_id,
+                            step.step_id,
+                            title=step.title,
+                            status="verifying",
+                            verification=self._verification_payload(verification),
+                            metadata={"repair_attempts": execution.repair_attempts},
+                        )
+                    if verification.passed:
+                        break
 
-        if not blocked:
-            self.memory.complete_task(plan.task_id)
-            if self.runtime:
-                self.runtime.update_run_status(
-                    run_id,
-                    "completed",
-                    metadata={"completed_steps": completed, "total_steps": len(steps)},
-                )
-            self._palace_add(
-                run_id=run_id,
-                step_id="",
-                closet="runs",
-                kind="run-summary",
-                title=f"Completed: {plan.task_summary}",
-                content=f"Completed {completed}/{len(steps)} steps.",
-                status="completed",
-            )
-            sha = self.git.commit_step("task-complete", plan.task_summary[:60])
-            if sha and self.config.git.auto_push:
-                self.git.push()
-            fire("on_task_complete", plan)
+                if not verification.passed:
+                    execution.failed_agent = "verifier"
+                    execution.failed_reason = verification.reason
+                    execution.memory_note = f"Verification failed: {verification.reason}"
+                    return execution
+
+            return execution
+        except Exception as e:
+            logger.exception("Step execution failed for %s", step.step_id)
+            execution.failed_agent = "worker-runtime"
+            execution.failed_reason = str(e)
+            execution.memory_note = f"Execution failed: {e}"
+            return execution
+
+    def _retry_step_ids(self, plan: Plan, retry_step_id: str) -> list[str]:
+        dependents: dict[str, set[str]] = {step.step_id: set() for step in plan.steps}
+        for step in plan.steps:
+            for dep in step.depends_on:
+                dependents.setdefault(dep, set()).add(step.step_id)
+
+        selected: list[str] = []
+        queue = [retry_step_id]
+        seen: set[str] = set()
+        while queue:
+            step_id = queue.pop(0)
+            if step_id in seen:
+                continue
+            seen.add(step_id)
+            selected.append(step_id)
+            queue.extend(sorted(dependents.get(step_id, set())))
+        return selected
+
+    def _scope_metadata(
+        self,
+        step: Step,
+        scope: StepScope,
+        *,
+        lease: str | None = None,
+        extra: dict | None = None,
+    ) -> dict:
+        declared = declared_step_scope(step)
+        inferred = infer_step_scope(step)
+        metadata = {
+            "declared_scope": list(declared.paths) if declared else [],
+            "inferred_scope": list(inferred.paths),
+            "effective_scope": list(scope.paths),
+            "scope_source": scope.source,
+            "scope": list(scope.paths),
+        }
+        if lease is not None:
+            metadata["lease"] = lease
+        metadata.update(extra or {})
+        return metadata
+
+    def _reviewer_name(self) -> str:
+        return getattr(self.agent, "name", "independent-reviewer") or "independent-reviewer"
 
     def _step_memory(self, step: Step) -> str:
         mem_summary = self.memory.get_summary(self.config.memory.max_context_chars)
@@ -601,6 +1065,107 @@ class Orchestrator:
             metadata={"worker": worker_name, "files": patch.changed_files},
         )
 
+    def _record_review(
+        self,
+        run_id: str,
+        step: Step,
+        review: Review,
+        *,
+        reviewer: str,
+        repair_attempts: int,
+    ) -> None:
+        if not self.runtime:
+            return
+        payload = {
+            "reviewer": reviewer,
+            "verdict": review.verdict,
+            "quality_score": review.quality_score,
+            "feedback": review.feedback,
+            "should_retry": review.should_retry,
+            "suggested_revision": review.suggested_revision,
+            "repair_attempts": repair_attempts,
+        }
+        self.runtime.record_event(
+            run_id,
+            "review_completed",
+            step_id=step.step_id,
+            payload=payload,
+        )
+        self.runtime.upsert_step(
+            run_id,
+            step.step_id,
+            title=step.title,
+            metadata={
+                "reviewer": reviewer,
+                "review_verdict": review.verdict,
+                "repair_attempts": repair_attempts,
+            },
+        )
+
+    def _record_repair_attempt(
+        self,
+        run_id: str,
+        step: Step,
+        *,
+        reason: str,
+        attempts_used: int,
+        attempts_left: int,
+    ) -> None:
+        if not self.runtime:
+            return
+        self.runtime.record_event(
+            run_id,
+            "repair_attempted",
+            step_id=step.step_id,
+            payload={
+                "reason": reason,
+                "attempts_used": attempts_used,
+                "attempts_left": attempts_left,
+            },
+        )
+        self.runtime.upsert_step(
+            run_id,
+            step.step_id,
+            title=step.title,
+            metadata={
+                "repair_attempts": attempts_used,
+                "last_repair_reason": reason,
+            },
+        )
+
+    def _revision_step(self, step: Step, feedback: str) -> Step:
+        return step.model_copy(update={
+            "description": step.description + f"\n\nREVISION REQUIRED: {feedback}"
+        })
+
+    @staticmethod
+    def _verification_summary(verification: VerificationResult) -> str:
+        if verification.commands:
+            last = verification.commands[-1]
+            output = f"\nCommand: {last.command}\nExit: {last.returncode}\nOutput:\n{last.output[:1200]}"
+        else:
+            output = ""
+        return f"Verification failed: {verification.reason}{output}"
+
+    def _release_summary(self, plan: Plan, completed: int, total: int) -> str:
+        lines = [
+            f"Task: {plan.task_summary}",
+            f"Completed steps: {completed}/{total}",
+        ]
+        if self.runtime:
+            for step in self.runtime.steps(plan.task_id):
+                files = step.metadata.get("changed_files", [])
+                if isinstance(files, list):
+                    files_text = ", ".join(files)
+                else:
+                    files_text = str(files)
+                verifier = step.verification_json or {}
+                verification = "skipped" if verifier.get("skipped") else "passed" if verifier.get("passed") else "unknown"
+                lines.append(
+                    f"- {step.step_id}: {step.status}; files: {files_text or 'none'}; verification: {verification}"
+                )
+        return "\n".join(lines)
+
     def _verification_payload(self, verification: VerificationResult) -> dict:
         return {
             "passed": verification.passed,
@@ -633,7 +1198,7 @@ class Orchestrator:
                 step.step_id,
                 title=step.title,
                 status="blocked",
-                metadata={"blocked_reason": reason},
+                metadata={"blocked_reason": reason, "lease": "blocked"},
             )
             self.runtime.update_run_status(
                 run_id,
@@ -704,7 +1269,7 @@ class Orchestrator:
         if self.runtime:
             self.runtime.record_event(
                 run_id,
-                "verification",
+                "verification_completed",
                 step_id=step_id,
                 payload=payload,
             )
@@ -718,22 +1283,28 @@ class Orchestrator:
             status="approved" if verification.passed else "rejected",
         )
 
-    def _assign_worker(self, step: Step) -> tuple[str, BaseAgent]:
-        if not self.worker_agents:
+    def _assign_worker(self, step: Step, unavailable: set[str] | None = None) -> tuple[str, BaseAgent]:
+        unavailable = unavailable or set()
+        candidates = {
+            name: agent
+            for name, agent in self.worker_agents.items()
+            if name not in unavailable
+        }
+        if not candidates:
             raise RuntimeError("No worker agents available")
 
         # Direct match by exact key name
         if step.preferred_agent not in ("any", "codex-worker", "claude-worker"):
-            if step.preferred_agent in self.worker_agents:
-                return step.preferred_agent, self.worker_agents[step.preferred_agent]
+            if step.preferred_agent in candidates:
+                return step.preferred_agent, candidates[step.preferred_agent]
 
         # Always prefer Codex workers — keep Claude for orchestration only
-        for name, agent in self.worker_agents.items():
+        for name, agent in candidates.items():
             if "claude" not in name.lower():
                 return name, agent
 
         # Fallback: use whatever is available
-        name, agent = next(iter(self.worker_agents.items()))
+        name, agent = next(iter(candidates.items()))
         return name, agent
 
     @staticmethod

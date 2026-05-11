@@ -12,9 +12,10 @@ When you type `run <task>`, Genesis:
 
 1. Sends the task to Claude (orchestrator), which produces a JSON execution plan breaking the work into concrete steps
 2. Assigns each step to a Codex worker agent, which writes files and runs shell commands inside an isolated git worktree
-3. After each step, Claude reviews the result and either approves it, requests a revision, or rejects it
-4. Approved steps are committed to git automatically
-5. Progress is written to `GENESIS_MEMORY.md` in the repository so the context accumulates across steps
+3. An independent reviewer role checks the diff and either approves it, requests a bounded repair, or rejects it
+4. Verification commands run in the isolated worktree; failed reviews or verification can trigger self-repair up to `runtime.retry_budget`
+5. Approved, verified steps are committed to git automatically, then a release summary is recorded
+6. Progress is written to `GENESIS_MEMORY.md` in the repository so the context accumulates across steps
 
 While workers execute you see a live terminal dashboard: the plan with step statuses, streaming agent output (shell commands, file writes, token counts), agent roster, and cumulative usage metrics.
 
@@ -302,7 +303,11 @@ remote    = "origin"
 branch    = "main"
 ```
 
-Genesis runs workers in isolated git worktrees under `~/.genesis/worktrees/`. A worker patch is captured and stored in SQLite, reviewed, verified in the isolated worktree, checked with `git apply --check`, then applied to the main repository and committed. Rejected or failed steps leave the main repository unchanged and can be inspected or retried with `inspect`, `resume`, and `retry`.
+Genesis runs workers in isolated git worktrees under `~/.genesis/worktrees/`. A worker patch is captured and stored in SQLite, reviewed by an independent reviewer role, verified in the isolated worktree, checked with `git apply --check`, then applied to the main repository and committed. Rejected or failed steps leave the main repository unchanged and can be inspected or retried with `inspect`, `resume`, and `retry`.
+
+When `runtime.max_parallel_workers` is greater than 1 and multiple workers are configured, Genesis can run independent steps at the same time. Plans may declare `file_scope` for each step; Genesis uses those scopes first, falls back to conservative inference when missing, leases non-overlapping scopes to workers, and still applies patches and commits one at a time on the main repository. Broad changes such as dependency, config, or unclear repo-wide work are serialized.
+
+`inspect <run_id>` shows the team handoff trail for each step: worker, reviewer, lease state, effective scope, repair attempts, blocker reason, patch artifact, commit, and runtime events such as `step_leased`, `worker_finished`, `review_completed`, `repair_attempted`, `verification_completed`, and `release_summary`.
 
 Because each accepted step becomes the base for the next worktree, isolated execution requires `git.auto_commit = true` and a clean main worktree apart from Genesis-managed memory/state files.
 
@@ -349,8 +354,8 @@ palace_enabled    = true
 
 [runtime]
 state_db = ""                    # empty = ~/.genesis/state/genesis.db
-retry_budget = 1
-max_parallel_workers = 1
+retry_budget = 1                 # bounded self-repair attempts per failed review/verification
+max_parallel_workers = 1         # increase for scoped parallel worker execution
 checkpoint_mode = "always"
 
 [verification]
@@ -386,6 +391,7 @@ genesis/
   config.py            TOML config loader, dataclasses
   palace.py            SQLite verbatim memory palace + FTS search
   runtime.py           Durable run events, checkpoints, artifacts
+  scheduler.py         Dependency and file-scope worker leasing
   worktree.py          Isolated git worktrees and patch application
   policy.py            Protected path and command policy checks
   verifier.py          Configurable verification gates before commit
@@ -395,7 +401,7 @@ genesis/
   main.py              Entry point
 ```
 
-Claude makes two calls per task: one `plan()` call to get a validated JSON execution plan, and one `review()` call per step to get a structured verdict. Codex workers execute in isolated git worktrees, not the main repository. Genesis captures a patch, records durable checkpoints in SQLite, verifies the patch in isolation, and commits only approved, verified steps.
+Claude makes one `plan()` call to get a validated JSON execution plan with optional per-step `file_scope`, then an independent reviewer role produces a structured verdict for each worker result. Codex workers execute in isolated git worktrees, not the main repository. Genesis captures a patch, records durable checkpoints in SQLite, retries bounded repairs when review or verification fails, verifies the patch in isolation, and commits only approved, verified steps. Independent steps can run concurrently when their effective file scopes do not overlap.
 
 ---
 

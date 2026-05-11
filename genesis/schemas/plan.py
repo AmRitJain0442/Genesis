@@ -10,6 +10,7 @@ class Step(BaseModel):
     type: Literal["code", "docs", "review", "research", "test", "config", "refactor"]
     preferred_agent: str = "any"
     depends_on: list[str] = Field(default_factory=list)
+    file_scope: list[str] = Field(default_factory=list)
     expected_output: str
     context_hint: str = ""
 
