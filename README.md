@@ -1,379 +1,392 @@
 # Genesis
 
-A terminal-only AI orchestration system for Windows. Genesis runs as a local CLI that coordinates multiple AI agents — Claude Code as the orchestrator and ChatGPT Codex as autonomous workers — to complete software development tasks from a single prompt.
+```
+   ____                          _
+  / ___| ___ _ __   ___  ___  __(_)___
+ | |  _ / _ \ '_ \ / _ \/ __|/ _` / __|
+ | |_| |  __/ | | |  __/\__ \ (_| \__ \
+  \____|\___|_| |_|\___||___/\__,_|___/
 
-No API keys required. Authentication is handled through your existing Claude Code Pro and ChatGPT Pro subscriptions via their respective CLI tools.
+        local AI orchestration for software work
+```
 
----
+Genesis is a terminal-only AI orchestration system for Windows. It coordinates Claude Code as the planner and reviewer, plus Codex CLI workers as autonomous code executors, so a single prompt can be broken into scoped, reviewed, verified, and committed development steps.
 
-## How it works
+No API keys are required. Genesis uses your existing Claude Code Pro and ChatGPT Pro sessions through their official CLI tools.
+
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
+![Interface](https://img.shields.io/badge/interface-terminal-green)
+
+## Why Genesis
+
+Most AI coding tools work as one assistant in one working tree. Genesis is built around a small local team model:
+
+- Claude Code plans the task and reviews completed work.
+- Codex workers execute implementation steps in isolated git worktrees.
+- Verification commands run before approved changes reach the main repository.
+- Durable state is stored locally so runs can be inspected, resumed, or retried.
+- Git commits are created only after review and verification pass.
+
+The result is a local command center for multi-step software work, with a visible audit trail and conservative repository handling.
+
+## How It Works
 
 When you type `run <task>`, Genesis:
 
-1. Sends the task to Claude (orchestrator), which produces a JSON execution plan breaking the work into concrete steps
-2. Assigns each step to a Codex worker agent, which writes files and runs shell commands inside an isolated git worktree
-3. An independent reviewer role checks the diff and either approves it, requests a bounded repair, or rejects it
-4. Verification commands run in the isolated worktree; failed reviews or verification can trigger self-repair up to `runtime.retry_budget`
-5. Approved, verified steps are committed to git automatically, then a release summary is recorded
-6. Progress is written to `GENESIS_MEMORY.md` in the repository so the context accumulates across steps
+1. Sends the task to the orchestrator, which returns a structured JSON execution plan.
+2. Assigns ready steps to worker agents based on dependencies and file scope.
+3. Runs each worker inside an isolated git worktree.
+4. Captures the patch and sends it to an independent reviewer role.
+5. Runs configured verification commands in isolation.
+6. Applies approved patches to the main repository and commits them.
+7. Records progress in local memory and SQLite runtime state.
 
-While workers execute you see a live command-center dashboard: scoped plan state, active worker/reviewer handoffs, streaming agent output, repair and verification activity, recent runtime events, agent roster, and cumulative usage metrics.
+During execution you see a live command-center dashboard with plan state, active workers, reviewer handoffs, streaming output, verification status, git activity, recent events, and usage metrics.
 
----
+## Features
 
-## Setup
+- Local terminal workflow with no hosted control plane.
+- Claude Code and Codex CLI integration through existing OAuth sessions.
+- Multi-account Codex worker support for parallel execution.
+- Isolated git worktrees for worker changes.
+- Bounded self-repair when review or verification fails.
+- Durable runs with `resume`, `retry`, `inspect`, and `cleanup`.
+- Configurable verification gates before commit.
+- Memory file plus searchable SQLite runtime memory.
+- Account management from inside the Genesis REPL.
 
-Follow these steps in order. Do not skip any step.
+## Requirements
 
-### Step 1 — Install Python
+- Windows
+- Python 3.10 or later
+- Git
+- Claude Code CLI installed and logged in
+- Codex CLI installed and logged in
+- Node.js 18 or later if installing Codex through npm
 
-Download and install Python 3.10 or later from https://python.org/downloads
+## Quick Start
 
-During installation, check the box that says **"Add Python to PATH"**.
+Clone and install Genesis:
 
-Verify it works:
-
-```
-python --version
-```
-
-You should see `Python 3.10.x` or higher.
-
----
-
-### Step 2 — Install Claude Code CLI
-
-Claude Code is the CLI for your Claude Pro subscription.
-
-Download and install it from https://claude.ai/download
-
-After installation, log in with your Claude account:
-
-```
-claude login
-```
-
-A browser window will open. Sign in with the same account that has your Claude Pro subscription.
-
-Verify it works:
-
-```
-claude --version
-```
-
----
-
-### Step 3 — Install Codex CLI
-
-Codex is the CLI for your ChatGPT Pro subscription.
-
-Install it via npm (requires Node.js 18+):
-
-```
-npm install -g @openai/codex
-```
-
-After installation, log in with your ChatGPT account:
-
-```
-codex login
-```
-
-A browser window will open. Sign in with the account that has your ChatGPT Pro subscription.
-
-Verify it works:
-
-```
-codex --version
-```
-
----
-
-### Step 4 — Clone and install Genesis
-
-```
-git clone https://github.com/yourname/genesis
-cd genesis
+```powershell
+git clone https://github.com/AmRitJain0442/Genesis.git
+cd Genesis
 pip install -e .
 ```
 
-This installs a global `genesis` command. Verify it installed:
+Install and authenticate the required agent CLIs:
 
+```powershell
+claude login
+codex login
 ```
-genesis --help
-```
 
----
+Create the Genesis config:
 
-### Step 5 — Create the config file
-
-```
+```powershell
 genesis init
 ```
 
-This creates `~/.genesis/config.toml` with default settings. Open it in any text editor.
+Start Genesis inside any git repository:
 
-Find the `[orchestrator]` section and make sure the model is set to `claude-sonnet-4-6`:
+```powershell
+cd C:\Projects\my-app
+genesis
+```
+
+Run a task:
+
+```text
+genesis> run build a REST API with user auth, a PostgreSQL backend, and pytest tests
+```
+
+## Setup Guide
+
+### 1. Install Python
+
+Download Python 3.10 or later from:
+
+```text
+https://python.org/downloads
+```
+
+During installation, enable `Add Python to PATH`.
+
+Verify the installation:
+
+```powershell
+python --version
+```
+
+### 2. Install Claude Code CLI
+
+Download Claude Code from:
+
+```text
+https://claude.ai/download
+```
+
+Log in:
+
+```powershell
+claude login
+```
+
+Verify it works:
+
+```powershell
+claude --version
+```
+
+### 3. Install Codex CLI
+
+Install Codex through npm:
+
+```powershell
+npm install -g @openai/codex
+```
+
+Log in:
+
+```powershell
+codex login
+```
+
+Verify it works:
+
+```powershell
+codex --version
+```
+
+### 4. Configure Genesis
+
+Create the config file:
+
+```powershell
+genesis init
+```
+
+This creates:
+
+```text
+~/.genesis/config.toml
+```
+
+Recommended orchestrator settings:
 
 ```toml
 [orchestrator]
 provider = "claude-cli"
-model    = "claude-sonnet-4-6"
+model = "claude-sonnet-4-6"
 ```
 
-Sonnet is recommended over Opus for the orchestrator because it has higher rate limits on Claude Pro.
-
-The `[worker]` section should be set to Codex:
+Recommended worker settings:
 
 ```toml
 [worker]
 provider = "codex-cli"
-model    = "auto"
+model = "auto"
 ```
 
-Save and close the file.
+Check the system:
 
----
-
-### Step 6 — Verify everything is connected
-
-```
+```powershell
 genesis status
 ```
 
-You should see output like:
+Expected agent roster:
 
-```
-Agents:   Claude Code  ·  Codex
+```text
+Agents:   Claude Code . Codex
 Active:   claude-cli-orchestrator, claude-cli-worker, codex-main
 ```
 
-If Claude Code or Codex shows as missing, re-run `claude login` or `codex login` in the same terminal and try again.
-
----
-
-### Step 7 (optional) — Add more Codex accounts
-
-If you have multiple ChatGPT Pro accounts, you can register each one as a separate worker. Each account runs in parallel on different steps, which speeds up execution.
-
-Inside the Genesis REPL:
-
-```
-genesis> add-account
-```
-
-You will be asked for:
-- A name for the account (e.g. `codex-2`)
-- A directory path where this account's login will be stored (e.g. `C:/Users/yourname/.codex-2`)
-
-Genesis will open a browser window for you to log in with the second account. After login, the account is saved to `~/.genesis/config.toml` and available immediately as a worker.
-
-Repeat this for each additional account.
-
-To unregister accounts from Genesis later:
-
-```
-genesis> remove-account codex-2
-genesis> remove-all-accounts
-```
-
-These commands update `~/.genesis/config.toml`. Add `--delete-home` if you also want Genesis to delete the separate `CODEX_HOME` directories for non-default accounts.
-
----
-
-### Step 8 — Fix character rendering (if needed)
-
-If the terminal shows garbled symbols or boxes instead of the dashboard, set the UTF-8 environment variable before running Genesis:
-
-```
-set PYTHONUTF8=1
-genesis
-```
-
-To make this permanent, add `PYTHONUTF8=1` to your system environment variables in Windows Settings > System > Advanced system settings > Environment Variables.
-
----
-
-## Running Genesis
-
-Navigate to any git repository and start the REPL:
-
-```
-cd C:\Projects\my-app
-genesis
-```
-
-If the folder is not yet a git repository, initialise it first:
-
-```
-cd C:\Projects\my-app
-git init
-git add .
-git commit -m "initial commit"
-genesis
-```
-
-Then give it a task:
-
-```
-genesis> run build a REST API with user auth, a PostgreSQL backend, and pytest tests
-```
-
-Genesis will plan the work, assign steps to Codex workers, and commit each approved step to git automatically.
-
----
+If either CLI is missing, run `claude login` or `codex login` again in the same terminal.
 
 ## Commands
 
+| Command | Description |
+| --- | --- |
+| `run <task>` | Execute a task through the AI orchestrator. |
+| `plan <task>` | Generate and preview a plan without executing it. |
+| `resume <run_id>` | Resume a durable run from stored state. |
+| `retry <run_id> <step_id>` | Retry a blocked step, then continue the run. |
+| `runs` | Show recent durable runs. |
+| `inspect <run_id>` | Show run state and event trace. |
+| `cleanup <run_id>` | Remove stale isolated worktrees for a run. |
+| `status` | Show agents, config, and recent git log. |
+| `agents` | List registered agents and their status. |
+| `config show` | Print the active configuration. |
+| `config edit` | Open the config file in your editor. |
+| `git log` | Show recent Genesis commits. |
+| `git commit [message]` | Manually commit current changes. |
+| `memory show` | Print the shared memory file. |
+| `memory search <query>` | Search SQLite memory. |
+| `memory mine` | Import `GENESIS_MEMORY.md` into SQLite memory. |
+| `memory clear` | Reset memory for a new project. |
+| `memory append <text>` | Add a manual note to memory. |
+| `switch orchestrator <name>` | Hot-swap the orchestrator agent. |
+| `switch worker <name>` | Hot-swap the default worker agent. |
+| `add-account` | Add a Codex account interactively. |
+| `remove-account <name>` | Remove one Codex account from Genesis. |
+| `remove-all-accounts` | Remove every Codex account from Genesis. |
+| `help` | Show all commands. |
+| `exit` | Quit Genesis. |
+
+## Codex Account Management
+
+Genesis can register multiple Codex accounts as separate workers. Each account uses a separate `CODEX_HOME` directory and its own login session.
+
+Add an account:
+
+```text
+genesis> add-account
 ```
-run <task>                 Execute a task through the AI orchestrator
-resume <run_id>            Resume a durable run from stored step state
-retry <run_id> <step_id>   Retry a blocked step, then continue the run
-plan <task>                Generate and preview a plan without executing it
-status                     Show agents, config, and recent git log
-agents                     List all registered agents and their status
-memory show                Print the shared memory file
-memory search <query>      Search the SQLite memory palace
-memory mine                Import GENESIS_MEMORY.md into palace memory
-memory clear               Reset memory for a new project
-memory append <text>       Add a manual note to memory
-config show                Print the active configuration
-config edit                Open the config file in your editor
-git log                    Show recent Genesis commits
-git commit [message]       Manually commit current changes
-runs                       Show recent durable runs
-inspect <run_id>           Show run state and event trace
-cleanup <run_id>           Remove stale isolated worktrees for a run
-switch orchestrator <name> Hot-swap the orchestrator agent
-switch worker <name>       Hot-swap the default worker agent
-add-account                Add a Codex account interactively
-remove-account <name>      Remove one Codex account from Genesis
-remove-all-accounts        Remove every Codex account from Genesis
-help                       Show all commands
-exit                       Quit Genesis
+
+Remove one account:
+
+```text
+genesis> remove-account codex-2
 ```
 
----
+Remove all registered Codex accounts:
 
-## Command-center UI
+```text
+genesis> remove-all-accounts
+```
 
-The terminal dashboard refreshes 8 times per second and is designed as an operator console:
+Remove accounts and delete non-default `CODEX_HOME` folders:
 
-- **Header** - task, phase, elapsed time, active worker/reviewer, current step, latest git SHA, and progress.
-- **Execution plan** - step status, declared/effective scope, repair count, title, and completion progress.
-- **Agent output** - streaming worker commands, file changes, review results, repair attempts, verification output, commits, and errors.
-- **Team** - configured agents with role and active state.
-- **Quality gates** - review and verification state per step.
-- **Event trace** - recent orchestration handoffs such as leases, reviews, repairs, verification, and release summary.
-- **Telemetry** - input/output/cached tokens, cost, and per-agent usage.
+```text
+genesis> remove-all-accounts --delete-home
+```
 
-Static REPL views use the same command-center styling. `status` shows agent roster and runtime controls, `runs` is the recent mission list, `inspect <run_id>` is the detailed diagnostic view, and `plan <task>` previews dependencies and file scopes before execution.
+Genesis never deletes the default `~/.codex` directory through `--delete-home`. Use `codex logout` if you want to clear the global Codex login.
 
----
+## Command-Center UI
+
+The live dashboard is designed for repeated software work rather than a one-off chat session.
+
+| Area | What It Shows |
+| --- | --- |
+| Header | Task, phase, elapsed time, current step, active worker, active reviewer, latest commit, and progress. |
+| Execution Plan | Step status, effective scope, repair count, title, and completion state. |
+| Agent Output | Streaming worker commands, file changes, review results, repair attempts, verification output, commits, and errors. |
+| Team | Configured agents with role and active state. |
+| Quality Gates | Review and verification status per step. |
+| Event Trace | Recent leases, reviews, repairs, verification, commits, and release summaries. |
+| Telemetry | Input tokens, output tokens, cached tokens, cost, and per-agent usage. |
+
+Static REPL views use the same command-center styling. `status` shows the agent roster and runtime controls, `runs` lists recent runs, `inspect <run_id>` opens the diagnostic view, and `plan <task>` previews dependencies and file scopes before execution.
 
 ## Memory
 
-Genesis writes a `GENESIS_MEMORY.md` file to the root of your repository. This file records the plan for each task, the outcome of each step, review verdicts, and completion timestamps.
+Genesis writes a `GENESIS_MEMORY.md` file to the root of your repository. This records task plans, step outcomes, review verdicts, and completion timestamps.
 
-This memory is injected into every planning and review prompt so the orchestrator understands what already exists before planning new work. It persists across sessions, so running `genesis` in the same repository later will pick up context from previous tasks.
+The memory file is injected into planning and review prompts so the orchestrator understands what already exists before it proposes new work.
 
-Genesis also keeps a local SQLite state database at `~/.genesis/state/genesis.db` by default. This database stores durable run events, checkpoints, verification results, and searchable verbatim "memory palace" drawers. Markdown memory remains the human-readable project log; SQLite is the operational memory and trace store.
+Genesis also keeps a local SQLite state database:
+
+```text
+~/.genesis/state/genesis.db
+```
+
+SQLite stores durable run events, checkpoints, verification results, patch artifacts, and searchable memory entries. Markdown memory remains the human-readable project log.
 
 Search memory:
 
-```
+```text
 genesis> memory search authentication middleware
 ```
 
-Import an existing Markdown memory file into the palace store:
+Import an existing memory file:
 
-```
+```text
 genesis> memory mine
 ```
 
-Clear memory when starting a conceptually new project:
+Clear memory for a conceptually new project:
 
-```
+```text
 genesis> memory clear
 ```
 
----
+## Git Integration
 
-## Git integration
+With `auto_commit = true`, Genesis commits only after review and verification pass:
 
-With `auto_commit = true` (default), Genesis commits only after a step is approved by review and verification gates pass:
-
-```
+```text
 [genesis] step-2: Implement authentication middleware
 [genesis] task-complete: Build REST API with auth and tests
 ```
 
-Auto-push is disabled by default. To enable it, edit `~/.genesis/config.toml`:
+Enable auto-push in `~/.genesis/config.toml`:
 
 ```toml
 [git]
 auto_push = true
-remote    = "origin"
-branch    = "main"
+remote = "origin"
+branch = "main"
 ```
 
-Genesis runs workers in isolated git worktrees under `~/.genesis/worktrees/`. A worker patch is captured and stored in SQLite, reviewed by an independent reviewer role, verified in the isolated worktree, checked with `git apply --check`, then applied to the main repository and committed. Rejected or failed steps leave the main repository unchanged and can be inspected or retried with `inspect`, `resume`, and `retry`.
+Genesis runs workers in isolated git worktrees under:
 
-When `runtime.max_parallel_workers` is greater than 1 and multiple workers are configured, Genesis can run independent steps at the same time. Plans may declare `file_scope` for each step; Genesis uses those scopes first, falls back to conservative inference when missing, leases non-overlapping scopes to workers, and still applies patches and commits one at a time on the main repository. Broad changes such as dependency, config, or unclear repo-wide work are serialized.
+```text
+~/.genesis/worktrees/
+```
 
-`inspect <run_id>` shows the team handoff trail for each step: worker, reviewer, lease state, effective scope, repair attempts, blocker reason, patch artifact, commit, and runtime events such as `step_leased`, `worker_finished`, `review_completed`, `repair_attempted`, `verification_completed`, and `release_summary`.
+A worker patch is captured, stored in SQLite, reviewed, verified in isolation, checked with `git apply --check`, then applied to the main repository and committed. Failed or rejected steps leave the main repository unchanged and can be inspected or retried.
 
-Because each accepted step becomes the base for the next worktree, isolated execution requires `git.auto_commit = true` and a clean main worktree apart from Genesis-managed memory/state files.
+Parallel execution is available when `runtime.max_parallel_workers` is greater than 1 and multiple workers are configured. Genesis leases non-overlapping file scopes to workers and still applies accepted patches one at a time to the main repository.
 
----
+## Configuration Reference
 
-## Configuration reference
-
-Full `~/.genesis/config.toml` with all options:
+Full `~/.genesis/config.toml` example:
 
 ```toml
 [orchestrator]
-provider = "claude-cli"          # claude-cli | codex-cli
-model    = "claude-sonnet-4-6"
+provider = "claude-cli"
+model = "claude-sonnet-4-6"
 
 [worker]
-provider = "codex-cli"           # codex-cli | claude-cli
-model    = "auto"
+provider = "codex-cli"
+model = "auto"
 
 [claude_cli]
-command = "claude"               # path to binary, auto-detected from PATH
-timeout = 300                    # seconds per call
+command = "claude"
+timeout = 300
 
 [codex_cli]
 command = "codex"
-timeout = 600                    # codex tasks run longer (it executes code)
+timeout = 600
 
 [[codex_cli.accounts]]
-name  = "codex-main"
-home  = ""                       # empty = default ~/.codex
+name = "codex-main"
+home = ""
 model = "auto"
 
 [git]
-auto_commit   = true
-auto_push     = false
-remote        = "origin"
-branch        = "main"
+auto_commit = true
+auto_push = false
+remote = "origin"
+branch = "main"
 commit_prefix = "[genesis]"
 
 [memory]
-file              = "GENESIS_MEMORY.md"
-max_context_chars = 6000         # chars of memory injected per prompt
-auto_append_plan  = true
-palace_enabled    = true
+file = "GENESIS_MEMORY.md"
+max_context_chars = 6000
+auto_append_plan = true
+palace_enabled = true
 
 [runtime]
-state_db = ""                    # empty = ~/.genesis/state/genesis.db
-retry_budget = 1                 # bounded self-repair attempts per failed review/verification
-max_parallel_workers = 1         # increase for scoped parallel worker execution
+state_db = ""
+retry_budget = 1
+max_parallel_workers = 1
 checkpoint_mode = "always"
 
 [verification]
-commands = []                    # e.g. ["python -m compileall genesis"]
+commands = []
 timeout = 300
 require_for_commit = true
 
@@ -384,54 +397,126 @@ blocked_commands = ["git reset --hard", "git checkout --", "Remove-Item -Recurse
 allowed_commands = []
 ```
 
----
-
 ## Architecture
 
-```
+```text
 genesis/
   agents/
-    orchestrator.py    Orchestrator class — plan(), review(), run_task()
-    claude_cli.py      ClaudeCodeCLIAgent — drives `claude --print`
-    codex_cli.py       CodexCLIAgent — drives `codex exec`
-    worker.py          Worker — Claude worker, parses XML code blocks
-    codex_worker.py    CodexWorker — Codex worker, detects content-hash file changes
+    orchestrator.py    Planning, review, scheduling, and run control
+    claude_cli.py      Claude Code subprocess adapter
+    codex_cli.py       Codex CLI subprocess adapter
+    worker.py          Claude worker implementation
+    codex_worker.py    Codex worker implementation
   schemas/
-    plan.py            Plan and Step Pydantic models
-    review.py          Review Pydantic model
+    plan.py            Plan and Step models
+    review.py          Review model
   ui/
-    dashboard.py       Rich Live layout — DashboardState, make_layout()
+    dashboard.py       Live dashboard state and layout
     console.py         Shared Rich Console singleton
-  config.py            TOML config loader, dataclasses
-  palace.py            SQLite verbatim memory palace + FTS search
-  runtime.py           Durable run events, checkpoints, artifacts
+  config.py            TOML config loader and dataclasses
+  palace.py            SQLite memory store with FTS search
+  runtime.py           Durable run events and artifacts
   scheduler.py         Dependency and file-scope worker leasing
   worktree.py          Isolated git worktrees and patch application
   policy.py            Protected path and command policy checks
-  verifier.py          Configurable verification gates before commit
-  memory.py            MemoryManager — reads/writes GENESIS_MEMORY.md
-  git_ops.py           GitManager — wraps GitPython
-  repl.py              GenesisREPL — main REPL loop, command dispatch
-  main.py              Entry point
+  verifier.py          Configurable verification gates
+  memory.py            GENESIS_MEMORY.md reader and writer
+  git_ops.py           GitPython wrapper
+  repl.py              REPL loop and command dispatch
+  main.py              CLI entry point
 ```
 
-Claude makes one `plan()` call to get a validated JSON execution plan with optional per-step `file_scope`, then an independent reviewer role produces a structured verdict for each worker result. Codex workers execute in isolated git worktrees, not the main repository. Genesis captures a patch, records durable checkpoints in SQLite, retries bounded repairs when review or verification fails, verifies the patch in isolation, and commits only approved, verified steps. Independent steps can run concurrently when their effective file scopes do not overlap.
+## Development
 
----
+Install in editable mode:
+
+```powershell
+pip install -e .
+```
+
+Run tests:
+
+```powershell
+python -m pytest -q
+```
+
+Run the REPL from the repository:
+
+```powershell
+python -m genesis.main
+```
 
 ## Troubleshooting
 
-**"You've hit your limit"**
-Claude Pro rate limit reached. Wait for the reset time shown in the message (usually less than an hour). To reduce how often this happens, make sure the orchestrator model is `claude-sonnet-4-6` and not `claude-opus-4-6`. Sonnet has significantly higher rate limits.
+### Claude says you have hit your limit
 
-**Codex exits with code 1**
-The Codex account is not logged in, or the session expired. Run `codex login` and try again. For a secondary account: `set CODEX_HOME=C:/Users/yourname/.codex-2` then `codex login`.
+Claude Pro rate limit reached. Wait for the reset time shown in the message. To reduce how often this happens, use `claude-sonnet-4-6` instead of `claude-opus-4-6` for the orchestrator.
 
-**"No worker agents available"**
-Neither Claude Code nor Codex was detected in PATH. Open a new terminal, confirm `claude --version` and `codex --version` both print a version number, then run `genesis` from that same terminal.
+### Codex exits with code 1
 
-**TOML parse error after editing config.toml**
-Windows path backslashes in TOML strings are treated as escape sequences. Use forward slashes in all paths inside the config file. Correct: `C:/Users/yourname/.codex-2`. Incorrect: `C:\Users\yourname\.codex-2`. Genesis writes forward slashes automatically when you use `add-account`, so this only affects manual edits.
+The Codex account is not logged in, or the session expired. Run:
 
-**Dashboard shows boxes or garbled characters**
-Set `PYTHONUTF8=1` before running Genesis. See Step 8 in the setup section above.
+```powershell
+codex login
+```
+
+For a secondary account:
+
+```powershell
+set CODEX_HOME=C:/Users/yourname/.codex-2
+codex login
+```
+
+### No worker agents are available
+
+Open a new terminal, then confirm both CLIs are visible:
+
+```powershell
+claude --version
+codex --version
+```
+
+Run `genesis status` from the same terminal.
+
+### TOML parse error after editing config.toml
+
+Use forward slashes in Windows paths inside TOML strings.
+
+Correct:
+
+```toml
+home = "C:/Users/yourname/.codex-2"
+```
+
+Incorrect:
+
+```toml
+home = "C:\Users\yourname\.codex-2"
+```
+
+### Dashboard shows boxes or garbled characters
+
+Set UTF-8 mode before running Genesis:
+
+```powershell
+set PYTHONUTF8=1
+genesis
+```
+
+To make this permanent, add `PYTHONUTF8=1` to your user environment variables in Windows.
+
+## Contributing
+
+Issues and pull requests are welcome. Good contributions for this project include:
+
+- Better CLI adapters and status checks.
+- Safer verification defaults.
+- More tests around worktree and patch behavior.
+- Documentation improvements.
+- UI refinements that keep the terminal workflow fast and readable.
+
+Please run the test suite before opening a pull request:
+
+```powershell
+python -m pytest -q
+```
