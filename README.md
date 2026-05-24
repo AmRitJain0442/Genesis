@@ -170,6 +170,15 @@ Genesis will open a browser window for you to log in with the second account. Af
 
 Repeat this for each additional account.
 
+To unregister accounts from Genesis later:
+
+```
+genesis> remove-account codex-2
+genesis> remove-all-accounts
+```
+
+These commands update `~/.genesis/config.toml`. Add `--delete-home` if you also want Genesis to delete the separate `CODEX_HOME` directories for non-default accounts.
+
 ---
 
 ### Step 8 — Fix character rendering (if needed)
@@ -238,6 +247,8 @@ cleanup <run_id>           Remove stale isolated worktrees for a run
 switch orchestrator <name> Hot-swap the orchestrator agent
 switch worker <name>       Hot-swap the default worker agent
 add-account                Add a Codex account interactively
+remove-account <name>      Remove one Codex account from Genesis
+remove-all-accounts        Remove every Codex account from Genesis
 help                       Show all commands
 exit                       Quit Genesis
 ```

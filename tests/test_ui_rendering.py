@@ -4,6 +4,7 @@ import unittest
 
 from rich.console import Console
 
+from genesis.repl import _help_renderable
 from genesis.schemas.plan import Plan
 from genesis.ui.dashboard import DashboardState, make_layout
 from genesis.ui.theme import command_table, progress_bar, status_label, trim
@@ -72,6 +73,16 @@ class UIRenderingTests(unittest.TestCase):
         console = Console(record=True, width=80)
         console.print(tbl)
         self.assertIn("Recent Runs", console.export_text())
+
+    def test_help_renders_rich_tables_without_literal_markup(self) -> None:
+        console = Console(record=True, width=120)
+        console.print(_help_renderable())
+        rendered = console.export_text()
+
+        self.assertIn("run <task>", rendered)
+        self.assertIn("remove-all-accounts", rendered)
+        self.assertNotIn("[bold", rendered)
+        self.assertNotIn("[/bold", rendered)
 
 
 if __name__ == "__main__":

@@ -115,6 +115,7 @@ class CodexCLIConfig:
     timeout: int = 600
     model: str = "auto"     # fallback model if no accounts are defined
     accounts: list[CodexAccount] = field(default_factory=list)
+    accounts_explicit: bool = False
 
 
 @dataclass
@@ -214,19 +215,22 @@ def load_config() -> GenesisConfig:
         )
 
     if cx := data.get("codex_cli"):
+        accounts_data = cx.get("accounts", [])
         accounts = [
             CodexAccount(
                 name=a.get("name", f"codex-{i+1}"),
                 home=a.get("home", ""),
                 model=a.get("model", "auto"),
             )
-            for i, a in enumerate(cx.get("accounts", []))
+            for i, a in enumerate(accounts_data)
+            if isinstance(a, dict)
         ]
         cfg.codex_cli = CodexCLIConfig(
             command=cx.get("command", "codex"),
             timeout=cx.get("timeout", 600),
             model=cx.get("model", "auto"),
             accounts=accounts,
+            accounts_explicit="accounts" in cx,
         )
 
     if b := data.get("chatgpt_browser"):

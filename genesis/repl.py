@@ -1,10 +1,10 @@
 from __future__ import annotations
 import os
 import logging
+import re
 from pathlib import Path
 
 from rich.live import Live
-from rich.markdown import Markdown
 from rich.console import Group
 
 from genesis import __version__
@@ -25,34 +25,198 @@ from genesis.ui.theme import command_panel, command_table, kv_table, markup, pro
 
 logger = logging.getLogger(__name__)
 
-_HELP = """\
-[bold]GENESIS COMMANDS[/bold]
+_HELP_SECTIONS = [
+    (
+        "Run Control",
+        [
+            ("run <task>", "Execute a task through the AI orchestrator"),
+            ("plan <task>", "Generate and preview a plan without execution"),
+            ("resume <run_id>", "Resume a durable run"),
+            ("retry <run_id> <step_id>", "Retry a blocked step, then resume"),
+            ("runs", "Show recent durable runs"),
+            ("inspect <run_id>", "Show run state and event trace"),
+            ("cleanup <run_id>", "Remove stale worktrees for a run"),
+        ],
+    ),
+    (
+        "Memory",
+        [
+            ("memory show", "Display the shared memory file"),
+            ("memory search <query>", "Search SQLite palace memory"),
+            ("memory mine", "Import GENESIS_MEMORY.md into palace memory"),
+            ("memory clear", "Reset the memory file"),
+            ("memory append <text>", "Manually add a note to memory"),
+        ],
+    ),
+    (
+        "Configuration",
+        [
+            ("status", "Show agent info and recent git log"),
+            ("agents", "List available agents"),
+            ("config show", "Display current configuration"),
+            ("config edit", "Open config in your editor"),
+            ("switch orchestrator <claude-cli|codex-cli>", "Hot-swap the orchestrator"),
+            ("switch worker <claude-cli|codex-cli>", "Hot-swap the default worker"),
+        ],
+    ),
+    (
+        "Accounts",
+        [
+            ("add-account", "Add a Codex account interactively"),
+            ("remove-account <name>", "Remove one Codex account from Genesis"),
+            ("remove-all-accounts", "Remove every Codex account from Genesis"),
+            ("remove-all-accounts --delete-home", "Also delete non-default CODEX_HOME folders"),
+        ],
+    ),
+    (
+        "Utility",
+        [
+            ("git log", "Show recent Genesis commits"),
+            ("git commit [message]", "Manually commit current changes"),
+            ("help", "Show this command index"),
+            ("clear", "Clear the terminal"),
+            ("exit", "Quit Genesis"),
+        ],
+    ),
+]
 
-  [bold cyan]run[/bold cyan] [dim]<task>[/dim]                       Execute a task through the AI orchestrator
-  [bold cyan]resume[/bold cyan] [dim]<run_id>[/dim]                  Resume a durable run
-  [bold cyan]retry[/bold cyan] [dim]<run_id> <step_id>[/dim]         Retry a blocked step, then resume
-  [bold cyan]plan[/bold cyan] [dim]<task>[/dim]                      Generate and preview a plan (no execution)
-  [bold cyan]status[/bold cyan]                            Show agent info and recent git log
-  [bold cyan]memory show[/bold cyan]                       Display the shared memory file
-  [bold cyan]memory search[/bold cyan] [dim]<query>[/dim]            Search SQLite palace memory
-  [bold cyan]memory mine[/bold cyan]                       Import GENESIS_MEMORY.md into palace memory
-  [bold cyan]memory clear[/bold cyan]                      Reset the memory file
-  [bold cyan]memory append[/bold cyan] [dim]<text>[/dim]             Manually add a note to memory
-  [bold cyan]runs[/bold cyan]                              Show recent durable runs
-  [bold cyan]inspect[/bold cyan] [dim]<run_id>[/dim]                 Show run state and events
-  [bold cyan]cleanup[/bold cyan] [dim]<run_id>[/dim]                 Remove stale worktrees for a run
-  [bold cyan]config show[/bold cyan]                       Display current configuration
-  [bold cyan]config edit[/bold cyan]                       Open config in your editor
-  [bold cyan]git log[/bold cyan]                           Show recent Genesis commits
-  [bold cyan]git commit[/bold cyan] [dim][message][/dim]             Manually commit current changes
-  [bold cyan]agents[/bold cyan]                            List available agents
-  [bold cyan]switch orchestrator[/bold cyan] [dim]<claude-cli|codex-cli>[/dim]   Hot-swap orchestrator
-  [bold cyan]switch worker[/bold cyan] [dim]<claude-cli|codex-cli>[/dim]        Hot-swap worker
-  [bold cyan]add-account[/bold cyan]                       Add a Codex account interactively
-  [bold cyan]help[/bold cyan]                              Show this help
-  [bold cyan]clear[/bold cyan]                             Clear the terminal
-  [bold cyan]exit[/bold cyan]                              Exit Genesis
-"""
+
+def _help_renderable() -> Group:
+    parts: list[object] = [
+        "[dim]Type a command exactly as shown. Values in angle brackets are required; values in square brackets are optional.[/dim]"
+    ]
+
+    for title, rows in _HELP_SECTIONS:
+        tbl = command_table(title, border_style="cyan", expand=True)
+        tbl.add_column("Command", ratio=2, min_width=24, overflow="fold")
+        tbl.add_column("Action", ratio=3, min_width=32, overflow="fold")
+        for command, description in rows:
+            tbl.add_row(f"[bold cyan]{markup(command)}[/bold cyan]", markup(description))
+        parts.append(tbl)
+
+    return Group(*parts)
+
+
+_ACCOUNT_NAME_RE = re.compile(
+    r"""^\s*name\s*=\s*(?P<quote>["'])(?P<name>.*?)(?P=quote)\s*(?:#.*)?$"""
+)
+_CODEX_EMPTY_ACCOUNTS_RE = re.compile(r"^\s*accounts\s*=\s*\[\s*\]\s*(?:#.*)?$")
+_CODEX_CLI_SECTION_RE = re.compile(r"^\s*\[codex_cli\]\s*(?:#.*)?$")
+
+
+def _is_active_toml_header(line: str) -> bool:
+    stripped = line.lstrip()
+    return stripped.startswith("[") and not stripped.startswith("#")
+
+
+def _is_codex_account_header(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("[[codex_cli.accounts]]") and not stripped.startswith("#")
+
+
+def _is_commented_codex_account_header(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("# [[codex_cli.accounts]]") or stripped.startswith("#[[codex_cli.accounts]]")
+
+
+def _is_codex_cli_section(line: str) -> bool:
+    return bool(_CODEX_CLI_SECTION_RE.match(line))
+
+
+def _extract_codex_account_name(block: list[str]) -> str | None:
+    for line in block:
+        match = _ACCOUNT_NAME_RE.match(line)
+        if match:
+            return match.group("name")
+    return None
+
+
+def _remove_empty_codex_account_markers(lines: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    in_codex_cli = False
+    for line in lines:
+        if _is_active_toml_header(line):
+            in_codex_cli = _is_codex_cli_section(line)
+        if in_codex_cli and _CODEX_EMPTY_ACCOUNTS_RE.match(line):
+            continue
+        cleaned.append(line)
+    return cleaned
+
+
+def _line_ending(lines: list[str]) -> str:
+    for line in lines:
+        if line.endswith("\r\n"):
+            return "\r\n"
+    return "\n"
+
+
+def _ensure_empty_codex_accounts_marker(lines: list[str]) -> list[str]:
+    lines = _remove_empty_codex_account_markers(lines)
+    ending = _line_ending(lines)
+    marker = f"accounts = []                # no Codex accounts registered in Genesis{ending}"
+
+    for index, line in enumerate(lines):
+        if _is_codex_cli_section(line):
+            lines.insert(index + 1, marker)
+            return lines
+
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] = f"{lines[-1]}{ending}"
+    if lines and lines[-1].strip():
+        lines.append(ending)
+    lines.extend((f"[codex_cli]{ending}", marker))
+    return lines
+
+
+def _rewrite_codex_accounts_text(
+    config_text: str,
+    *,
+    remove_names: set[str] | None = None,
+    remove_all: bool = False,
+) -> tuple[str, list[str], list[str], list[str]]:
+    """Remove active [[codex_cli.accounts]] blocks while preserving other TOML text."""
+    names = remove_names or set()
+    lines = config_text.splitlines(keepends=True)
+    rewritten: list[str] = []
+    seen: list[str] = []
+    removed: list[str] = []
+    remaining: list[str] = []
+
+    index = 0
+    while index < len(lines):
+        if not _is_codex_account_header(lines[index]):
+            rewritten.append(lines[index])
+            index += 1
+            continue
+
+        block_start = index
+        index += 1
+        while (
+            index < len(lines)
+            and not _is_active_toml_header(lines[index])
+            and not _is_commented_codex_account_header(lines[index])
+        ):
+            index += 1
+
+        block = lines[block_start:index]
+        account_name = _extract_codex_account_name(block)
+        if account_name:
+            seen.append(account_name)
+
+        should_remove = remove_all or (account_name in names if account_name else False)
+        if should_remove:
+            removed.append(account_name or "<unnamed>")
+            continue
+
+        if account_name:
+            remaining.append(account_name)
+        rewritten.extend(block)
+
+    rewritten = _remove_empty_codex_account_markers(rewritten)
+    if not remaining:
+        rewritten = _ensure_empty_codex_accounts_marker(rewritten)
+
+    return "".join(rewritten), removed, seen, remaining
 
 
 class GenesisREPL:
@@ -105,9 +269,9 @@ class GenesisREPL:
         # Codex CLI agents (no API key — uses `codex login` / ChatGPT Pro OAuth)
         codex_cmd = find_codex_binary()
         if codex_cmd:
-            accounts = cfg.codex_cli.accounts or [
-                CodexAccount(name="codex-main", home="", model=cfg.codex_cli.model)
-            ]
+            accounts = cfg.codex_cli.accounts
+            if not accounts and not cfg.codex_cli.accounts_explicit:
+                accounts = [CodexAccount(name="codex-main", home="", model=cfg.codex_cli.model)]
             for i, account in enumerate(accounts):
                 model = account.model if account.model != "auto" else "auto"
                 # Orchestrator slot: first account only (claude-cli preferred)
@@ -840,18 +1004,173 @@ class GenesisREPL:
         )
 
         try:
-            with open(CONFIG_FILE, "a", encoding="utf-8") as f:
-                f.write(entry)
+            existing_text = CONFIG_FILE.read_text(encoding="utf-8") if CONFIG_FILE.exists() else ""
+            existing_lines = existing_text.splitlines(keepends=True)
+            cleaned_text = "".join(_remove_empty_codex_account_markers(existing_lines))
+            if cleaned_text and not cleaned_text.endswith(("\n", "\r")):
+                cleaned_text += "\n"
+            CONFIG_FILE.write_text(f"{cleaned_text}{entry}", encoding="utf-8")
             console.print(f"\n[green]✓ Account '{name}' added to config.[/green]")
             console.print("[dim]Rebuilding agents…[/dim]")
-            from genesis.config import reset_config_cache
-            reset_config_cache()
-            self.config = get_config()
-            self._build_agents()
+            self._reload_config_and_agents()
             self.cmd_status()
         except Exception as e:
             console.print(f"[red]Failed to update config: {e}[/red]")
             console.print(f"Add this manually to {CONFIG_FILE}:\n{entry}")
+
+    def _reload_config_and_agents(self) -> None:
+        from genesis.config import reset_config_cache
+
+        reset_config_cache()
+        self.config = get_config()
+        self._build_agents()
+
+    def _account_map(self) -> dict[str, CodexAccount]:
+        return {account.name: account for account in self.config.codex_cli.accounts}
+
+    def _delete_codex_home_dirs(self, accounts: list[CodexAccount]) -> None:
+        import shutil
+
+        home_root = Path.home().resolve()
+        for account in accounts:
+            if not account.home:
+                console.print(
+                    f"[yellow]Skipped deleting the default Codex home for '{account.name}'. "
+                    "Run `codex logout` if you want to clear that global login.[/yellow]"
+                )
+                continue
+
+            path = Path(account.home).expanduser()
+            try:
+                resolved = path.resolve()
+            except OSError as e:
+                console.print(f"[yellow]Skipped {path}: {e}[/yellow]")
+                continue
+
+            if not resolved.exists():
+                console.print(f"[dim]CODEX_HOME already absent: {resolved}[/dim]")
+                continue
+            if resolved == home_root:
+                console.print(f"[yellow]Skipped deleting home directory: {resolved}[/yellow]")
+                continue
+
+            shutil.rmtree(resolved)
+            console.print(f"[green]Deleted CODEX_HOME:[/green] {resolved}")
+
+    def cmd_remove_account(self, args: list[str]) -> None:
+        """
+        Remove one Codex account registration from ~/.genesis/config.toml.
+
+        Usage: remove-account <name> [--delete-home]
+        """
+        flags = {arg for arg in args if arg.startswith("-")}
+        names = [arg for arg in args if not arg.startswith("-")]
+
+        if "--help" in flags or "-h" in flags:
+            console.print("Usage: remove-account <name> [--delete-home]")
+            return
+
+        if not CONFIG_FILE.exists():
+            console.print(f"[red]Config file not found:[/red] {CONFIG_FILE}")
+            return
+
+        accounts = self._account_map()
+        if not names:
+            if not accounts:
+                console.print("[dim]No Codex accounts are registered in Genesis.[/dim]")
+                return
+            tbl = command_table("Codex Accounts", border_style="cyan")
+            tbl.add_column("Name")
+            tbl.add_column("CODEX_HOME")
+            for account in accounts.values():
+                tbl.add_row(markup(account.name), account.home or "[dim]default ~/.codex[/dim]")
+            console.print(tbl)
+            console.print("[cyan]Account name to remove[/cyan]: ", end="")
+            account_name = input().strip()
+        else:
+            account_name = names[0]
+
+        if not account_name:
+            console.print("[red]Name cannot be empty.[/red]")
+            return
+
+        if account_name.lower() == "all":
+            self.cmd_remove_all_accounts(list(flags))
+            return
+
+        try:
+            original_text = CONFIG_FILE.read_text(encoding="utf-8")
+            updated_text, removed, seen, remaining = _rewrite_codex_accounts_text(
+                original_text,
+                remove_names={account_name},
+            )
+        except Exception as e:
+            console.print(f"[red]Failed to read config: {e}[/red]")
+            return
+
+        if not removed:
+            available = ", ".join(seen) if seen else "none"
+            console.print(f"[yellow]No Genesis Codex account named '{account_name}'. Available: {available}[/yellow]")
+            return
+
+        try:
+            CONFIG_FILE.write_text(updated_text, encoding="utf-8")
+        except Exception as e:
+            console.print(f"[red]Failed to update config: {e}[/red]")
+            return
+
+        removed_accounts = [accounts[name] for name in removed if name in accounts]
+        if "--delete-home" in flags and removed_accounts:
+            self._delete_codex_home_dirs(removed_accounts)
+
+        self._reload_config_and_agents()
+        console.print(f"[green]Removed Codex account from Genesis:[/green] {', '.join(removed)}")
+        if not remaining:
+            console.print("[dim]No Codex accounts remain registered in Genesis.[/dim]")
+        self.cmd_status()
+
+    def cmd_remove_all_accounts(self, args: list[str]) -> None:
+        """
+        Remove every Codex account registration from ~/.genesis/config.toml.
+
+        Usage: remove-all-accounts [--yes] [--delete-home]
+        """
+        flags = {arg for arg in args if arg.startswith("-")}
+        if "--help" in flags or "-h" in flags:
+            console.print("Usage: remove-all-accounts [--yes] [--delete-home]")
+            return
+
+        if not CONFIG_FILE.exists():
+            console.print(f"[red]Config file not found:[/red] {CONFIG_FILE}")
+            return
+
+        accounts = list(self.config.codex_cli.accounts)
+        if "--yes" not in flags:
+            console.print("[yellow]Remove all Codex accounts from Genesis config? (y/N): [/yellow]", end="")
+            if input().strip().lower() != "y":
+                console.print("[dim]No accounts removed.[/dim]")
+                return
+
+        try:
+            original_text = CONFIG_FILE.read_text(encoding="utf-8")
+            updated_text, removed, _seen, _remaining = _rewrite_codex_accounts_text(
+                original_text,
+                remove_all=True,
+            )
+            CONFIG_FILE.write_text(updated_text, encoding="utf-8")
+        except Exception as e:
+            console.print(f"[red]Failed to update config: {e}[/red]")
+            return
+
+        if "--delete-home" in flags and accounts:
+            self._delete_codex_home_dirs(accounts)
+
+        self._reload_config_and_agents()
+        if removed:
+            console.print(f"[green]Removed Codex accounts from Genesis:[/green] {', '.join(removed)}")
+        else:
+            console.print("[green]Disabled Genesis Codex account fallback.[/green]")
+        self.cmd_status()
 
     def cmd_switch(self, args: list[str]) -> None:
         if len(args) < 2:
@@ -964,13 +1283,25 @@ class GenesisREPL:
                 self.cmd_cleanup(rest)
             elif cmd in ("add-account", "add_account", "addaccount"):
                 self.cmd_add_account([])
+            elif cmd in ("remove-account", "remove_account", "removeaccount"):
+                self.cmd_remove_account(rest.split())
+            elif cmd in (
+                "remove-all-accounts",
+                "remove_all_accounts",
+                "removeallaccounts",
+                "remove-accounts",
+                "remove_accounts",
+                "remove-all",
+                "remove_all",
+            ):
+                self.cmd_remove_all_accounts(rest.split())
             elif cmd == "switch":
                 sub, sub_rest = _split_sub(rest)
                 self.cmd_switch([sub] + ([sub_rest] if sub_rest else []))
             elif cmd == "clear":
                 console.clear()
             elif cmd == "help":
-                console.print(command_panel(Markdown(_HELP), "COMMAND INDEX", border_style="cyan"))
+                console.print(command_panel(_help_renderable(), "COMMAND INDEX", border_style="cyan", padding=(1, 2)))
             else:
                 console.print(
                     f"[yellow]Unknown command '{cmd}'.[/yellow] "
