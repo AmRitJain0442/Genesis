@@ -18,6 +18,10 @@ No API keys are required. Genesis uses your existing Claude Code Pro and ChatGPT
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 ![Interface](https://img.shields.io/badge/interface-terminal-green)
 
+<p align="center">
+  <img src="docs/images/genesis-command-center.png" alt="Genesis command center with connected AI coding workers" width="100%">
+</p>
+
 ## Why Genesis
 
 Most AI coding tools work as one assistant in one working tree. Genesis is built around a small local team model:
@@ -43,6 +47,10 @@ When you type `run <task>`, Genesis:
 7. Records progress in local memory and SQLite runtime state.
 
 During execution you see a live command-center dashboard with plan state, active workers, reviewer handoffs, streaming output, verification status, git activity, recent events, and usage metrics.
+
+<p align="center">
+  <img src="docs/images/genesis-workflow.png" alt="Genesis workflow from planning through workers, review, verification, and commit" width="100%">
+</p>
 
 ## Features
 
