@@ -7,7 +7,7 @@
  | |_| |  __/ | | |  __/\__ \ (_| \__ \
   \____|\___|_| |_|\___||___/\__,_|___/
 
-        local AI orchestration for software work
+        local AI orchestration for software work.
 ```
 
 Genesis is a terminal-only AI orchestration system for Windows. It coordinates Claude Code as the planner and reviewer, plus Codex CLI workers as autonomous code executors, so a single prompt can be broken into scoped, reviewed, verified, and committed development steps.
