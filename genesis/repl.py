@@ -6,6 +6,7 @@ from pathlib import Path
 
 from rich.live import Live
 from rich.console import Group
+from rich.markdown import Markdown
 
 from genesis import __version__
 from genesis.config import get_config, CONFIG_FILE, CodexAccount
