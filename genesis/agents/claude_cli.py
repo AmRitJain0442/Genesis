@@ -199,6 +199,21 @@ class ClaudeCodeCLIAgent(BaseAgent):
             encoding="utf-8",
             start_new_session=True,
         )
+
+        # Drain stderr on a background thread so a full stderr pipe buffer can
+        # never deadlock the stdout read loop below.
+        stderr_chunks: list[str] = []
+
+        def _drain_stderr() -> None:
+            try:
+                for err_line in proc.stderr:
+                    stderr_chunks.append(err_line)
+            except Exception:
+                pass
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
         try:
             proc.stdin.write(prompt)
             proc.stdin.close()
@@ -262,6 +277,7 @@ class ClaudeCodeCLIAgent(BaseAgent):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+            stderr_thread.join(timeout=5)
 
         if timed_out.is_set():
             raise RuntimeError(f"Claude CLI timed out after {self.timeout}s")
@@ -272,7 +288,7 @@ class ClaudeCodeCLIAgent(BaseAgent):
         final_text = "".join(accumulated_text) or result_text
 
         if proc.returncode != 0 and not final_text:
-            err = proc.stderr.read().strip()
+            err = "".join(stderr_chunks).strip()
             raise RuntimeError(f"Claude CLI exited {proc.returncode}: {err[:400]}")
 
         logger.debug("_call_streaming: accumulated=%d chars, result=%d chars",

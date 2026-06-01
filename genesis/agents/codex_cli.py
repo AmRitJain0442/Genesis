@@ -232,6 +232,21 @@ class CodexCLIAgent(BaseAgent):
             start_new_session=True,
         )
 
+        # Drain stderr on a background thread. Reading it only after the stdout
+        # loop would deadlock if the child fills the stderr pipe buffer (~64 KB)
+        # while we are blocked reading stdout.
+        stderr_chunks: list[str] = []
+
+        def _drain_stderr() -> None:
+            try:
+                for err_line in proc.stderr:
+                    stderr_chunks.append(err_line)
+            except Exception:
+                pass
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
         # Write prompt and close stdin — guard against broken pipe on early exit
         try:
             try:
@@ -312,12 +327,13 @@ class CodexCLIAgent(BaseAgent):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+            stderr_thread.join(timeout=5)
 
         if timed_out.is_set():
             raise RuntimeError(f"Codex timed out after {self.timeout}s")
 
         if proc.returncode != 0 and not last_message:
-            stderr = proc.stderr.read().strip()
+            stderr = "".join(stderr_chunks).strip()
             raise RuntimeError(f"Codex exited {proc.returncode}: {stderr[:400]}")
 
         return last_message
