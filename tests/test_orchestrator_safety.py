@@ -298,6 +298,78 @@ class OrchestratorSafetyTests(unittest.TestCase):
             self.assertIn("verification_completed", event_types)
             git.close()
 
+    def test_advisory_verification_commits_despite_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+            before = self._commit_count(root)
+
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.runtime.retry_budget = 0
+            cfg.verification.commands = ['python -c "raise SystemExit(1)"']
+            cfg.verification.require_for_commit = False
+            memory = MemoryManager(str(root / "GENESIS_MEMORY.md"))
+            git = GitManager(str(root), cfg.git)
+            runtime = RuntimeStore(cfg.runtime.state_db)
+
+            orchestrator = Orchestrator(
+                FakePlanReviewAgent(verdict="approved", task_id="run-advisory"),
+                {"fake-worker": FakeWorkerAgent(filename="ok.txt", content="ok")},
+                memory,
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=PalaceStore(cfg.runtime.state_db),
+                policy=ExecutionPolicy(),
+            )
+
+            orchestrator.run_task("commit despite failing verification")
+
+            # Verification fails, but require_for_commit=false makes it advisory.
+            self.assertTrue((root / "ok.txt").exists())
+            self.assertGreater(self._commit_count(root), before)
+            step = runtime.get_step("run-advisory", "step-1")
+            self.assertEqual("committed", step.status)
+            self.assertTrue(step.commit_sha)
+            git.close()
+
+    def test_required_verification_blocks_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+            before = self._commit_count(root)
+
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.runtime.retry_budget = 0
+            cfg.verification.commands = ['python -c "raise SystemExit(1)"']
+            cfg.verification.require_for_commit = True
+            memory = MemoryManager(str(root / "GENESIS_MEMORY.md"))
+            git = GitManager(str(root), cfg.git)
+            runtime = RuntimeStore(cfg.runtime.state_db)
+
+            orchestrator = Orchestrator(
+                FakePlanReviewAgent(verdict="approved", task_id="run-required"),
+                {"fake-worker": FakeWorkerAgent(filename="ok.txt", content="ok")},
+                memory,
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=PalaceStore(cfg.runtime.state_db),
+                policy=ExecutionPolicy(),
+            )
+
+            orchestrator.run_task("block on failing verification")
+
+            # Default gate: a failing verification must block the commit.
+            self.assertEqual(before, self._commit_count(root))
+            step = runtime.get_step("run-required", "step-1")
+            self.assertEqual("blocked", step.status)
+            git.close()
+
     def test_resume_skips_committed_steps_and_runs_pending_step(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

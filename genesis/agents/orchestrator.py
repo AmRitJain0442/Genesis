@@ -956,10 +956,17 @@ class Orchestrator:
                         break
 
                 if not verification.passed:
-                    execution.failed_agent = "verifier"
-                    execution.failed_reason = verification.reason
-                    execution.memory_note = f"Verification failed: {verification.reason}"
-                    return execution
+                    if self.config.verification.require_for_commit:
+                        execution.failed_agent = "verifier"
+                        execution.failed_reason = verification.reason
+                        execution.memory_note = f"Verification failed: {verification.reason}"
+                        return execution
+                    # Advisory mode: surface the failure but allow the commit.
+                    if output_callback:
+                        output_callback(
+                            f"Verification failed but require_for_commit=false; "
+                            f"committing anyway: {verification.reason}"
+                        )
 
             return execution
         except Exception as e:
