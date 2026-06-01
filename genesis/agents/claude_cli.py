@@ -11,10 +11,11 @@ Claude Code docs on non-interactive use:
 from __future__ import annotations
 import json
 import subprocess
+import threading
 import logging
 import shutil
 from typing import Callable
-from genesis.agents.base import BaseAgent, AgentInfo
+from genesis.agents.base import BaseAgent, AgentInfo, terminate_process_tree
 
 logger = logging.getLogger(__name__)
 
@@ -196,12 +197,25 @@ class ClaudeCodeCLIAgent(BaseAgent):
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            start_new_session=True,
         )
         try:
             proc.stdin.write(prompt)
             proc.stdin.close()
         except BrokenPipeError:
             pass
+
+        # The blocking read loop below has no inherent timeout, so a hung CLI
+        # would stall Genesis forever. A watchdog kills the process after the
+        # configured timeout, which ends the stdout iterator and lets us raise.
+        timed_out = threading.Event()
+
+        def _abort_on_timeout() -> None:
+            timed_out.set()
+            terminate_process_tree(proc)
+
+        watchdog = threading.Timer(self.timeout, _abort_on_timeout)
+        watchdog.start()
 
         result_text = ""
         accumulated_text: list[str] = []
@@ -242,11 +256,15 @@ class ClaudeCodeCLIAgent(BaseAgent):
                     )
                     result_text = event.get("result") or ""
         finally:
+            watchdog.cancel()
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+
+        if timed_out.is_set():
+            raise RuntimeError(f"Claude CLI timed out after {self.timeout}s")
 
         # Always prefer the joined text blocks — they are the raw model output and
         # avoid any post-processing the CLI applies to the result field.

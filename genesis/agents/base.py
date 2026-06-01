@@ -1,7 +1,41 @@
 from __future__ import annotations
+import os
+import signal
+import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable
+
+
+def terminate_process_tree(proc: "subprocess.Popen") -> None:
+    """Best-effort kill of a child process and all of its descendants.
+
+    Killing only the immediate child can leave grandchildren alive — e.g. the
+    node/native process spawned behind a ``.cmd`` shim on Windows — and those
+    grandchildren keep the stdout pipe open, blocking readers indefinitely. On
+    Windows we use ``taskkill /T`` to take down the whole tree; on POSIX we kill
+    the process group (requires ``start_new_session=True`` at spawn time).
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                check=False,
+            )
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+    except Exception:
+        # Last-ditch fallback — kill at least the direct child.
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 @dataclass

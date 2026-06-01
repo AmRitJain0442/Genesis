@@ -14,11 +14,12 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import logging
 from pathlib import Path
 from typing import Callable
 
-from genesis.agents.base import BaseAgent, AgentInfo
+from genesis.agents.base import BaseAgent, AgentInfo, terminate_process_tree
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +229,7 @@ class CodexCLIAgent(BaseAgent):
             text=True,
             encoding="utf-8",
             env=env,
+            start_new_session=True,
         )
 
         # Write prompt and close stdin — guard against broken pipe on early exit
@@ -238,6 +240,17 @@ class CodexCLIAgent(BaseAgent):
                 proc.stdin.close()
         except (BrokenPipeError, OSError):
             pass
+
+        # Streaming reads block indefinitely, so enforce the configured timeout
+        # with a watchdog that kills the process and ends the stdout iterator.
+        timed_out = threading.Event()
+
+        def _abort_on_timeout() -> None:
+            timed_out.set()
+            terminate_process_tree(proc)
+
+        watchdog = threading.Timer(self.timeout, _abort_on_timeout)
+        watchdog.start()
 
         last_message = ""
         try:
@@ -293,11 +306,15 @@ class CodexCLIAgent(BaseAgent):
                         f"[dim]Tokens: in={inp} (cached={cached}) out={out}[/dim]"
                     )
         finally:
+            watchdog.cancel()
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+
+        if timed_out.is_set():
+            raise RuntimeError(f"Codex timed out after {self.timeout}s")
 
         if proc.returncode != 0 and not last_message:
             stderr = proc.stderr.read().strip()
