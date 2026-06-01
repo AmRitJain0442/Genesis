@@ -203,9 +203,12 @@ def load_config() -> GenesisConfig:
         )
 
     if w := data.get("worker"):
+        # Fall back to the dataclass defaults (codex-cli / auto) so a partial
+        # [worker] table can't silently flip the worker over to Claude.
+        defaults = WorkerConfig()
         cfg.worker = WorkerConfig(
-            provider=w.get("provider", "claude-cli"),
-            model=w.get("model", "claude-sonnet-4-6"),
+            provider=w.get("provider", defaults.provider),
+            model=w.get("model", defaults.model),
         )
 
     if c := data.get("claude_cli"):
