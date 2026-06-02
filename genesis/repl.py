@@ -1310,44 +1310,28 @@ class GenesisREPL:
                 )
 
     def _print_banner(self) -> None:
-        systems = [
-            ("Claude Code", "online" if find_claude_binary() else "missing"),
-            ("Codex", "online" if find_codex_binary() else "missing"),
+        from genesis.ui.banner import render_banner
+
+        systems: list[tuple[str, bool]] = [
+            ("Claude Code", bool(find_claude_binary())),
+            ("Codex", bool(find_codex_binary())),
         ]
         if self.config.chatgpt_browser.enabled:
-            systems.append(("ChatGPT browser", "online"))
+            systems.append(("ChatGPT browser", True))
 
-        sys_tbl = command_table("Subsystems", border_style="magenta")
-        sys_tbl.add_column("System")
-        sys_tbl.add_column("State", width=12)
-        for name, state in systems:
-            sys_tbl.add_row(markup(name), status_label(state))
-
-        ops_tbl = kv_table(
-            [
-                ("version", __version__),
-                ("work_dir", self.work_dir),
-                ("memory", self.config.memory.file),
-                ("agents", ", ".join(self._agents.keys()) or "none available"),
-                ("parallelism", self.config.runtime.max_parallel_workers),
-                ("state_db", resolve_state_db(self.config)),
-            ],
-            title="Command Center",
-            border_style="cyan",
-        )
+        info = [
+            ("cwd", Path(self.work_dir).name or self.work_dir),
+            ("agents", str(len(self._agents)) if self._agents else "none"),
+            ("parallel", str(self.config.runtime.max_parallel_workers)),
+            ("memory", self.config.memory.file),
+        ]
 
         console.print()
-        console.print(
-            command_panel(
-                Group(
-                    ops_tbl,
-                    sys_tbl,
-                    "[dim]Commands: run <task> | runs | inspect <run_id> | status | help | exit[/dim]",
-                ),
-                "GENESIS",
-                border_style="magenta",
-                subtitle="terminal command center",
-                padding=(1, 2),
-            )
+        render_banner(
+            console,
+            version=__version__,
+            systems=systems,
+            info=info,
+            commands="run <task>   ·   runs   ·   inspect <id>   ·   status   ·   help   ·   exit",
         )
         console.print()
