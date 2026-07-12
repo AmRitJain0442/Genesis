@@ -320,14 +320,21 @@ class Orchestrator:
             f"GIT DIFF:\n\n{diff_block}\n\n"
             f"Return your review as JSON."
         )
-        if hasattr(self.agent, "chat_review"):
-            raw = self.agent.chat_review(_REVIEW_SYSTEM, [{"role": "user", "content": msg}])
+        reviewer = self._review_agent()
+        if hasattr(reviewer, "chat_review"):
+            raw = reviewer.chat_review(_REVIEW_SYSTEM, [{"role": "user", "content": msg}])
         else:
-            raw = self.agent.chat(_REVIEW_SYSTEM, [{"role": "user", "content": msg}])
+            raw = reviewer.chat(_REVIEW_SYSTEM, [{"role": "user", "content": msg}])
         if not raw or not raw.strip():
-            raise ValueError(f"Orchestrator returned empty review response for {step.step_id}")
+            raise ValueError(f"Reviewer returned empty review response for {step.step_id}")
         data = self._extract_json(raw)
         return Review(**data)
+
+    def _review_agent(self) -> BaseAgent:
+        """The dedicated reviewer. Prefer the peer brain so review is an
+        independent check rather than the plan synthesizer grading itself;
+        fall back to the primary brain when only one is available."""
+        return self.co_brain or self.agent
 
     def run_task(self, task: str, callbacks: dict[str, Callable] | None = None) -> None:
         self._run_fresh_task(task, callbacks)
@@ -734,6 +741,9 @@ class Orchestrator:
                     worktree_path=str(worktree_path),
                 )
 
+            specialty = self._specialty_for(step)
+            step_room = self._open_step_room(step, worker_name, specialty)
+
             worker = _make_worker(
                 worker_agent,
                 self._step_memory(step),
@@ -746,11 +756,19 @@ class Orchestrator:
                 execution.failed_agent = worker_name
                 execution.failed_reason = result.error or "worker failed"
                 execution.memory_note = f"FAILED: {execution.failed_reason}"
+                self._post_step(step_room, worker_name, "worker",
+                                f"Failed: {execution.failed_reason}", "status")
                 return execution
 
             patch = worktrees.capture_patch(worktree_path)
             if patch.changed_files:
                 result.files_written = patch.changed_files
+            self._post_step(
+                step_room, worker_name, "worker",
+                f"Wrote {len(result.files_written)} file(s): "
+                f"{', '.join(result.files_written) or 'none'}",
+                "code",
+            )
             execution.patch = patch
             execution.patch_id = self._store_patch(run_id, step.step_id, patch)
             if self.runtime:
@@ -780,6 +798,11 @@ class Orchestrator:
                 diff_text=patch.patch_text or "No git diff available.",
             )
             execution.review = review
+            self._post_step(
+                step_room, execution.reviewer_name, "reviewer",
+                f"{review.verdict} ({review.quality_score}/10): {review.feedback}",
+                "decision",
+            )
             if self.runtime:
                 self.runtime.upsert_step(
                     run_id,
@@ -1057,7 +1080,55 @@ class Orchestrator:
         return metadata
 
     def _reviewer_name(self) -> str:
-        return getattr(self.agent, "name", "independent-reviewer") or "independent-reviewer"
+        return getattr(self._review_agent(), "name", "independent-reviewer") or "independent-reviewer"
+
+    # ── Per-step worker rooms (observable in the viewer) ─────────────────────
+
+    def _open_step_room(self, step: Step, worker_name: str, specialty: str) -> str:
+        """Open a chatroom for this step where the brain briefs the worker; the
+        worker's result and the reviewer's verdict are posted here too. Returns
+        the room id, or '' when there is no chatroom. Never raises."""
+        if self.chatroom is None:
+            return ""
+        try:
+            from genesis.chatroom import RoomKind
+
+            brain = getattr(self.agent, "name", "brain") or "brain"
+            room = self.chatroom.create_room(
+                RoomKind.worker_room,
+                f"{step.step_id} — {step.title}",
+                participants=[brain, worker_name],
+            )
+            self.chatroom.post(
+                room.id, brain, "brain",
+                f"Brief for {worker_name} · specialty: {specialty}\n"
+                f"{step.description}\nExpected: {step.expected_output}",
+            )
+            return room.id
+        except Exception:
+            return ""
+
+    def _post_step(self, room_id: str, sender: str, role: str, content: str,
+                   kind: str = "message") -> None:
+        if self.chatroom is None or not room_id:
+            return
+        try:
+            self.chatroom.post(room_id, sender, role, content, kind)
+        except Exception:
+            pass
+
+    _SPECIALTIES = {
+        "test": "testing & test coverage",
+        "code": "implementation",
+        "docs": "documentation",
+        "review": "code review",
+        "research": "research & investigation",
+        "config": "configuration & tooling",
+        "refactor": "refactoring & cleanup",
+    }
+
+    def _specialty_for(self, step: Step) -> str:
+        return self._SPECIALTIES.get((step.type or "").lower(), "implementation")
 
     def _step_memory(self, step: Step) -> str:
         mem_summary = self.memory.get_summary(self.config.memory.max_context_chars)
@@ -1069,7 +1140,14 @@ class Orchestrator:
             )
             if palace_context:
                 mem_summary = mem_summary + "\n\n---\n\n" + palace_context
-        return mem_summary
+        # Phase 3: give the worker a specialty framing so it focuses on producing
+        # fully-tested, production-quality work in the area this step needs.
+        specialty = self._specialty_for(step)
+        directive = (
+            f"YOUR SPECIALTY FOR THIS STEP: {specialty}. "
+            f"Produce complete, fully-tested, production-quality work in this area."
+        )
+        return f"{directive}\n\n---\n\n{mem_summary}"
 
     def _store_patch(self, run_id: str, step_id: str, patch: WorktreePatch) -> str:
         if not self.runtime:
