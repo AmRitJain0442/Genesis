@@ -730,26 +730,56 @@ class GenesisREPL:
 
         console.print(tbl)
 
+    @staticmethod
+    def _agent_account_label(agent) -> str:
+        """The login/account an agent is bound to — its CLAUDE_CONFIG_DIR or
+        CODEX_HOME, or the provider default when unset."""
+        config_dir = getattr(agent, "config_dir", None)
+        if config_dir is not None:          # Claude CLI agent
+            return config_dir or "default ~/.claude"
+        codex_home = getattr(agent, "codex_home", None)
+        if codex_home is not None:          # Codex CLI agent
+            return codex_home or "default ~/.codex"
+        return "-"
+
+    def _agent_role_label(self, name: str, agent, primary, reviewer) -> str:
+        if agent is primary:
+            return "brain"
+        if reviewer is not None and agent is reviewer:
+            return "reviewer"
+        if "orchestrator" in name:
+            return "brain"
+        return "worker"
+
+    def _agent_state_label(self, name: str):
+        if self.registry is not None and not self.registry.is_available(name):
+            return "[yellow]limited[/yellow]"
+        return status_label("idle")
+
     def cmd_status(self) -> None:
         agent_tbl = command_table("Agent Roster", border_style="magenta")
-        agent_tbl.add_column("Role", width=12)
-        agent_tbl.add_column("Name", style="cyan")
-        agent_tbl.add_column("Provider", width=14)
-        agent_tbl.add_column("Model", width=22)
-        agent_tbl.add_column("State", width=10)
+        agent_tbl.add_column("Role", width=9)
+        agent_tbl.add_column("Name", style="cyan", width=22, overflow="fold")
+        agent_tbl.add_column("Provider", width=11)
+        agent_tbl.add_column("Model", width=18, overflow="fold")
+        agent_tbl.add_column("Account", width=22, overflow="fold")
+        agent_tbl.add_column("State", width=9)
+
+        primary = self._get_orchestrator()
+        reviewer = self._get_co_brain(primary) if (primary and self.config.collaboration.enabled) else None
 
         for name, agent in self._agents.items():
-            role = "orchestrator" if "orchestrator" in name else "worker"
             agent_tbl.add_row(
-                "ORCH" if role == "orchestrator" else "WORK",
+                self._agent_role_label(name, agent, primary, reviewer),
                 markup(name),
                 markup(agent.provider),
                 markup(agent.model),
-                status_label("idle"),
+                markup(self._agent_account_label(agent)),
+                self._agent_state_label(name),
             )
 
         if not self._agents:
-            agent_tbl.add_row("-", "[dim]none[/dim]", "-", "-", status_label("blocked"))
+            agent_tbl.add_row("-", "[dim]none[/dim]", "-", "-", "-", status_label("blocked"))
 
         cfg = self.config
         ops_tbl = kv_table(
