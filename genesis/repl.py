@@ -20,6 +20,7 @@ from genesis.agents.base import AgentInfo, BaseAgent
 from genesis.agents.claude_cli import ClaudeCodeCLIAgent, find_claude_binary
 from genesis.agents.codex_cli import CodexCLIAgent, find_codex_binary
 from genesis.agents.orchestrator import Orchestrator
+from genesis.agents.availability import AccountRegistry
 from genesis.chatroom import ChatroomManager, ChatroomServer, RoomKind
 from genesis.ui.console import console
 from genesis.ui.dashboard import DashboardState, make_layout
@@ -274,6 +275,10 @@ class GenesisREPL:
         self.chatroom = ChatroomManager(persist_dir=persist_dir)
         self.chatroom_server: ChatroomServer | None = None
 
+        # Shared across runs so a rate/usage-limited account stays skipped for its
+        # cooldown while another account takes over.
+        self.registry = AccountRegistry(self.config.failover.cooldown_seconds)
+
     # ── Agent construction ─────────────────────────────────────────────────
 
     def _build_agents(self) -> None:
@@ -402,6 +407,7 @@ class GenesisREPL:
             policy=self.policy,
             co_brain=co_brain,
             chatroom=self.chatroom,
+            registry=self.registry,
         )
 
     # ── Commands ───────────────────────────────────────────────────────────

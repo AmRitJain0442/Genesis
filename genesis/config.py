@@ -140,6 +140,12 @@ class DialogueConfig:
 
 
 @dataclass
+class FailoverConfig:
+    enabled: bool = True          # when an account is rate/usage/quota limited, use another
+    cooldown_seconds: int = 900   # how long an exhausted account is skipped before retry
+
+
+@dataclass
 class ChatroomConfig:
     enabled: bool = True
     host: str = "127.0.0.1"
@@ -213,6 +219,7 @@ class GenesisConfig:
     chatroom: ChatroomConfig = field(default_factory=ChatroomConfig)
     collaboration: CollaborationConfig = field(default_factory=CollaborationConfig)
     dialogue: DialogueConfig = field(default_factory=DialogueConfig)
+    failover: FailoverConfig = field(default_factory=FailoverConfig)
     git: GitConfig = field(default_factory=GitConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -308,6 +315,12 @@ def load_config() -> GenesisConfig:
         cfg.dialogue = DialogueConfig(
             enabled=dl.get("enabled", True),
             max_turns=dl.get("max_turns", 3),
+        )
+
+    if fo := data.get("failover"):
+        cfg.failover = FailoverConfig(
+            enabled=fo.get("enabled", True),
+            cooldown_seconds=fo.get("cooldown_seconds", 900),
         )
 
     if g := data.get("git"):

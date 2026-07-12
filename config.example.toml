@@ -82,6 +82,14 @@ max_rounds = 4
 enabled   = true
 max_turns = 3
 
+[failover]
+# When an account's CLI reports a rate/usage/quota limit, Genesis marks it
+# exhausted and routes the work to another account (same provider first, then
+# any). Applies to workers and to brain calls (planning, review, direction).
+# The exhausted account is skipped for cooldown_seconds, then retried.
+enabled          = true
+cooldown_seconds = 900      # 15 minutes
+
 [chatroom]
 # A local, observable message bus for agent coordination. When a run starts,
 # Genesis prints a localhost link where you can watch the agents communicate

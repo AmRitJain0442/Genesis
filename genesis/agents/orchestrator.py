@@ -11,6 +11,7 @@ from typing import Callable, TYPE_CHECKING
 from genesis.schemas.plan import Plan, Step
 from genesis.schemas.review import Review
 from genesis.agents.worker import Worker, WorkerResult
+from genesis.agents.availability import is_exhaustion_error
 from genesis.memory import MemoryManager
 from genesis.git_ops import GitManager
 from genesis.config import GenesisConfig
@@ -166,6 +167,7 @@ class Orchestrator:
         policy: ExecutionPolicy | None = None,
         co_brain: BaseAgent | None = None,
         chatroom=None,
+        registry=None,
     ):
         self.agent = agent
         self.worker_agents = worker_agents
@@ -180,6 +182,11 @@ class Orchestrator:
         # enabled, the two brains debate before self.agent synthesizes the plan.
         self.co_brain = co_brain
         self.chatroom = chatroom
+        # Account failover: exhausted (rate/usage/quota-limited) accounts are
+        # skipped for a cooldown so another account takes over.
+        from genesis.agents.availability import AccountRegistry
+        cooldown = getattr(getattr(config, "failover", None), "cooldown_seconds", 900)
+        self.registry = registry if registry is not None else AccountRegistry(cooldown)
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -215,10 +222,12 @@ class Orchestrator:
                 "Output ONLY the raw JSON object. No prose, no markdown fences, no code blocks. "
                 "Begin with { and end with }."
             )
-            if hasattr(self.agent, "chat_plan"):
-                raw = self.agent.chat_plan(_SYSTEM, [{"role": "user", "content": msg}])
-            else:
-                raw = self.agent.chat(_SYSTEM, [{"role": "user", "content": msg}])
+            def _do_plan(agent):
+                if hasattr(agent, "chat_plan"):
+                    return agent.chat_plan(_SYSTEM, [{"role": "user", "content": msg}])
+                return agent.chat(_SYSTEM, [{"role": "user", "content": msg}])
+
+            raw = self._invoke(self._brain_candidates(self.agent), _do_plan)
 
             if not raw or not raw.strip():
                 last_err = ValueError("Empty plan response from orchestrator")
@@ -320,11 +329,14 @@ class Orchestrator:
             f"GIT DIFF:\n\n{diff_block}\n\n"
             f"Return your review as JSON."
         )
-        reviewer = self._review_agent()
-        if hasattr(reviewer, "chat_review"):
-            raw = reviewer.chat_review(_REVIEW_SYSTEM, [{"role": "user", "content": msg}])
-        else:
-            raw = reviewer.chat(_REVIEW_SYSTEM, [{"role": "user", "content": msg}])
+        def _do_review(agent):
+            if hasattr(agent, "chat_review"):
+                return agent.chat_review(_REVIEW_SYSTEM, [{"role": "user", "content": msg}])
+            return agent.chat(_REVIEW_SYSTEM, [{"role": "user", "content": msg}])
+
+        # Review on the independent reviewer, failing over to another account if
+        # it is rate/usage limited.
+        raw = self._invoke(self._brain_candidates(self._review_agent()), _do_review)
         if not raw or not raw.strip():
             raise ValueError(f"Reviewer returned empty review response for {step.step_id}")
         data = self._extract_json(raw)
@@ -743,27 +755,31 @@ class Orchestrator:
 
             specialty = self._specialty_for(step)
             step_room = self._open_step_room(step, worker_name, specialty)
+            # Failover state: the account actually used may change mid-step if the
+            # current one hits its rate/usage limit.
+            worker_state = {"name": worker_name, "agent": worker_agent}
 
-            worker = _make_worker(
-                worker_agent,
-                self._step_memory(step),
-                str(worktree_path),
-                output_callback=output_callback,
-            )
+            def run_turn(s):
+                return self._worker_execute_with_failover(
+                    s, worktree_path, output_callback, worker_state, step_room)
+
             # Phase 3b: a multi-turn brain<->worker dialogue shapes the work
             # before the independent reviewer gates it. Single-shot when disabled.
             if getattr(self.config, "dialogue", None) and self.config.dialogue.enabled:
                 outcome = self._run_worker_dialogue(
-                    step, worker, worker_name, step_room, output_callback
+                    step, run_turn, worker_state["name"], step_room, output_callback
                 )
                 result = outcome.result
             else:
-                result = worker.execute(step)
+                result = run_turn(step)
                 self._post_step(
-                    step_room, worker_name, "worker",
+                    step_room, worker_state["name"], "worker",
                     f"Wrote {len(getattr(result, 'files_written', []) or [])} file(s)", "code",
                 )
 
+            # Failover may have switched the account partway through.
+            worker_name = worker_state["name"]
+            execution.worker_name = worker_name
             execution.result = result
             if result is None or not result.success:
                 reason = (getattr(result, "error", "") if result else "") or "worker failed"
@@ -847,7 +863,7 @@ class Orchestrator:
                     attempts_left=retries_left,
                 )
                 revised = self._revision_step(step, reason)
-                result = worker.execute(revised)
+                result = run_turn(revised)
                 execution.result = result
                 if not result.success:
                     review = review.model_copy(update={
@@ -944,7 +960,7 @@ class Orchestrator:
                         attempts_left=retries_left,
                     )
                     revised = self._revision_step(step, reason)
-                    result = worker.execute(revised)
+                    result = run_turn(revised)
                     execution.result = result
                     if not result.success:
                         execution.failed_agent = worker_name
@@ -1148,7 +1164,10 @@ class Orchestrator:
             'Return ONLY the JSON object.'
         )
         try:
-            raw = self.agent.chat(director_system, [{"role": "user", "content": msg}])
+            raw = self._invoke(
+                self._brain_candidates(self.agent),
+                lambda a: a.chat(director_system, [{"role": "user", "content": msg}]),
+            )
             data = self._extract_json(raw)
         except Exception as e:
             logger.warning("Director evaluation failed (%s); approving to avoid a loop", e)
@@ -1157,7 +1176,7 @@ class Orchestrator:
         feedback = str(data.get("feedback", "")).strip()
         return (action != "revise"), feedback
 
-    def _run_worker_dialogue(self, step: Step, worker, worker_name: str,
+    def _run_worker_dialogue(self, step: Step, run_worker, worker_name: str,
                              step_room: str, output_callback):
         from genesis.agents.worker_dialogue import WorkerDialogue
 
@@ -1167,7 +1186,7 @@ class Orchestrator:
             worker_name=worker_name,
             brain_name=brain,
             max_turns=self.config.dialogue.max_turns,
-            run_worker=lambda s: worker.execute(s),
+            run_worker=run_worker,
             evaluate=lambda s, r, t: self._brain_evaluate(s, r),
             make_revision=self._revision_step,
             post=lambda sender, role, content, kind="message": self._post_step(
@@ -1473,7 +1492,9 @@ class Orchestrator:
         )
 
     def _assign_worker(self, step: Step, unavailable: set[str] | None = None) -> tuple[str, BaseAgent]:
-        unavailable = unavailable or set()
+        unavailable = set(unavailable or set())
+        if self._failover_enabled():
+            unavailable |= self.registry.exhausted_names()
         candidates = {
             name: agent
             for name, agent in self.worker_agents.items()
@@ -1495,6 +1516,85 @@ class Orchestrator:
         # Fallback: use whatever is available
         name, agent = next(iter(candidates.items()))
         return name, agent
+
+    # ── Account failover ─────────────────────────────────────────────────────
+
+    def _failover_enabled(self) -> bool:
+        return getattr(getattr(self.config, "failover", None), "enabled", True)
+
+    def _notify_failover(self, name: str, room_id: str = "", alt: str = "") -> None:
+        target = f" — routing to {alt}" if alt else ""
+        logger.warning("Account '%s' exhausted%s; failing over", name, target)
+        self._post_step(room_id, name, "system",
+                        f"{name} hit its rate/usage limit{target}", "status")
+
+    def _brain_candidates(self, primary: BaseAgent) -> list[BaseAgent]:
+        """Ordered, de-duplicated brain-capable agents for a role: the preferred
+        agent, the two brains, then any account (each CLI can plan/review)."""
+        out: list[BaseAgent] = []
+        seen: set[str] = set()
+        for agent in [primary, self.agent, self.co_brain, *self.worker_agents.values()]:
+            if agent is None:
+                continue
+            name = getattr(agent, "name", "")
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append(agent)
+        return out
+
+    def _invoke(self, candidates: list[BaseAgent], make_call: Callable[[BaseAgent], str]) -> str:
+        """Call make_call on the first available agent; on an exhaustion error,
+        mark that account and fail over to the next. Raises if all are spent."""
+        last_err: Exception | None = None
+        for agent in candidates:
+            name = getattr(agent, "name", "?")
+            if self._failover_enabled() and not self.registry.is_available(name):
+                continue
+            try:
+                return make_call(agent)
+            except Exception as e:
+                if self._failover_enabled() and is_exhaustion_error(str(e)):
+                    self.registry.mark_exhausted(name)
+                    self._notify_failover(name)
+                    last_err = e
+                    continue
+                raise
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("No available accounts for this call (all rate/usage limited)")
+
+    def _alternate_worker(self, step: Step, exclude: set[str]) -> tuple[str, BaseAgent] | None:
+        try:
+            return self._assign_worker(step, unavailable=exclude)
+        except RuntimeError:
+            return None
+
+    def _worker_execute_with_failover(self, step: Step, worktree_path, output_callback,
+                                      state: dict, room_id: str) -> WorkerResult:
+        """Run one worker turn; if the account is exhausted, mark it and retry on
+        an alternate worker. `state` ({name, agent}) is updated in place so later
+        turns and the runtime record reflect the account actually used."""
+        tried: set[str] = set()
+        while True:
+            name, agent = state["name"], state["agent"]
+            tried.add(name)
+            worker = _make_worker(
+                agent, self._step_memory(step), str(worktree_path),
+                output_callback=output_callback,
+            )
+            result = worker.execute(step)
+            if result.success or not self._failover_enabled() or not is_exhaustion_error(result.error):
+                return result
+
+            self.registry.mark_exhausted(name)
+            alt = self._alternate_worker(step, exclude=tried)
+            if alt is None:
+                self._notify_failover(name, room_id)
+                return result   # nobody left to take over — surface the exhaustion
+            alt_name, alt_agent = alt
+            self._notify_failover(name, room_id, alt=alt_name)
+            state["name"], state["agent"] = alt_name, alt_agent
 
     @staticmethod
     def _dump_debug(label: str, content: str) -> None:
