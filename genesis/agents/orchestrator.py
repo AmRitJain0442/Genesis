@@ -164,6 +164,8 @@ class Orchestrator:
         runtime: RuntimeStore | None = None,
         palace: PalaceStore | None = None,
         policy: ExecutionPolicy | None = None,
+        co_brain: BaseAgent | None = None,
+        chatroom=None,
     ):
         self.agent = agent
         self.worker_agents = worker_agents
@@ -174,6 +176,10 @@ class Orchestrator:
         self.runtime = runtime
         self.palace = palace
         self.policy = policy
+        # Second brain for collaborative planning (Phase 2). When present and
+        # enabled, the two brains debate before self.agent synthesizes the plan.
+        self.co_brain = co_brain
+        self.chatroom = chatroom
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -189,9 +195,14 @@ class Orchestrator:
                 )
             except Exception as e:
                 logger.warning("Palace wakeup failed: %s", e)
+        # Phase 2: let the two brains debate first; fold their agreed discussion
+        # into the planning context so self.agent synthesizes the shared plan.
+        discussion = self._run_brain_debate(task, context=mem)
+
         base_msg = (
             f"CURRENT MEMORY CONTEXT:\n{mem}\n\n---\n\n"
             f"RETRIEVED PALACE MEMORY:\n{palace_mem or 'No relevant palace memories.'}\n\n---\n\n"
+            f"{discussion}"
             f"TASK TO PLAN:\n{task}\n\n"
             f"Return the plan as JSON. Output ONLY the JSON object — "
             f"start your response with {{ and end with }}. No preamble, no explanation."
@@ -227,6 +238,35 @@ class Orchestrator:
             return Plan(**data)
 
         raise ValueError(f"Could not parse plan after 2 attempts: {last_err}")
+
+    def _run_brain_debate(self, task: str, context: str = "") -> str:
+        """Run the two-brain debate (if a co-brain is available and enabled) and
+        return an agreed-discussion block to fold into the plan prompt. Returns
+        an empty string when collaboration is unavailable or fails, so planning
+        degrades gracefully to the single-brain path."""
+        collab_cfg = getattr(self.config, "collaboration", None)
+        if self.co_brain is None or (collab_cfg is not None and not collab_cfg.enabled):
+            return ""
+        try:
+            from genesis.agents.collaboration import BrainCollaboration
+
+            max_rounds = collab_cfg.max_rounds if collab_cfg else 4
+            collab = BrainCollaboration(
+                self.agent, self.co_brain, chatroom=self.chatroom, max_rounds=max_rounds
+            )
+            result = collab.discuss(task, context=context)
+        except Exception as e:
+            logger.warning("Brain debate failed, falling back to single-brain plan: %s", e)
+            return ""
+
+        if not result.transcript:
+            return ""
+        status = "reached consensus" if result.converged else "did not fully converge; arbitrate"
+        return (
+            f"BRAIN DEBATE ({result.rounds} round(s), {status}):\n"
+            f"{result.transcript}\n\n"
+            f"Synthesize the above discussion into the final plan.\n\n---\n\n"
+        )
 
     def review(
         self,

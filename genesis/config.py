@@ -128,6 +128,12 @@ class CodexCLIConfig:
 
 
 @dataclass
+class CollaborationConfig:
+    enabled: bool = True      # when two brains are available, have them debate the plan
+    max_rounds: int = 4       # hard backstop; if unresolved, the Claude brain arbitrates
+
+
+@dataclass
 class ChatroomConfig:
     enabled: bool = True
     host: str = "127.0.0.1"
@@ -199,6 +205,7 @@ class GenesisConfig:
     codex_cli: CodexCLIConfig = field(default_factory=CodexCLIConfig)
     chatgpt_browser: ChatGPTBrowserConfig = field(default_factory=ChatGPTBrowserConfig)
     chatroom: ChatroomConfig = field(default_factory=ChatroomConfig)
+    collaboration: CollaborationConfig = field(default_factory=CollaborationConfig)
     git: GitConfig = field(default_factory=GitConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -282,6 +289,12 @@ def load_config() -> GenesisConfig:
             port=cr.get("port", 0),
             persist=cr.get("persist", True),
             open_browser=cr.get("open_browser", False),
+        )
+
+    if cl := data.get("collaboration"):
+        cfg.collaboration = CollaborationConfig(
+            enabled=cl.get("enabled", True),
+            max_rounds=cl.get("max_rounds", 4),
         )
 
     if g := data.get("git"):

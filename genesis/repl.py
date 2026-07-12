@@ -375,11 +375,21 @@ class GenesisREPL:
     def _get_workers(self) -> dict[str, BaseAgent]:
         return {k: v for k, v in self._agents.items() if "orchestrator" not in k}
 
+    def _get_co_brain(self, primary: BaseAgent) -> BaseAgent | None:
+        """The second brain (a different orchestrator agent) for collaborative
+        planning — the one that isn't the primary. None if only one brain."""
+        for key in ("claude-cli-orchestrator", "codex-orchestrator", "chatgpt-orchestrator"):
+            agent = self._agents.get(key)
+            if agent is not None and agent is not primary:
+                return agent
+        return None
+
     def _make_orchestrator(self) -> Orchestrator | None:
         orch = self._get_orchestrator()
         workers = self._get_workers()
         if not orch or not workers:
             return None
+        co_brain = self._get_co_brain(orch) if self.config.collaboration.enabled else None
         return Orchestrator(
             orch,
             workers,
@@ -390,6 +400,8 @@ class GenesisREPL:
             runtime=self.runtime,
             palace=self.palace,
             policy=self.policy,
+            co_brain=co_brain,
+            chatroom=self.chatroom,
         )
 
     # ── Commands ───────────────────────────────────────────────────────────

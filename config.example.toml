@@ -66,6 +66,14 @@ model = "auto"
 # home  = "C:/Users/amrit/.codex-pro3"
 # model = "auto"
 
+[collaboration]
+# When two brains are available (a Claude orchestrator AND a Codex orchestrator),
+# they debate the task in a brain chatroom and converge on a shared plan before
+# any workers start. They debate until both agree; max_rounds is a hard backstop
+# after which the Claude brain arbitrates and synthesizes the final plan.
+enabled    = true
+max_rounds = 4
+
 [chatroom]
 # A local, observable message bus for agent coordination. When a run starts,
 # Genesis prints a localhost link where you can watch the agents communicate
