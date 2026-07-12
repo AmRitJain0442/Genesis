@@ -20,6 +20,7 @@ from genesis.agents.base import AgentInfo, BaseAgent
 from genesis.agents.claude_cli import ClaudeCodeCLIAgent, find_claude_binary
 from genesis.agents.codex_cli import CodexCLIAgent, find_codex_binary
 from genesis.agents.orchestrator import Orchestrator
+from genesis.chatroom import ChatroomManager, ChatroomServer, RoomKind
 from genesis.ui.console import console
 from genesis.ui.dashboard import DashboardState, make_layout
 from genesis.ui.theme import command_panel, command_table, kv_table, markup, progress_bar, status_label, trim
@@ -265,6 +266,14 @@ class GenesisREPL:
         self._agents: dict[str, BaseAgent] = {}
         self._build_agents()
 
+        # Chatroom substrate — a shared, observable message bus. The web viewer
+        # is created lazily on the first run so idle sessions open no ports.
+        persist_dir = None
+        if self.config.chatroom.persist:
+            persist_dir = str(Path(resolve_state_db(self.config)).parent / "chatrooms")
+        self.chatroom = ChatroomManager(persist_dir=persist_dir)
+        self.chatroom_server: ChatroomServer | None = None
+
     # ── Agent construction ─────────────────────────────────────────────────
 
     def _build_agents(self) -> None:
@@ -384,6 +393,98 @@ class GenesisREPL:
         )
 
     # ── Commands ───────────────────────────────────────────────────────────
+
+    # ── Chatroom viewer ─────────────────────────────────────────────────────
+
+    def _ensure_chatroom_server(self) -> str | None:
+        """Start the localhost viewer on first use; return its URL (or None)."""
+        if not self.config.chatroom.enabled:
+            return None
+        if self.chatroom_server is None:
+            self.chatroom_server = ChatroomServer(
+                self.chatroom,
+                host=self.config.chatroom.host,
+                port=self.config.chatroom.port,
+            )
+        try:
+            url = self.chatroom_server.start()
+        except OSError as e:
+            logger.warning("Chatroom viewer failed to start: %s", e)
+            self.chatroom_server = None
+            return None
+        if self.config.chatroom.open_browser:
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:
+                pass
+        return url
+
+    def _stop_chatroom_server(self) -> None:
+        if self.chatroom_server is not None:
+            self.chatroom_server.stop()
+            self.chatroom_server = None
+
+    def _bridge_callbacks_to_chatroom(self, raw: dict, task: str) -> dict:
+        """Wrap orchestrator callbacks so every coordination event is also posted
+        to a chatroom — making the flow observable in the web viewer. Posting
+        must never break a run, so all failures are swallowed."""
+        if not self.config.chatroom.enabled:
+            return raw
+
+        orch = self._get_orchestrator()
+        brain = getattr(orch, "name", "brain") or "brain"
+        room = self.chatroom.create_room(
+            RoomKind.system, task[:60] or "run", participants=list(self._agents.keys())
+        )
+
+        def say(sender: str, role: str, content: str, kind: str = "message") -> None:
+            try:
+                self.chatroom.post(room.id, sender, role, content, kind)
+            except Exception:
+                pass
+
+        def _files(result) -> str:
+            written = getattr(result, "files_written", None) or []
+            head = f"wrote {len(written)} file(s)"
+            return head + (": " + ", ".join(written) if written else "")
+
+        posters = {
+            "on_plan": lambda plan, *a: say(
+                brain, "brain", f"Planned {len(plan.steps)} steps — {plan.task_summary}", "decision"),
+            "on_step_start": lambda step, idx, total, *a: say(
+                brain, "brain", f"> Step {step.step_id}: {step.title}", "status"),
+            "on_worker_assigned": lambda step, worker, *a: say(
+                brain, "brain", f"Assigned {worker} -> {step.step_id}", "status"),
+            "on_step_result": lambda step, result, worker, *a: say(
+                worker, "worker", f"{step.step_id}: {_files(result)}", "code"),
+            "on_review": lambda step, review, *a: say(
+                "reviewer", "reviewer",
+                f"{step.step_id}: {review.verdict} ({review.quality_score}/10) — {review.feedback}",
+                "decision"),
+            "on_commit": lambda step, sha, *a: say(
+                brain, "brain", f"Committed {step.step_id}" + (f" @ {sha}" if sha else ""), "decision"),
+            "on_status": lambda msg, *a: say(brain, "system", str(msg), "status"),
+            "on_error": lambda step, error, *a: say(
+                brain, "system", f"{getattr(step, 'step_id', '?')}: ERROR {error}", "status"),
+            "on_task_complete": lambda plan, *a: say(brain, "brain", "Task complete", "decision"),
+        }
+
+        def compose(name, original):
+            poster = posters.get(name)
+            if poster is None:
+                return original
+
+            def wrapped(*args, **kwargs):
+                try:
+                    poster(*args, **kwargs)
+                except Exception:
+                    pass
+                return original(*args, **kwargs)
+
+            return wrapped
+
+        return {k: compose(k, v) for k, v in raw.items()}
 
     def cmd_run(self, task: str) -> None:
         if not task:
@@ -521,6 +622,13 @@ class GenesisREPL:
             "on_error": on_error,
             "on_task_complete": on_task_complete,
         }
+
+        # Observability: start the localhost viewer and mirror every coordination
+        # event into a chatroom before wiring the Live display on top.
+        chat_url = self._ensure_chatroom_server()
+        raw_callbacks = self._bridge_callbacks_to_chatroom(raw_callbacks, task)
+        if chat_url:
+            console.print(f"[dim]Watch the agents live:[/dim] [cyan]{chat_url}[/cyan]")
 
         try:
             with Live(
@@ -1491,13 +1599,14 @@ class GenesisREPL:
     # ── Main loop ──────────────────────────────────────────────────────────
 
     def _cleanup(self) -> None:
-        """Close any browser agents that were opened."""
+        """Close any browser agents and shut down the chatroom viewer."""
         for agent in self._agents.values():
             if hasattr(agent, "close"):
                 try:
                     agent.close()
                 except Exception:
                     pass
+        self._stop_chatroom_server()
 
     def run(self) -> None:
         self._print_banner()

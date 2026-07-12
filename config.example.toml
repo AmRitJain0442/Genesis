@@ -66,6 +66,16 @@ model = "auto"
 # home  = "C:/Users/amrit/.codex-pro3"
 # model = "auto"
 
+[chatroom]
+# A local, observable message bus for agent coordination. When a run starts,
+# Genesis prints a localhost link where you can watch the agents communicate
+# live (read-only). Nothing is exposed beyond 127.0.0.1.
+enabled      = true
+host         = "127.0.0.1"
+port         = 0            # 0 = pick a free port automatically
+persist      = true         # append per-room transcripts under .genesis/state/chatrooms
+open_browser = false        # set true to auto-open the viewer on the first run
+
 [chatgpt_browser]
 # Only needed if you want to drive ChatGPT via the web UI.
 # Requires: pip install playwright && playwright install chromium

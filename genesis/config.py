@@ -128,6 +128,15 @@ class CodexCLIConfig:
 
 
 @dataclass
+class ChatroomConfig:
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 0           # 0 = ephemeral (OS picks a free port)
+    persist: bool = True     # write per-room JSONL under .genesis/state/chatrooms
+    open_browser: bool = False
+
+
+@dataclass
 class ChatGPTBrowserConfig:
     enabled: bool = False
     headless: bool = True
@@ -189,6 +198,7 @@ class GenesisConfig:
     claude_cli: ClaudeCLIConfig = field(default_factory=ClaudeCLIConfig)
     codex_cli: CodexCLIConfig = field(default_factory=CodexCLIConfig)
     chatgpt_browser: ChatGPTBrowserConfig = field(default_factory=ChatGPTBrowserConfig)
+    chatroom: ChatroomConfig = field(default_factory=ChatroomConfig)
     git: GitConfig = field(default_factory=GitConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -263,6 +273,15 @@ def load_config() -> GenesisConfig:
             headless=b.get("headless", True),
             profile_dir=b.get("profile_dir", ""),
             model=b.get("model", "gpt-4o"),
+        )
+
+    if cr := data.get("chatroom"):
+        cfg.chatroom = ChatroomConfig(
+            enabled=cr.get("enabled", True),
+            host=cr.get("host", "127.0.0.1"),
+            port=cr.get("port", 0),
+            persist=cr.get("persist", True),
+            open_browser=cr.get("open_browser", False),
         )
 
     if g := data.get("git"):
