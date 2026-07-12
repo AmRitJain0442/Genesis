@@ -1,0 +1,119 @@
+import json
+import types
+import unittest
+
+from genesis.agents.worker_dialogue import WorkerDialogue
+from genesis.agents.orchestrator import Orchestrator
+from genesis.config import GenesisConfig
+
+
+def _result(files=None, success=True, text="did the thing", error=""):
+    return types.SimpleNamespace(
+        success=success, files_written=list(files or []), result_text=text, error=error,
+    )
+
+
+def _step(step_id="s1"):
+    return types.SimpleNamespace(step_id=step_id, title="t", type="code",
+                                 description="d", expected_output="out")
+
+
+class _Recorder:
+    def __init__(self):
+        self.posts = []
+
+    def __call__(self, sender, role, content, kind="message"):
+        self.posts.append((role, content))
+
+
+class WorkerDialogueTests(unittest.TestCase):
+    def _dialogue(self, *, evaluations, max_turns=3, worker_results=None):
+        step = _step()
+        results = iter(worker_results or [_result(["a.py"]), _result(["a.py", "test_a.py"]),
+                                          _result(["a.py"])])
+        evals = iter(evaluations)
+        rec = _Recorder()
+
+        def run_worker(s):
+            return next(results)
+
+        def evaluate(s, r, turn):
+            return next(evals)
+
+        def make_revision(s, feedback):
+            return _step(step_id=s.step_id)  # feedback carried implicitly
+
+        dlg = WorkerDialogue(
+            step=step, worker_name="codex-main", brain_name="claude", max_turns=max_turns,
+            run_worker=run_worker, evaluate=evaluate, make_revision=make_revision, post=rec,
+        )
+        return dlg.run(), rec
+
+    def test_approves_after_one_revision(self) -> None:
+        outcome, rec = self._dialogue(evaluations=[(False, "add tests"), (True, "")])
+        self.assertTrue(outcome.approved)
+        self.assertEqual(2, outcome.turns)
+        roles = [r for r, _ in rec.posts]
+        # worker, brain(revise), worker, brain(approve)
+        self.assertEqual(["worker", "brain", "worker", "brain"], roles)
+        self.assertIn("Revise: add tests", [c for _, c in rec.posts])
+
+    def test_hits_turn_budget_without_approval(self) -> None:
+        outcome, rec = self._dialogue(evaluations=[(False, "more"), (False, "more")], max_turns=2)
+        self.assertFalse(outcome.approved)
+        self.assertEqual(2, outcome.turns)
+        self.assertTrue(any("Turn budget reached" in c for _, c in rec.posts))
+
+    def test_worker_failure_ends_dialogue(self) -> None:
+        outcome, rec = self._dialogue(
+            evaluations=[(True, "")],
+            worker_results=[_result(success=False, error="boom")],
+        )
+        self.assertFalse(outcome.approved)
+        self.assertEqual(1, outcome.turns)
+        self.assertTrue(any("Worker failed: boom" in c for _, c in rec.posts))
+
+    def test_evaluator_exception_fails_open(self) -> None:
+        step = _step()
+        rec = _Recorder()
+
+        def boom(s, r, turn):
+            raise RuntimeError("judge crashed")
+
+        dlg = WorkerDialogue(
+            step=step, worker_name="w", brain_name="b", max_turns=3,
+            run_worker=lambda s: _result(["a.py"]),
+            evaluate=boom, make_revision=lambda s, f: s, post=rec,
+        )
+        outcome = dlg.run()
+        self.assertTrue(outcome.approved)     # failed open, no infinite loop
+        self.assertEqual(1, outcome.turns)
+
+
+class BrainEvaluateTests(unittest.TestCase):
+    def _orch(self, reply):
+        agent = types.SimpleNamespace(
+            name="claude", chat=lambda system, messages, output_callback=None: reply)
+        mem = types.SimpleNamespace(get_summary=lambda n: "")
+        return Orchestrator(agent, {"w": object()}, mem, git=None, config=GenesisConfig(),
+                            work_dir=".")
+
+    def test_parses_revise(self) -> None:
+        orch = self._orch(json.dumps({"action": "revise", "feedback": "add a test"}))
+        approve, feedback = orch._brain_evaluate(_step(), _result(["a.py"]))
+        self.assertFalse(approve)
+        self.assertEqual("add a test", feedback)
+
+    def test_parses_approve(self) -> None:
+        orch = self._orch(json.dumps({"action": "approve", "feedback": ""}))
+        approve, _ = orch._brain_evaluate(_step(), _result(["a.py"]))
+        self.assertTrue(approve)
+
+    def test_unparseable_reply_fails_open(self) -> None:
+        orch = self._orch("not json at all")
+        approve, _ = orch._brain_evaluate(_step(), _result(["a.py"]))
+        self.assertTrue(approve)
+
+
+if __name__ == "__main__":
+    unittest.main()

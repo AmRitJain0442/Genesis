@@ -74,6 +74,14 @@ model = "auto"
 enabled    = true
 max_rounds = 4
 
+[dialogue]
+# Multi-turn conversation between the directing brain and each worker. The
+# worker implements, the brain evaluates and asks for specific revisions, and
+# the worker iterates — up to max_turns — before the work goes to the
+# independent reviewer. Watch it unfold in the per-step worker room.
+enabled   = true
+max_turns = 3
+
 [chatroom]
 # A local, observable message bus for agent coordination. When a run starts,
 # Genesis prints a localhost link where you can watch the agents communicate

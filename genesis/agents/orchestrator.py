@@ -750,25 +750,32 @@ class Orchestrator:
                 str(worktree_path),
                 output_callback=output_callback,
             )
-            result = worker.execute(step)
+            # Phase 3b: a multi-turn brain<->worker dialogue shapes the work
+            # before the independent reviewer gates it. Single-shot when disabled.
+            if getattr(self.config, "dialogue", None) and self.config.dialogue.enabled:
+                outcome = self._run_worker_dialogue(
+                    step, worker, worker_name, step_room, output_callback
+                )
+                result = outcome.result
+            else:
+                result = worker.execute(step)
+                self._post_step(
+                    step_room, worker_name, "worker",
+                    f"Wrote {len(getattr(result, 'files_written', []) or [])} file(s)", "code",
+                )
+
             execution.result = result
-            if not result.success:
+            if result is None or not result.success:
+                reason = (getattr(result, "error", "") if result else "") or "worker failed"
                 execution.failed_agent = worker_name
-                execution.failed_reason = result.error or "worker failed"
-                execution.memory_note = f"FAILED: {execution.failed_reason}"
-                self._post_step(step_room, worker_name, "worker",
-                                f"Failed: {execution.failed_reason}", "status")
+                execution.failed_reason = reason
+                execution.memory_note = f"FAILED: {reason}"
+                self._post_step(step_room, worker_name, "worker", f"Failed: {reason}", "status")
                 return execution
 
             patch = worktrees.capture_patch(worktree_path)
             if patch.changed_files:
                 result.files_written = patch.changed_files
-            self._post_step(
-                step_room, worker_name, "worker",
-                f"Wrote {len(result.files_written)} file(s): "
-                f"{', '.join(result.files_written) or 'none'}",
-                "code",
-            )
             execution.patch = patch
             execution.patch_id = self._store_patch(run_id, step.step_id, patch)
             if self.runtime:
@@ -1116,6 +1123,63 @@ class Orchestrator:
             self.chatroom.post(room_id, sender, role, content, kind)
         except Exception:
             pass
+
+    # ── Multi-turn brain<->worker dialogue ───────────────────────────────────
+
+    def _brain_evaluate(self, step: Step, result: WorkerResult) -> tuple[bool, str]:
+        """The directing brain judges a worker turn: approve, or revise with
+        specific feedback. Parse failures fail open (approve) so a flaky judge
+        can never trap the dialogue in a loop."""
+        director_system = (
+            "You are the brain directing a worker on a single step. Given the worker's latest "
+            "result, decide whether the implementation is complete and correct — including any "
+            "tests the step needs — or requires another revision. Be strict about tests and "
+            "correctness, but do not ask for gold-plating.\n"
+            'Return ONLY JSON: {"action":"approve"|"revise","feedback":"<specific, actionable '
+            'changes if revise; empty if approve>"}'
+        )
+        files = result.files_written or []
+        body = (result.result_text or "")[:3000]
+        msg = (
+            f"STEP:\n  ID: {step.step_id}\n  Title: {step.title}\n  Type: {step.type}\n"
+            f"  Expected Output: {step.expected_output}\n\n"
+            f"WORKER FILES ({len(files)}): {', '.join(files) or 'none'}\n\n"
+            f"WORKER SUMMARY:\n{body}\n\n"
+            'Return ONLY the JSON object.'
+        )
+        try:
+            raw = self.agent.chat(director_system, [{"role": "user", "content": msg}])
+            data = self._extract_json(raw)
+        except Exception as e:
+            logger.warning("Director evaluation failed (%s); approving to avoid a loop", e)
+            return True, ""
+        action = str(data.get("action", "approve")).strip().lower()
+        feedback = str(data.get("feedback", "")).strip()
+        return (action != "revise"), feedback
+
+    def _run_worker_dialogue(self, step: Step, worker, worker_name: str,
+                             step_room: str, output_callback):
+        from genesis.agents.worker_dialogue import WorkerDialogue
+
+        brain = getattr(self.agent, "name", "brain") or "brain"
+        dialogue = WorkerDialogue(
+            step=step,
+            worker_name=worker_name,
+            brain_name=brain,
+            max_turns=self.config.dialogue.max_turns,
+            run_worker=lambda s: worker.execute(s),
+            evaluate=lambda s, r, t: self._brain_evaluate(s, r),
+            make_revision=self._revision_step,
+            post=lambda sender, role, content, kind="message": self._post_step(
+                step_room, sender, role, content, kind),
+        )
+        outcome = dialogue.run()
+        if output_callback:
+            output_callback(
+                f"Dialogue on {step.step_id}: {outcome.turns} turn(s), "
+                f"{'brain-approved' if outcome.approved else 'sent to review'}"
+            )
+        return outcome
 
     _SPECIALTIES = {
         "test": "testing & test coverage",
