@@ -97,9 +97,18 @@ class WorkerConfig:
 
 
 @dataclass
+class ClaudeAccount:
+    name: str = "claude-main"
+    config_dir: str = ""    # CLAUDE_CONFIG_DIR — empty = system default (~/.claude)
+    model: str = "auto"
+
+
+@dataclass
 class ClaudeCLIConfig:
     command: str = "claude"
     timeout: int = 300
+    accounts: list[ClaudeAccount] = field(default_factory=list)
+    accounts_explicit: bool = False
 
 
 @dataclass
@@ -212,9 +221,21 @@ def load_config() -> GenesisConfig:
         )
 
     if c := data.get("claude_cli"):
+        claude_accounts_data = c.get("accounts", [])
+        claude_accounts = [
+            ClaudeAccount(
+                name=a.get("name", f"claude-{i+1}"),
+                config_dir=a.get("config_dir", ""),
+                model=a.get("model", "auto"),
+            )
+            for i, a in enumerate(claude_accounts_data)
+            if isinstance(a, dict)
+        ]
         cfg.claude_cli = ClaudeCLIConfig(
             command=c.get("command", "claude"),
             timeout=c.get("timeout", 300),
+            accounts=claude_accounts,
+            accounts_explicit="accounts" in c,
         )
 
     if cx := data.get("codex_cli"):

@@ -10,10 +10,12 @@ Claude Code docs on non-interactive use:
 """
 from __future__ import annotations
 import json
+import os
 import subprocess
 import threading
 import logging
 import shutil
+from pathlib import Path
 from typing import Callable
 from genesis.agents.base import BaseAgent, AgentInfo, terminate_process_tree
 
@@ -82,10 +84,22 @@ class ClaudeCodeCLIAgent(BaseAgent):
         info: AgentInfo,
         command: str = "claude",
         timeout: int = 300,
+        config_dir: str = "",   # empty = use system default (~/.claude)
     ):
         super().__init__(info)
         self.command = command
         self.timeout = timeout
+        # Normalise config_dir to OS path (config may use forward slashes on Windows)
+        self.config_dir = str(Path(config_dir)) if config_dir else ""
+
+    def _env(self) -> dict[str, str]:
+        """Inherit the current env, adding CLAUDE_CONFIG_DIR when this agent has
+        a dedicated one so multiple accounts stay isolated from the default
+        ~/.claude login."""
+        env = os.environ.copy()
+        if self.config_dir:
+            env["CLAUDE_CONFIG_DIR"] = self.config_dir
+        return env
 
     # ── Core chat method ───────────────────────────────────────────────────
 
@@ -129,7 +143,8 @@ class ClaudeCodeCLIAgent(BaseAgent):
         if json_schema:
             cmd += ["--json-schema", json_schema]
 
-        logger.debug("Calling: %s (prompt %d chars)", " ".join(cmd[:4]), len(prompt))
+        logger.debug("Calling: %s (prompt %d chars, config_dir=%s)",
+                     " ".join(cmd[:4]), len(prompt), self.config_dir or "default")
 
         result = subprocess.run(
             cmd,
@@ -138,6 +153,7 @@ class ClaudeCodeCLIAgent(BaseAgent):
             text=True,
             timeout=self.timeout,
             encoding="utf-8",
+            env=self._env(),
         )
 
         if result.returncode != 0:
@@ -188,7 +204,8 @@ class ClaudeCodeCLIAgent(BaseAgent):
             "--verbose",
         ]
 
-        logger.debug("Claude streaming cmd: %s", " ".join(cmd[:5]))
+        logger.debug("Claude streaming cmd: %s (config_dir=%s)",
+                     " ".join(cmd[:5]), self.config_dir or "default")
 
         proc = subprocess.Popen(
             cmd,
@@ -198,6 +215,7 @@ class ClaudeCodeCLIAgent(BaseAgent):
             text=True,
             encoding="utf-8",
             start_new_session=True,
+            env=self._env(),
         )
 
         # Drain stderr on a background thread so a full stderr pipe buffer can

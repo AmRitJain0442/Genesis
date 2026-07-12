@@ -1,6 +1,7 @@
 # Genesis Configuration
 # Run `genesis init` to install this at ~/.genesis/config.toml
-# Or run `genesis add-account` from the REPL to add Codex accounts interactively.
+# Or run `genesis add-account` / `add-claude-account` from the REPL to add
+# Codex or Claude accounts interactively.
 #
 # No API keys required.
 # Claude Code and Codex both authenticate via OAuth using your Pro accounts.
@@ -16,9 +17,27 @@ provider = "codex-cli"
 model = "auto"              # uses your account's default (currently gpt-5.4)
 
 [claude_cli]
-# Requires: Claude Code installed + logged in via `claude login`
+# Requires: Claude Code installed + logged in via `claude auth login`
 command = "claude"          # auto-detected from PATH
 timeout = 300               # seconds per call
+
+# ── Multiple Claude accounts ───────────────────────────────────────────────
+# Add one [[claude_cli.accounts]] block per Claude account.
+# Each account uses its own CLAUDE_CONFIG_DIR directory with a separate login
+# session, so extra logins never disturb your default ~/.claude account.
+# Accounts are automatically registered as workers named by their "name" field.
+# Run `genesis add-claude-account` from the REPL to add accounts interactively.
+# (Omit the accounts entirely to keep using your single default ~/.claude login.)
+#
+# [[claude_cli.accounts]]
+# name       = "claude-main"     # used as the worker key in Genesis
+# config_dir = ""                # empty = default ~/.claude (your current login)
+# model      = "auto"            # "auto" = use the [orchestrator]/[worker] model
+#
+# [[claude_cli.accounts]]
+# name       = "claude-pro2"
+# config_dir = "C:/Users/amrit/.claude-pro2"   # CLAUDE_CONFIG_DIR for this account
+# model      = "auto"
 
 [codex_cli]
 # Requires: Codex CLI installed + logged in via `codex login`

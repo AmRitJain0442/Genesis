@@ -9,7 +9,7 @@ from rich.console import Group
 from rich.markdown import Markdown
 
 from genesis import __version__
-from genesis.config import get_config, CONFIG_FILE, CodexAccount
+from genesis.config import get_config, CONFIG_FILE, CodexAccount, ClaudeAccount
 from genesis.memory import MemoryManager
 from genesis.git_ops import GitManager
 from genesis.palace import PalaceStore, resolve_state_db
@@ -67,6 +67,10 @@ _HELP_SECTIONS = [
             ("remove-account <name>", "Remove one Codex account from Genesis"),
             ("remove-all-accounts", "Remove every Codex account from Genesis"),
             ("remove-all-accounts --delete-home", "Also delete non-default CODEX_HOME folders"),
+            ("add-claude-account", "Add a Claude account interactively"),
+            ("remove-claude-account <name>", "Remove one Claude account from Genesis"),
+            ("remove-all-claude-accounts", "Remove every Claude account from Genesis"),
+            ("remove-all-claude-accounts --delete-config-dir", "Also delete non-default CLAUDE_CONFIG_DIR folders"),
         ],
     ),
     (
@@ -101,8 +105,7 @@ def _help_renderable() -> Group:
 _ACCOUNT_NAME_RE = re.compile(
     r"""^\s*name\s*=\s*(?P<quote>["'])(?P<name>.*?)(?P=quote)\s*(?:#.*)?$"""
 )
-_CODEX_EMPTY_ACCOUNTS_RE = re.compile(r"^\s*accounts\s*=\s*\[\s*\]\s*(?:#.*)?$")
-_CODEX_CLI_SECTION_RE = re.compile(r"^\s*\[codex_cli\]\s*(?:#.*)?$")
+_EMPTY_ACCOUNTS_RE = re.compile(r"^\s*accounts\s*=\s*\[\s*\]\s*(?:#.*)?$")
 
 
 def _is_active_toml_header(line: str) -> bool:
@@ -110,21 +113,21 @@ def _is_active_toml_header(line: str) -> bool:
     return stripped.startswith("[") and not stripped.startswith("#")
 
 
-def _is_codex_account_header(line: str) -> bool:
+def _is_account_header(line: str, section: str) -> bool:
     stripped = line.strip()
-    return stripped.startswith("[[codex_cli.accounts]]") and not stripped.startswith("#")
+    return stripped.startswith(f"[[{section}.accounts]]") and not stripped.startswith("#")
 
 
-def _is_commented_codex_account_header(line: str) -> bool:
+def _is_commented_account_header(line: str, section: str) -> bool:
     stripped = line.strip()
-    return stripped.startswith("# [[codex_cli.accounts]]") or stripped.startswith("#[[codex_cli.accounts]]")
+    return stripped.startswith(f"# [[{section}.accounts]]") or stripped.startswith(f"#[[{section}.accounts]]")
 
 
-def _is_codex_cli_section(line: str) -> bool:
-    return bool(_CODEX_CLI_SECTION_RE.match(line))
+def _is_cli_section(line: str, section: str) -> bool:
+    return bool(re.match(rf"^\s*\[{re.escape(section)}\]\s*(?:#.*)?$", line))
 
 
-def _extract_codex_account_name(block: list[str]) -> str | None:
+def _extract_account_name(block: list[str]) -> str | None:
     for line in block:
         match = _ACCOUNT_NAME_RE.match(line)
         if match:
@@ -132,13 +135,13 @@ def _extract_codex_account_name(block: list[str]) -> str | None:
     return None
 
 
-def _remove_empty_codex_account_markers(lines: list[str]) -> list[str]:
+def _remove_empty_account_markers(lines: list[str], section: str) -> list[str]:
     cleaned: list[str] = []
-    in_codex_cli = False
+    in_section = False
     for line in lines:
         if _is_active_toml_header(line):
-            in_codex_cli = _is_codex_cli_section(line)
-        if in_codex_cli and _CODEX_EMPTY_ACCOUNTS_RE.match(line):
+            in_section = _is_cli_section(line, section)
+        if in_section and _EMPTY_ACCOUNTS_RE.match(line):
             continue
         cleaned.append(line)
     return cleaned
@@ -151,13 +154,13 @@ def _line_ending(lines: list[str]) -> str:
     return "\n"
 
 
-def _ensure_empty_codex_accounts_marker(lines: list[str]) -> list[str]:
-    lines = _remove_empty_codex_account_markers(lines)
+def _ensure_empty_accounts_marker(lines: list[str], section: str, label: str) -> list[str]:
+    lines = _remove_empty_account_markers(lines, section)
     ending = _line_ending(lines)
-    marker = f"accounts = []                # no Codex accounts registered in Genesis{ending}"
+    marker = f"accounts = []                # no {label} accounts registered in Genesis{ending}"
 
     for index, line in enumerate(lines):
-        if _is_codex_cli_section(line):
+        if _is_cli_section(line, section):
             lines.insert(index + 1, marker)
             return lines
 
@@ -165,17 +168,19 @@ def _ensure_empty_codex_accounts_marker(lines: list[str]) -> list[str]:
         lines[-1] = f"{lines[-1]}{ending}"
     if lines and lines[-1].strip():
         lines.append(ending)
-    lines.extend((f"[codex_cli]{ending}", marker))
+    lines.extend((f"[{section}]{ending}", marker))
     return lines
 
 
-def _rewrite_codex_accounts_text(
+def _rewrite_accounts_text(
     config_text: str,
+    section: str,
+    label: str,
     *,
     remove_names: set[str] | None = None,
     remove_all: bool = False,
 ) -> tuple[str, list[str], list[str], list[str]]:
-    """Remove active [[codex_cli.accounts]] blocks while preserving other TOML text."""
+    """Remove active [[<section>.accounts]] blocks while preserving other TOML text."""
     names = remove_names or set()
     lines = config_text.splitlines(keepends=True)
     rewritten: list[str] = []
@@ -185,7 +190,7 @@ def _rewrite_codex_accounts_text(
 
     index = 0
     while index < len(lines):
-        if not _is_codex_account_header(lines[index]):
+        if not _is_account_header(lines[index], section):
             rewritten.append(lines[index])
             index += 1
             continue
@@ -195,12 +200,12 @@ def _rewrite_codex_accounts_text(
         while (
             index < len(lines)
             and not _is_active_toml_header(lines[index])
-            and not _is_commented_codex_account_header(lines[index])
+            and not _is_commented_account_header(lines[index], section)
         ):
             index += 1
 
         block = lines[block_start:index]
-        account_name = _extract_codex_account_name(block)
+        account_name = _extract_account_name(block)
         if account_name:
             seen.append(account_name)
 
@@ -213,11 +218,35 @@ def _rewrite_codex_accounts_text(
             remaining.append(account_name)
         rewritten.extend(block)
 
-    rewritten = _remove_empty_codex_account_markers(rewritten)
+    rewritten = _remove_empty_account_markers(rewritten, section)
     if not remaining:
-        rewritten = _ensure_empty_codex_accounts_marker(rewritten)
+        rewritten = _ensure_empty_accounts_marker(rewritten, section, label)
 
     return "".join(rewritten), removed, seen, remaining
+
+
+def _rewrite_codex_accounts_text(
+    config_text: str,
+    *,
+    remove_names: set[str] | None = None,
+    remove_all: bool = False,
+) -> tuple[str, list[str], list[str], list[str]]:
+    return _rewrite_accounts_text(
+        config_text, "codex_cli", "Codex",
+        remove_names=remove_names, remove_all=remove_all,
+    )
+
+
+def _rewrite_claude_accounts_text(
+    config_text: str,
+    *,
+    remove_names: set[str] | None = None,
+    remove_all: bool = False,
+) -> tuple[str, list[str], list[str], list[str]]:
+    return _rewrite_accounts_text(
+        config_text, "claude_cli", "Claude",
+        remove_names=remove_names, remove_all=remove_all,
+    )
 
 
 class GenesisREPL:
@@ -244,28 +273,37 @@ class GenesisREPL:
         cfg = self.config
         cmd = find_claude_binary() or cfg.claude_cli.command
 
-        # Claude Code CLI agents (no API key needed — uses `claude login` session)
+        # Claude Code CLI agents (no API key needed — uses `claude auth login`
+        # session). Each account gets its own CLAUDE_CONFIG_DIR so multiple
+        # logins stay isolated from the default ~/.claude session.
         if find_claude_binary():
-            self._agents["claude-cli-orchestrator"] = ClaudeCodeCLIAgent(
-                AgentInfo(
-                    "claude-cli-orchestrator",
-                    "claude-cli",
-                    cfg.orchestrator.model if self._orch_provider == "claude-cli" else "claude-sonnet-4-6",
-                    max_tokens=8096,
-                ),
-                command=cmd,
-                timeout=cfg.claude_cli.timeout,
-            )
-            self._agents["claude-cli-worker"] = ClaudeCodeCLIAgent(
-                AgentInfo(
-                    "claude-cli-worker",
-                    "claude-cli",
-                    cfg.worker.model if self._worker_provider == "claude-cli" else "claude-sonnet-4-6",
-                    max_tokens=8096,
-                ),
-                command=cmd,
-                timeout=cfg.claude_cli.timeout,
-            )
+            claude_accounts = cfg.claude_cli.accounts
+            if not claude_accounts and not cfg.claude_cli.accounts_explicit:
+                claude_accounts = [ClaudeAccount(name="claude-main", config_dir="", model="")]
+            for i, account in enumerate(claude_accounts):
+                real_model = account.model if account.model not in ("", "auto", "default") else ""
+                orch_model = real_model or (
+                    cfg.orchestrator.model if self._orch_provider == "claude-cli" else "claude-sonnet-4-6"
+                )
+                worker_model = real_model or (
+                    cfg.worker.model if self._worker_provider == "claude-cli" else "claude-sonnet-4-6"
+                )
+                # Orchestrator slot: first account only
+                if i == 0:
+                    self._agents["claude-cli-orchestrator"] = ClaudeCodeCLIAgent(
+                        AgentInfo("claude-cli-orchestrator", "claude-cli", orch_model, max_tokens=8096),
+                        command=cmd,
+                        timeout=cfg.claude_cli.timeout,
+                        config_dir=account.config_dir,
+                    )
+                # Every account registers as a worker
+                worker_key = account.name if account.name else f"claude-worker-{i+1}"
+                self._agents[worker_key] = ClaudeCodeCLIAgent(
+                    AgentInfo(worker_key, "claude-cli", worker_model, max_tokens=8096),
+                    command=cmd,
+                    timeout=cfg.claude_cli.timeout,
+                    config_dir=account.config_dir,
+                )
 
         # Codex CLI agents (no API key — uses `codex login` / ChatGPT Pro OAuth)
         codex_cmd = find_codex_binary()
@@ -1007,7 +1045,7 @@ class GenesisREPL:
         try:
             existing_text = CONFIG_FILE.read_text(encoding="utf-8") if CONFIG_FILE.exists() else ""
             existing_lines = existing_text.splitlines(keepends=True)
-            cleaned_text = "".join(_remove_empty_codex_account_markers(existing_lines))
+            cleaned_text = "".join(_remove_empty_account_markers(existing_lines, "codex_cli"))
             if cleaned_text and not cleaned_text.endswith(("\n", "\r")):
                 cleaned_text += "\n"
             CONFIG_FILE.write_text(f"{cleaned_text}{entry}", encoding="utf-8")
@@ -1173,6 +1211,254 @@ class GenesisREPL:
             console.print("[green]Disabled Genesis Codex account fallback.[/green]")
         self.cmd_status()
 
+    # ── Claude accounts ────────────────────────────────────────────────────
+
+    def _claude_account_map(self) -> dict[str, ClaudeAccount]:
+        return {account.name: account for account in self.config.claude_cli.accounts}
+
+    def _claude_login_ok(self, claude_cmd: str, env: dict, config_dir: str) -> bool:
+        """Confirm the isolated Claude login completed.
+
+        Primary signal is `claude auth status`; fall back to a credentials file
+        appearing in the config dir for CLI versions without that subcommand."""
+        import subprocess as _sp
+
+        status_cmd = [claude_cmd, "auth", "status"]
+        if os.name == "nt" and claude_cmd.lower().endswith((".cmd", ".bat")):
+            status_cmd = ["cmd", "/c"] + status_cmd
+        try:
+            check = _sp.run(status_cmd, env=env, capture_output=True, text=True)
+            if check.returncode == 0:
+                return True
+        except Exception:
+            pass
+
+        cfg_path = Path(config_dir)
+        return (cfg_path / ".credentials.json").exists() or any(cfg_path.glob("*credentials*"))
+
+    def _delete_claude_config_dirs(self, accounts: list[ClaudeAccount]) -> None:
+        import shutil
+
+        home_root = Path.home().resolve()
+        default_claude = (Path.home() / ".claude").resolve()
+        for account in accounts:
+            if not account.config_dir:
+                console.print(
+                    f"[yellow]Skipped deleting the default Claude config for '{account.name}'. "
+                    "Run `claude auth logout` if you want to clear that global login.[/yellow]"
+                )
+                continue
+
+            path = Path(account.config_dir).expanduser()
+            try:
+                resolved = path.resolve()
+            except OSError as e:
+                console.print(f"[yellow]Skipped {path}: {e}[/yellow]")
+                continue
+
+            if not resolved.exists():
+                console.print(f"[dim]CLAUDE_CONFIG_DIR already absent: {resolved}[/dim]")
+                continue
+            if resolved in (home_root, default_claude):
+                console.print(f"[yellow]Skipped deleting protected directory: {resolved}[/yellow]")
+                continue
+
+            shutil.rmtree(resolved)
+            console.print(f"[green]Deleted CLAUDE_CONFIG_DIR:[/green] {resolved}")
+
+    def cmd_add_claude_account(self, args: list[str]) -> None:
+        """
+        Interactively add a new Claude account to ~/.genesis/config.toml.
+
+        Usage: add-claude-account
+        """
+        import subprocess as _sp
+
+        console.print("\n[bold]Add a Claude Account[/bold]")
+        console.print("Each account needs its own CLAUDE_CONFIG_DIR directory.\n")
+
+        console.print("[cyan]Account name[/cyan] (e.g. claude-pro2): ", end="")
+        name = input().strip()
+        if not name:
+            console.print("[red]Name cannot be empty.[/red]")
+            return
+        if "claude" not in name.lower():
+            console.print(
+                "[yellow]Tip: start the name with 'claude-' so Genesis treats it as a Claude worker.[/yellow]"
+            )
+
+        default_dir = str(Path.home() / f".claude-{name}")
+        console.print(f"[cyan]CLAUDE_CONFIG_DIR directory[/cyan] (default: {default_dir}): ", end="")
+        config_dir = input().strip() or default_dir
+
+        dir_path = Path(config_dir)
+        if not dir_path.exists():
+            dir_path.mkdir(parents=True, exist_ok=True)
+            console.print(f"[green]Created directory:[/green] {config_dir}")
+
+        console.print(f"\n[dim]Now logging in to Claude with CLAUDE_CONFIG_DIR={config_dir}[/dim]")
+        console.print(
+            "[dim]A browser window will open — log in with your other Claude account. "
+            "Your default ~/.claude login is not affected.[/dim]\n"
+        )
+
+        claude_cmd = find_claude_binary() or "claude"
+        env = os.environ.copy()
+        env["CLAUDE_CONFIG_DIR"] = str(Path(config_dir))
+
+        login_cmd = [claude_cmd, "auth", "login"]
+        if os.name == "nt" and claude_cmd.lower().endswith((".cmd", ".bat")):
+            login_cmd = ["cmd", "/c"] + login_cmd
+
+        try:
+            _sp.run(login_cmd, env=env, check=False)
+        except Exception as e:
+            console.print(f"[red]Login failed: {e}[/red]")
+            return
+
+        if not self._claude_login_ok(claude_cmd, env, config_dir):
+            console.print("[red]Login did not complete. Account not added.[/red]")
+            return
+
+        # Append to config.toml — always use forward slashes (TOML requires it)
+        config_toml = str(Path(config_dir)).replace("\\", "/")
+        entry = (
+            f"\n[[claude_cli.accounts]]\n"
+            f'name = "{name}"\n'
+            f'config_dir = "{config_toml}"\n'
+            f'model = "auto"\n'
+        )
+
+        try:
+            existing_text = CONFIG_FILE.read_text(encoding="utf-8") if CONFIG_FILE.exists() else ""
+            existing_lines = existing_text.splitlines(keepends=True)
+            cleaned_text = "".join(_remove_empty_account_markers(existing_lines, "claude_cli"))
+            if cleaned_text and not cleaned_text.endswith(("\n", "\r")):
+                cleaned_text += "\n"
+            CONFIG_FILE.write_text(f"{cleaned_text}{entry}", encoding="utf-8")
+            console.print(f"\n[green]✓ Claude account '{name}' added to config.[/green]")
+            console.print("[dim]Rebuilding agents…[/dim]")
+            self._reload_config_and_agents()
+            self.cmd_status()
+        except Exception as e:
+            console.print(f"[red]Failed to update config: {e}[/red]")
+            console.print(f"Add this manually to {CONFIG_FILE}:\n{entry}")
+
+    def cmd_remove_claude_account(self, args: list[str]) -> None:
+        """
+        Remove one Claude account registration from ~/.genesis/config.toml.
+
+        Usage: remove-claude-account <name> [--delete-config-dir]
+        """
+        flags = {arg for arg in args if arg.startswith("-")}
+        names = [arg for arg in args if not arg.startswith("-")]
+
+        if "--help" in flags or "-h" in flags:
+            console.print("Usage: remove-claude-account <name> [--delete-config-dir]")
+            return
+
+        if not CONFIG_FILE.exists():
+            console.print(f"[red]Config file not found:[/red] {CONFIG_FILE}")
+            return
+
+        accounts = self._claude_account_map()
+        if not names:
+            if not accounts:
+                console.print("[dim]No Claude accounts are registered in Genesis.[/dim]")
+                return
+            tbl = command_table("Claude Accounts", border_style="cyan")
+            tbl.add_column("Name")
+            tbl.add_column("CLAUDE_CONFIG_DIR")
+            for account in accounts.values():
+                tbl.add_row(markup(account.name), account.config_dir or "[dim]default ~/.claude[/dim]")
+            console.print(tbl)
+            console.print("[cyan]Account name to remove[/cyan]: ", end="")
+            account_name = input().strip()
+        else:
+            account_name = names[0]
+
+        if not account_name:
+            console.print("[red]Name cannot be empty.[/red]")
+            return
+
+        if account_name.lower() == "all":
+            self.cmd_remove_all_claude_accounts(list(flags))
+            return
+
+        try:
+            original_text = CONFIG_FILE.read_text(encoding="utf-8")
+            updated_text, removed, seen, remaining = _rewrite_claude_accounts_text(
+                original_text,
+                remove_names={account_name},
+            )
+        except Exception as e:
+            console.print(f"[red]Failed to read config: {e}[/red]")
+            return
+
+        if not removed:
+            available = ", ".join(seen) if seen else "none"
+            console.print(f"[yellow]No Genesis Claude account named '{account_name}'. Available: {available}[/yellow]")
+            return
+
+        try:
+            CONFIG_FILE.write_text(updated_text, encoding="utf-8")
+        except Exception as e:
+            console.print(f"[red]Failed to update config: {e}[/red]")
+            return
+
+        removed_accounts = [accounts[name] for name in removed if name in accounts]
+        if "--delete-config-dir" in flags and removed_accounts:
+            self._delete_claude_config_dirs(removed_accounts)
+
+        self._reload_config_and_agents()
+        console.print(f"[green]Removed Claude account from Genesis:[/green] {', '.join(removed)}")
+        if not remaining:
+            console.print("[dim]No Claude accounts remain registered in Genesis.[/dim]")
+        self.cmd_status()
+
+    def cmd_remove_all_claude_accounts(self, args: list[str]) -> None:
+        """
+        Remove every Claude account registration from ~/.genesis/config.toml.
+
+        Usage: remove-all-claude-accounts [--yes] [--delete-config-dir]
+        """
+        flags = {arg for arg in args if arg.startswith("-")}
+        if "--help" in flags or "-h" in flags:
+            console.print("Usage: remove-all-claude-accounts [--yes] [--delete-config-dir]")
+            return
+
+        if not CONFIG_FILE.exists():
+            console.print(f"[red]Config file not found:[/red] {CONFIG_FILE}")
+            return
+
+        accounts = list(self.config.claude_cli.accounts)
+        if "--yes" not in flags:
+            console.print("[yellow]Remove all Claude accounts from Genesis config? (y/N): [/yellow]", end="")
+            if input().strip().lower() != "y":
+                console.print("[dim]No accounts removed.[/dim]")
+                return
+
+        try:
+            original_text = CONFIG_FILE.read_text(encoding="utf-8")
+            updated_text, removed, _seen, _remaining = _rewrite_claude_accounts_text(
+                original_text,
+                remove_all=True,
+            )
+            CONFIG_FILE.write_text(updated_text, encoding="utf-8")
+        except Exception as e:
+            console.print(f"[red]Failed to update config: {e}[/red]")
+            return
+
+        if "--delete-config-dir" in flags and accounts:
+            self._delete_claude_config_dirs(accounts)
+
+        self._reload_config_and_agents()
+        if removed:
+            console.print(f"[green]Removed Claude accounts from Genesis:[/green] {', '.join(removed)}")
+        else:
+            console.print("[green]Disabled Genesis Claude account fallback.[/green]")
+        self.cmd_status()
+
     def cmd_switch(self, args: list[str]) -> None:
         if len(args) < 2:
             console.print("Usage: switch [orchestrator|worker] [claude-cli|chatgpt]")
@@ -1296,6 +1582,18 @@ class GenesisREPL:
                 "remove_all",
             ):
                 self.cmd_remove_all_accounts(rest.split())
+            elif cmd in ("add-claude-account", "add_claude_account", "addclaudeaccount"):
+                self.cmd_add_claude_account([])
+            elif cmd in ("remove-claude-account", "remove_claude_account", "removeclaudeaccount"):
+                self.cmd_remove_claude_account(rest.split())
+            elif cmd in (
+                "remove-all-claude-accounts",
+                "remove_all_claude_accounts",
+                "removeallclaudeaccounts",
+                "remove-claude-accounts",
+                "remove_claude_accounts",
+            ):
+                self.cmd_remove_all_claude_accounts(rest.split())
             elif cmd == "switch":
                 sub, sub_rest = _split_sub(rest)
                 self.cmd_switch([sub] + ([sub_rest] if sub_rest else []))
