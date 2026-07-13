@@ -190,7 +190,14 @@ class Orchestrator:
 
     # ── Public API ─────────────────────────────────────────────────────────
 
-    def plan(self, task: str) -> Plan:
+    def plan(self, task: str, on_status=None) -> Plan:
+        def status(msg: str) -> None:
+            if on_status:
+                try:
+                    on_status(msg)
+                except Exception:
+                    pass
+
         mem = self.memory.get_summary(self.config.memory.max_context_chars)
         palace_mem = ""
         if self.palace and self.config.memory.palace_enabled:
@@ -204,7 +211,7 @@ class Orchestrator:
                 logger.warning("Palace wakeup failed: %s", e)
         # Phase 2: let the two brains debate first; fold their agreed discussion
         # into the planning context so self.agent synthesizes the shared plan.
-        discussion = self._run_brain_debate(task, context=mem)
+        discussion = self._run_brain_debate(task, context=mem, on_status=on_status)
 
         base_msg = (
             f"CURRENT MEMORY CONTEXT:\n{mem}\n\n---\n\n"
@@ -215,8 +222,11 @@ class Orchestrator:
             f"start your response with {{ and end with }}. No preamble, no explanation."
         )
 
+        status("Synthesizing the plan...")
         last_err: Exception | None = None
         for attempt in range(2):
+            if attempt:
+                status("Re-parsing the plan...")
             msg = base_msg if attempt == 0 else (
                 base_msg + "\n\nIMPORTANT: your previous response could not be parsed. "
                 "Output ONLY the raw JSON object. No prose, no markdown fences, no code blocks. "
@@ -248,7 +258,7 @@ class Orchestrator:
 
         raise ValueError(f"Could not parse plan after 2 attempts: {last_err}")
 
-    def _run_brain_debate(self, task: str, context: str = "") -> str:
+    def _run_brain_debate(self, task: str, context: str = "", on_status=None) -> str:
         """Run the two-brain debate (if a co-brain is available and enabled) and
         return an agreed-discussion block to fold into the plan prompt. Returns
         an empty string when collaboration is unavailable or fails, so planning
@@ -263,10 +273,17 @@ class Orchestrator:
             collab = BrainCollaboration(
                 self.agent, self.co_brain, chatroom=self.chatroom, max_rounds=max_rounds
             )
-            result = collab.discuss(task, context=context)
+            result = collab.discuss(task, context=context, on_status=on_status)
         except Exception as e:
             logger.warning("Brain debate failed, falling back to single-brain plan: %s", e)
             return ""
+
+        if on_status:
+            try:
+                on_status("Brains reached consensus" if result.converged
+                          else "Round cap reached — arbitrating the plan")
+            except Exception:
+                pass
 
         if not result.transcript:
             return ""
@@ -364,7 +381,7 @@ class Orchestrator:
                 fn(*args, **kwargs)
 
         fire("on_status", "Planning task...")
-        plan = self.plan(task)
+        plan = self.plan(task, on_status=lambda m: fire("on_status", m))
         if not plan.steps:
             raise ValueError("Orchestrator returned an empty plan - no steps to execute.")
         fire("on_plan", plan)

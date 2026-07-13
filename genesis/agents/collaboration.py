@@ -65,7 +65,14 @@ class BrainCollaboration:
         self.chatroom = chatroom
         self.max_rounds = max(1, max_rounds)
 
-    def discuss(self, task: str, context: str = "") -> DiscussionResult:
+    def discuss(self, task: str, context: str = "", on_status=None) -> DiscussionResult:
+        def status(msg: str) -> None:
+            if on_status:
+                try:
+                    on_status(msg)
+                except Exception:
+                    pass
+
         room_id = ""
         if self.chatroom is not None:
             room = self.chatroom.create_room(
@@ -80,13 +87,17 @@ class BrainCollaboration:
         converged = False
         rounds = 0
 
+        status("Brains debating the approach...")
         for rounds in range(1, self.max_rounds + 1):
             for brain in self.brains:
                 name = _name(brain)
+                status(f"{name} is thinking... (debate round {rounds}/{self.max_rounds})")
                 reply = self._speak(brain, task, context, turns)
                 turns.append((name, reply))
                 agreed[name] = parse_agreement(reply)
                 self._post(room_id, name, reply)
+                status(f"{name} {'agrees' if agreed[name] else 'wants changes'} "
+                       f"(debate round {rounds})")
 
                 # Converged the moment both brains' most recent messages agree.
                 if all(agreed.values()):
