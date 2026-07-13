@@ -301,7 +301,7 @@ class GenesisREPL:
                     cfg.orchestrator.model if self._orch_provider == "claude-cli" else "claude-sonnet-4-6"
                 )
                 worker_model = real_model or (
-                    cfg.worker.model if self._worker_provider == "claude-cli" else "claude-sonnet-4-6"
+                    cfg.worker.model if self._worker_provider == "claude-cli" else "claude-sonnet-5"
                 )
                 # Orchestrator slot: first account only
                 if i == 0:
@@ -456,7 +456,7 @@ class GenesisREPL:
         orch = self._get_orchestrator()
         brain = getattr(orch, "name", "brain") or "brain"
         room = self.chatroom.create_room(
-            RoomKind.system, task[:60] or "run", participants=list(self._agents.keys())
+            RoomKind.system, task[:60] or "run", participants=self._unique_agent_names()
         )
 
         def say(sender: str, role: str, content: str, kind: str = "message") -> None:
@@ -802,6 +802,26 @@ class GenesisREPL:
             return "[yellow]limited[/yellow]"
         return status_label("idle")
 
+    def _agent_groups(self) -> list[tuple[str, list[tuple[str, BaseAgent]]]]:
+        """Group agent slots by underlying login identity so each unique account
+        appears once. Returns ordered (display_name, [(slot_name, agent), ...]).
+        The display name prefers the account's real name over the synthetic
+        "*-orchestrator" slot. Shared by the roster and the chatroom so their
+        participant lists never disagree."""
+        groups: dict[str, list[tuple[str, BaseAgent]]] = {}
+        for name, agent in self._agents.items():
+            groups.setdefault(self._agent_identity(agent), []).append((name, agent))
+        out: list[tuple[str, list[tuple[str, BaseAgent]]]] = []
+        for members in groups.values():
+            names = [n for n, _ in members]
+            display = next((n for n in names if "orchestrator" not in n), names[0])
+            out.append((display, members))
+        return out
+
+    def _unique_agent_names(self) -> list[str]:
+        """One display name per unique account (see _agent_groups)."""
+        return [display for display, _ in self._agent_groups()]
+
     def cmd_status(self) -> None:
         agent_tbl = command_table("Agent Roster", border_style="magenta")
         agent_tbl.add_column("Role", width=16, overflow="fold")
@@ -817,16 +837,10 @@ class GenesisREPL:
         # Collapse agent slots that share the same underlying login into one row
         # so each unique account is shown exactly once (an account serving as a
         # brain is also registered as a worker — that is one account, one row).
-        groups: dict[str, list[tuple[str, BaseAgent]]] = {}
-        for name, agent in self._agents.items():
-            groups.setdefault(self._agent_identity(agent), []).append((name, agent))
-
         role_rank = {"brain": 0, "reviewer": 1, "worker": 2}
-        for members in groups.values():
+        for display_name, members in self._agent_groups():
             names = [n for n, _ in members]
             agent = members[0][1]
-            # Prefer the account's real name over the synthetic "*-orchestrator" slot.
-            display_name = next((n for n in names if "orchestrator" not in n), names[0])
             roles: list[str] = []
             for n, a in members:
                 r = self._agent_role_label(n, a, primary, reviewer)
