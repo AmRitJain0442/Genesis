@@ -56,6 +56,7 @@ class WorkerDialogue:
         evaluate: Callable[["Step", "WorkerResult", int], tuple[bool, str]],
         make_revision: Callable[["Step", str], "Step"],
         post: Callable[..., None],
+        on_status: Callable[[str], None] | None = None,
     ) -> None:
         self.step = step
         self.worker_name = worker_name
@@ -65,28 +66,42 @@ class WorkerDialogue:
         self.evaluate = evaluate
         self.make_revision = make_revision
         self.post = post
+        self.on_status = on_status
+
+    def _status(self, msg: str) -> None:
+        if self.on_status:
+            try:
+                self.on_status(msg)
+            except Exception:
+                pass
 
     def run(self) -> DialogueOutcome:
         current = self.step
         result = None
         approved = False
         turns = 0
+        sid = self.step.step_id
+        cap = self.max_turns
 
         for turn in range(1, self.max_turns + 1):
             turns = turn
+            self._status(f"{self.worker_name} implementing {sid} (turn {turn}/{cap})...")
             result = self.run_worker(current)
             self.post(self.worker_name, "worker", _summary(result, turn), "code")
 
             if not getattr(result, "success", False):
+                self._status(f"{self.worker_name} failed on {sid} - handing to review")
                 self.post(self.brain_name, "brain",
                           f"Worker failed: {getattr(result, 'error', '') or 'unknown error'}", "status")
                 break
 
             if turn >= self.max_turns:
+                self._status(f"Turn budget reached on {sid} - handing to independent review")
                 self.post(self.brain_name, "brain",
                           "Turn budget reached — handing to independent review.", "decision")
                 break
 
+            self._status(f"{self.brain_name} reviewing {sid} (turn {turn}/{cap})...")
             try:
                 approve, feedback = self.evaluate(self.step, result, turn)
             except Exception as e:
@@ -94,11 +109,13 @@ class WorkerDialogue:
                 approve, feedback = True, ""   # fail open — don't loop on evaluator errors
 
             if approve:
+                self._status(f"{self.brain_name} approved {sid} - handing to independent review")
                 self.post(self.brain_name, "brain",
                           "Looks complete — handing to independent review.", "decision")
                 approved = True
                 break
 
+            self._status(f"{self.brain_name} requested changes on {sid} (turn {turn})")
             self.post(self.brain_name, "brain", f"Revise: {feedback}", "message")
             current = self.make_revision(self.step, feedback)
 

@@ -281,7 +281,7 @@ class Orchestrator:
         if on_status:
             try:
                 on_status("Brains reached consensus" if result.converged
-                          else "Round cap reached — arbitrating the plan")
+                          else "Round cap reached - arbitrating the plan")
             except Exception:
                 pass
 
@@ -1208,6 +1208,7 @@ class Orchestrator:
             make_revision=self._revision_step,
             post=lambda sender, role, content, kind="message": self._post_step(
                 step_room, sender, role, content, kind),
+            on_status=output_callback,
         )
         outcome = dialogue.run()
         if output_callback:
