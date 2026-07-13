@@ -95,6 +95,41 @@ class CodexCLIAgent(BaseAgent):
 
     # ── Internals ──────────────────────────────────────────────────────────
 
+    def for_work_dir(self, work_dir: str) -> "CodexCLIAgent":
+        """A copy of this agent bound to a different working directory (its own
+        login, model and reasoning preserved). Each step runs in its own git
+        worktree, so the worker must point Codex at that worktree — not the
+        agent's original main-repo work_dir — via a fresh, thread-safe instance."""
+        return CodexCLIAgent(
+            self.info,
+            command=self.command,
+            timeout=self.timeout,
+            work_dir=work_dir,
+            codex_home=self.codex_home,
+            reasoning=self.reasoning,
+        )
+
+    @staticmethod
+    def _sandbox_flags(allow_writes: bool) -> list[str]:
+        """Sandbox + approval flags for `codex exec`.
+
+        On Windows, Codex has no enforceable OS sandbox, so `--full-auto` and
+        `--sandbox workspace-write` both silently collapse to read-only: the
+        worker can neither write files nor run multi-command shells (they come
+        back as "blocked by policy" / "workspace is configured read-only"). That
+        is why a write step produced 0 files every turn. Genesis already isolates
+        each step in a throwaway git worktree, gated by independent review and
+        the execution policy, so for write-enabled runs on Windows we grant Codex
+        full access there. Other platforms keep the real workspace-write sandbox.
+        """
+        if allow_writes:
+            if os.name == "nt":
+                return ["--dangerously-bypass-approvals-and-sandbox"]
+            return ["--full-auto", "--sandbox", "workspace-write"]
+        # Read-only (planning / review): never writes; --full-auto just keeps
+        # approvals non-interactive.
+        return ["--full-auto", "--sandbox", "read-only"]
+
     def _build_prompt(self, system: str, messages: list[dict]) -> str:
         parts = [system]
         for msg in messages:
@@ -121,7 +156,6 @@ class CodexCLIAgent(BaseAgent):
 
         cmd = [
             self.command, "exec",
-            "--full-auto",
             "-C", self.work_dir,
             "-o", output_file,
             "-",  # read prompt from stdin
@@ -143,10 +177,7 @@ class CodexCLIAgent(BaseAgent):
         if self.reasoning:
             cmd += ["-c", f"model_reasoning_effort={self.reasoning}"]
 
-        if allow_writes:
-            cmd += ["--sandbox", "workspace-write"]
-        else:
-            cmd += ["--sandbox", "read-only"]
+        cmd += self._sandbox_flags(allow_writes)
 
         # On Windows, .cmd/.bat scripts must be invoked via cmd.exe
         if os.name == "nt" and cmd[0].lower().endswith((".cmd", ".bat")):
@@ -200,7 +231,6 @@ class CodexCLIAgent(BaseAgent):
 
         cmd = [
             self.command, "exec",
-            "--full-auto",
             "--json",
             "-C", self.work_dir,
             "-",
@@ -219,10 +249,7 @@ class CodexCLIAgent(BaseAgent):
         if self.reasoning:
             cmd += ["-c", f"model_reasoning_effort={self.reasoning}"]
 
-        if allow_writes:
-            cmd += ["--sandbox", "workspace-write"]
-        else:
-            cmd += ["--sandbox", "read-only"]
+        cmd += self._sandbox_flags(allow_writes)
 
         if os.name == "nt" and cmd[0].lower().endswith((".cmd", ".bat")):
             cmd = ["cmd", "/c"] + cmd

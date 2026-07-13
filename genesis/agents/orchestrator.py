@@ -39,7 +39,10 @@ def _make_worker(agent: BaseAgent, memory_summary: str, work_dir: str,
         from genesis.agents.codex_cli import CodexCLIAgent
         from genesis.agents.codex_worker import CodexWorker
         if isinstance(agent, CodexCLIAgent):
-            return CodexWorker(agent, memory_summary, work_dir,
+            # Bind Codex to THIS step's worktree so it writes there (and the diff
+            # is captured), not in the agent's original main-repo work_dir.
+            bound = agent.for_work_dir(work_dir)
+            return CodexWorker(bound, memory_summary, work_dir,
                                output_callback=output_callback)
     except ImportError:
         pass
