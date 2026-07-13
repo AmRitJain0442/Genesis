@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import json
 import logging
 import re
 from pathlib import Path
@@ -756,10 +757,53 @@ class GenesisREPL:
             return "[yellow]limited[/yellow]"
         return status_label("idle")
 
+    _LOGIN_ID_CACHE: dict[str, str | None] = {}
+
+    @classmethod
+    def _codex_login_id(cls, home: str) -> str | None:
+        """The ChatGPT account_id backing a Codex home, read from its auth.json.
+        Two homes logged into the same account share an id, so they collapse to
+        one roster entry. Cached; returns None if unreadable."""
+        if home not in cls._LOGIN_ID_CACHE:
+            val = None
+            try:
+                with open(os.path.join(home, "auth.json"), encoding="utf-8") as f:
+                    data = json.load(f)
+                tokens = data.get("tokens")
+                if isinstance(tokens, dict):
+                    val = tokens.get("account_id")
+            except Exception:
+                val = None
+            cls._LOGIN_ID_CACHE[home] = val
+        return cls._LOGIN_ID_CACHE[home]
+
+    @classmethod
+    def _agent_identity(cls, agent) -> str:
+        """A stable fingerprint of the underlying login an agent uses, so two
+        agent slots backed by the same account (e.g. the orchestrator slot and
+        a worker slot reusing account #1) collapse into a single roster row."""
+        config_dir = getattr(agent, "config_dir", None)
+        if config_dir is not None:          # Claude CLI — opaque token, key on dir
+            path = config_dir or os.path.expanduser("~/.claude")
+            return "claude:" + os.path.normcase(os.path.abspath(path))
+        codex_home = getattr(agent, "codex_home", None)
+        if codex_home is not None:          # Codex CLI — key on real account_id
+            path = codex_home or os.path.expanduser("~/.codex")
+            return "codex:" + (cls._codex_login_id(path)
+                               or os.path.normcase(os.path.abspath(path)))
+        return "agent:" + str(getattr(agent, "name", id(agent)))
+
+    def _group_state_label(self, names: list[str]):
+        if self.registry is not None and any(
+            not self.registry.is_available(n) for n in names
+        ):
+            return "[yellow]limited[/yellow]"
+        return status_label("idle")
+
     def cmd_status(self) -> None:
         agent_tbl = command_table("Agent Roster", border_style="magenta")
-        agent_tbl.add_column("Role", width=9)
-        agent_tbl.add_column("Name", style="cyan", width=22, overflow="fold")
+        agent_tbl.add_column("Role", width=16, overflow="fold")
+        agent_tbl.add_column("Name", style="cyan", width=20, overflow="fold")
         agent_tbl.add_column("Provider", width=11)
         agent_tbl.add_column("Model", width=18, overflow="fold")
         agent_tbl.add_column("Account", width=22, overflow="fold")
@@ -768,14 +812,36 @@ class GenesisREPL:
         primary = self._get_orchestrator()
         reviewer = self._get_co_brain(primary) if (primary and self.config.collaboration.enabled) else None
 
+        # Collapse agent slots that share the same underlying login into one row
+        # so each unique account is shown exactly once (an account serving as a
+        # brain is also registered as a worker — that is one account, one row).
+        groups: dict[str, list[tuple[str, BaseAgent]]] = {}
         for name, agent in self._agents.items():
+            groups.setdefault(self._agent_identity(agent), []).append((name, agent))
+
+        role_rank = {"brain": 0, "reviewer": 1, "worker": 2}
+        for members in groups.values():
+            names = [n for n, _ in members]
+            agent = members[0][1]
+            # Prefer the account's real name over the synthetic "*-orchestrator" slot.
+            display_name = next((n for n in names if "orchestrator" not in n), names[0])
+            roles: list[str] = []
+            for n, a in members:
+                r = self._agent_role_label(n, a, primary, reviewer)
+                if r not in roles:
+                    roles.append(r)
+            roles.sort(key=lambda r: role_rank.get(r, 9))
+            models: list[str] = []
+            for _, a in members:
+                if a.model not in models:
+                    models.append(a.model)
             agent_tbl.add_row(
-                self._agent_role_label(name, agent, primary, reviewer),
-                markup(name),
+                "+".join(roles),
+                markup(display_name),
                 markup(agent.provider),
-                markup(agent.model),
+                markup(" / ".join(models)),
                 markup(self._agent_account_label(agent)),
-                self._agent_state_label(name),
+                self._group_state_label(names),
             )
 
         if not self._agents:
