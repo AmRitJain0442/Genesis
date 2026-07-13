@@ -29,7 +29,22 @@ class WorktreeManager:
         repo_key = hashlib.sha256(str(self.repo_root).encode("utf-8")).hexdigest()[:16]
         self.worktrees_root = CONFIG_DIR / "worktrees" / repo_key
 
+    def has_head(self) -> bool:
+        """True if the repo has at least one commit (a HEAD to branch from)."""
+        return self._git("rev-parse", "--verify", "--quiet", "HEAD",
+                          check=False).returncode == 0
+
     def ensure_clean_main(self, ignore_paths: list[str] | None = None) -> None:
+        # A brand-new `git init` (no commit yet) has no HEAD to create worktrees
+        # from. That's a different problem from a dirty tree, so report it plainly
+        # instead of the misleading "commit or stash current changes".
+        if not self.has_head():
+            raise RuntimeError(
+                "This repository has no commits yet, so Genesis has no base "
+                "revision to build from. Make an initial commit first:\n"
+                '    git add -A && git commit -m "initial commit"'
+            )
+
         ignored = [p.replace("\\", "/").lstrip("./") for p in (ignore_paths or [])]
         dirty = []
         for line in self._git("status", "--porcelain").stdout.splitlines():
@@ -40,9 +55,19 @@ class WorktreeManager:
                 continue
             dirty.append(line)
         if dirty:
+            preview = "\n".join("    " + line for line in dirty[:10])
+            more = f"\n    ... and {len(dirty) - 10} more" if len(dirty) > 10 else ""
+            only_untracked = all(line.startswith("??") for line in dirty)
+            hint = (
+                "These are untracked files. Commit them so Genesis uses them as "
+                "the base (git add -A && git commit), or add them to .gitignore."
+                if only_untracked else
+                "Commit or stash these changes before running "
+                "(e.g. git add -A && git commit)."
+            )
             raise RuntimeError(
-                "Genesis isolated execution requires a clean git worktree. "
-                "Commit or stash current changes before running."
+                "Genesis isolated execution requires a clean git worktree, but "
+                f"found {len(dirty)} uncommitted change(s):\n{preview}{more}\n{hint}"
             )
 
     def create(self, run_id: str, step_id: str) -> Path:
