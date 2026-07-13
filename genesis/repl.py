@@ -336,6 +336,7 @@ class GenesisREPL:
                         timeout=cfg.codex_cli.timeout,
                         work_dir=self.work_dir,
                         codex_home=account.home,
+                        reasoning=account.reasoning,
                     )
                 # Every account registers as a worker
                 worker_key = account.name if account.name else f"codex-worker-{i+1}"
@@ -345,6 +346,7 @@ class GenesisREPL:
                     timeout=cfg.codex_cli.timeout,
                     work_dir=self.work_dir,
                     codex_home=account.home,
+                    reasoning=account.reasoning,
                 )
 
         # ChatGPT browser agent (optional — requires playwright)

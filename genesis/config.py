@@ -116,6 +116,7 @@ class CodexAccount:
     name: str = "codex-main"
     home: str = ""          # CODEX_HOME — empty = system default (~/.codex)
     model: str = "auto"
+    reasoning: str = ""     # model_reasoning_effort: "", minimal, low, medium, high
 
 
 @dataclass
@@ -276,6 +277,7 @@ def load_config() -> GenesisConfig:
                 name=a.get("name", f"codex-{i+1}"),
                 home=a.get("home", ""),
                 model=a.get("model", "auto"),
+                reasoning=a.get("reasoning", ""),
             )
             for i, a in enumerate(accounts_data)
             if isinstance(a, dict)

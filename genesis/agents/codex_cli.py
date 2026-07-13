@@ -54,6 +54,7 @@ class CodexCLIAgent(BaseAgent):
         timeout: int = 600,
         work_dir: str = ".",
         codex_home: str = "",   # empty = use system default (~/.codex)
+        reasoning: str = "",    # model_reasoning_effort; empty = account default
     ):
         super().__init__(info)
         self.command = command
@@ -61,6 +62,7 @@ class CodexCLIAgent(BaseAgent):
         self.work_dir = str(Path(work_dir).resolve())
         # Normalise codex_home to OS path (config may use forward slashes on Windows)
         self.codex_home = str(Path(codex_home)) if codex_home else ""
+        self.reasoning = (reasoning or "").strip()
 
     # ── BaseAgent interface ────────────────────────────────────────────────
 
@@ -136,6 +138,11 @@ class CodexCLIAgent(BaseAgent):
         if self.model and self.model not in ("auto", "default"):
             cmd += ["--model", self.model]
 
+        # Reasoning effort (minimal|low|medium|high) — the "high" in e.g.
+        # "gpt-5.6-sol high". Only sent when pinned; otherwise account default.
+        if self.reasoning:
+            cmd += ["-c", f"model_reasoning_effort={self.reasoning}"]
+
         if allow_writes:
             cmd += ["--sandbox", "workspace-write"]
         else:
@@ -206,6 +213,11 @@ class CodexCLIAgent(BaseAgent):
 
         if self.model and self.model not in ("auto", "default"):
             cmd += ["--model", self.model]
+
+        # Reasoning effort (minimal|low|medium|high) — the "high" in e.g.
+        # "gpt-5.6-sol high". Only sent when pinned; otherwise account default.
+        if self.reasoning:
+            cmd += ["-c", f"model_reasoning_effort={self.reasoning}"]
 
         if allow_writes:
             cmd += ["--sandbox", "workspace-write"]
