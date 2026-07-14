@@ -93,6 +93,28 @@ class WorkerDialogueTests(unittest.TestCase):
             outcome.result.files_written,
         )
 
+    def test_evidence_guard_retries_before_model_evaluation(self) -> None:
+        bad = _result(["brain.html"])
+        bad.evidence = {
+            "guard_violations": [
+                "Restore tracked files deleted outside the declared step scope: brain.html"
+            ]
+        }
+        good = _result(["config.py"])
+        good.evidence = {"guard_violations": []}
+
+        outcome, rec = self._dialogue(
+            evaluations=[(True, "")],
+            worker_results=[bad, good],
+        )
+
+        self.assertTrue(outcome.approved)
+        self.assertEqual(2, outcome.turns)
+        self.assertTrue(any(
+            "Deterministic evidence guard failed" in content
+            for _, content in rec.posts
+        ))
+
     def test_hits_turn_budget_without_approval(self) -> None:
         outcome, rec = self._dialogue(evaluations=[(False, "more"), (False, "more")], max_turns=2)
         self.assertFalse(outcome.approved)

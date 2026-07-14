@@ -8,6 +8,7 @@ reads the git diff to discover which files were created or modified.
 from __future__ import annotations
 import logging
 import hashlib
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -133,32 +134,73 @@ class CodexWorker:
     def _snapshot(self) -> dict[str, str]:
         """Return {relative_path: sha256} for all relevant files in work_dir."""
         snap: dict[str, str] = {}
-        for p in self.work_dir.rglob("*"):
-            if p.is_file() and not _is_ignored(p, self.work_dir):
-                try:
-                    snap[str(p.relative_to(self.work_dir))] = hashlib.sha256(
-                        p.read_bytes()
-                    ).hexdigest()
-                except Exception:
-                    pass
+        for relative in self._git_visible_files():
+            p = self.work_dir / relative
+            if not p.is_file():
+                continue
+            try:
+                snap[relative] = hashlib.sha256(p.read_bytes()).hexdigest()
+            except Exception:
+                pass
         return snap
+
+    def _git_visible_files(self) -> list[str]:
+        """Tracked and non-ignored untracked files, excluding cache noise."""
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.work_dir),
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                ],
+                capture_output=True,
+                check=True,
+            )
+            paths = result.stdout.decode("utf-8", errors="replace").split("\0")
+            return sorted(
+                path.replace("\\", "/")
+                for path in paths
+                if path and not _is_ignored(self.work_dir / path, self.work_dir)
+            )
+        except (OSError, subprocess.SubprocessError):
+            return sorted(
+                str(path.relative_to(self.work_dir)).replace("\\", "/")
+                for path in self.work_dir.rglob("*")
+                if path.is_file() and not _is_ignored(path, self.work_dir)
+            )
 
     def _diff(self, before: dict[str, str]) -> list[str]:
         """Return files that are new or modified since the snapshot."""
         after = self._snapshot()
-        changed = []
-        for path, digest in after.items():
-            if path not in before or before[path] != digest:
-                changed.append(path)
-        return sorted(changed)
+        return sorted(
+            path
+            for path in set(before) | set(after)
+            if before.get(path) != after.get(path)
+        )
 
 
 def _is_ignored(path: Path, root: Path) -> bool:
     """Skip git internals, caches, and binary blobs."""
-    rel = str(path.relative_to(root))
-    skip_prefixes = (".git", ".genesis/state", "__pycache__", "node_modules", ".venv", "venv")
+    rel = str(path.relative_to(root)).replace("\\", "/")
+    parts = Path(rel).parts
+    skip_parts = (
+        ".git",
+        ".genesis",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "__pycache__",
+        "node_modules",
+        ".venv",
+        "venv",
+    )
     skip_suffixes = (".pyc", ".pyo", ".egg-info")
     return (
-        any(rel.startswith(p) for p in skip_prefixes)
+        any(part in skip_parts for part in parts)
         or any(rel.endswith(s) for s in skip_suffixes)
     )

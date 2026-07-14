@@ -155,6 +155,18 @@ class WorkerDialogue:
                 )
                 continue
 
+            guard_violations = list(evidence.get("guard_violations", []) or [])
+            if guard_violations and turn < self.max_turns:
+                feedback = "Deterministic evidence guard failed:\n- " + "\n- ".join(
+                    str(item) for item in guard_violations
+                )
+                self._status(
+                    f"Evidence guard rejected turn {turn} on {sid}; retrying repair"
+                )
+                self.post(self.brain_name, "brain", feedback, "status")
+                current = self.make_revision(current, feedback)
+                continue
+
             if turn >= self.max_turns:
                 self._status(f"Turn budget reached on {sid} - handing to independent review")
                 self.post(self.brain_name, "brain",

@@ -15,6 +15,7 @@ from genesis.agents.worker import Worker, WorkerResult
 from genesis.agents.availability import is_exhaustion_error
 from genesis.memory import MemoryManager
 from genesis.git_ops import GitManager
+from genesis.evidence import evaluate_patch_evidence
 from genesis.config import GenesisConfig
 from genesis.palace import PalaceStore
 from genesis.policy import ExecutionPolicy
@@ -930,6 +931,7 @@ class Orchestrator:
                     result.evidence = self._turn_evidence(
                         turn_patch,
                         turn_version,
+                        step=s,
                         reported_files=reported_files,
                     )
                     if self.runtime:
@@ -1002,6 +1004,22 @@ class Orchestrator:
                 execution.failed_reason = (
                     "Worker completed without a reviewable patch. No reviewer "
                     "was called because the changed-file manifest is empty."
+                )
+                execution.memory_note = execution.failed_reason
+                self._post_step(
+                    step_room,
+                    worker_name,
+                    "worker",
+                    execution.failed_reason,
+                    "status",
+                )
+                return execution
+
+            guard = evaluate_patch_evidence(step, patch)
+            if not guard.passed:
+                execution.failed_agent = worker_name
+                execution.failed_reason = "Evidence guard failed: " + " ".join(
+                    guard.violations
                 )
                 execution.memory_note = execution.failed_reason
                 self._post_step(
@@ -1402,8 +1420,10 @@ class Orchestrator:
         patch: WorktreePatch,
         version: int,
         *,
+        step: Step | None = None,
         reported_files: list[str] | None = None,
     ) -> dict:
+        guard = evaluate_patch_evidence(step, patch) if step is not None else None
         return {
             "version": version,
             "patch_sha": patch.patch_sha,
@@ -1414,6 +1434,7 @@ class Orchestrator:
             "status_lines": list(patch.status_lines),
             "diff_status_lines": list(patch.diff_status_lines),
             "patch_text": patch.patch_text,
+            "guard_violations": list(guard.violations) if guard else [],
         }
 
     def _run_worker_dialogue(self, step: Step, run_worker, worker_name: str,
