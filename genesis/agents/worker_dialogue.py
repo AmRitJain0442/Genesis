@@ -101,8 +101,14 @@ class WorkerDialogue:
             )
             result = self.run_worker(current)
 
-            turn_files = list(getattr(result, "files_written", None) or [])
-            for path in turn_files:
+            authoritative_files = list(
+                getattr(result, "files_written", None) or []
+            )
+            evidence = getattr(result, "evidence", None) or {}
+            turn_files = list(
+                evidence.get("turn_reported_files", authoritative_files)
+            )
+            for path in authoritative_files:
                 if path not in cumulative_files:
                     cumulative_files.append(path)
             # Each Codex turn reports only files changed during that turn. Keep

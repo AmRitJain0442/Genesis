@@ -909,9 +909,11 @@ class Orchestrator:
             # Failover state: the account actually used may change mid-step if the
             # current one hits its rate/usage limit.
             worker_state = {"name": worker_name, "agent": worker_agent}
+            turn_version = 0
 
             def run_turn(s):
-                return self._worker_execute_with_failover(
+                nonlocal turn_version
+                result = self._worker_execute_with_failover(
                     s,
                     worktree_path,
                     output_callback,
@@ -920,6 +922,28 @@ class Orchestrator:
                     plan=plan,
                     run_id=run_id,
                 )
+                if result is not None and result.success:
+                    turn_version += 1
+                    reported_files = list(result.files_written or [])
+                    turn_patch = worktrees.capture_patch(worktree_path)
+                    result.files_written = turn_patch.changed_files
+                    result.evidence = self._turn_evidence(
+                        turn_patch,
+                        turn_version,
+                        reported_files=reported_files,
+                    )
+                    if self.runtime:
+                        self.runtime.record_event(
+                            run_id,
+                            "worker_turn_evidence",
+                            step_id=step.step_id,
+                            payload={
+                                key: value
+                                for key, value in result.evidence.items()
+                                if key != "patch_text"
+                            },
+                        )
+                return result
 
             # Phase 3b: a multi-turn brain<->worker dialogue shapes the work
             # before the independent reviewer gates it. Single-shot when disabled.
@@ -1335,10 +1359,28 @@ class Orchestrator:
         )
         files = result.files_written or []
         body = (result.result_text or "")[:3000]
+        evidence = getattr(result, "evidence", None) or {}
+        patch_text = str(evidence.get("patch_text", ""))
+        patch_block = self._bounded_diff(patch_text, max_chars=8000) if patch_text else "No patch captured."
+        status_lines = evidence.get("status_lines", [])
+        status_block = "\n".join(str(line) for line in status_lines) or "clean"
+        diff_status_lines = evidence.get("diff_status_lines", [])
+        diff_status_block = (
+            "\n".join(str(line) for line in diff_status_lines)
+            or "no base-relative changes"
+        )
         msg = (
             f"STEP:\n  ID: {step.step_id}\n  Title: {step.title}\n  Type: {step.type}\n"
             f"  Expected Output: {step.expected_output}\n\n"
-            f"WORKER FILES ({len(files)}): {', '.join(files) or 'none'}\n\n"
+            f"AUTHORITATIVE TURN EVIDENCE:\n"
+            f"  Version: {evidence.get('version', 'unknown')}\n"
+            f"  Patch ID: {evidence.get('patch_sha', 'none')}\n"
+            f"  Base: {evidence.get('base_sha', 'unknown')}\n"
+            f"  Head: {evidence.get('head_sha', 'unknown')}\n"
+            f"  Changed Files ({len(files)}): {', '.join(files) or 'none'}\n"
+            f"  Working Tree Status:\n{status_block}\n"
+            f"  Base-relative Diff Status:\n{diff_status_block}\n\n"
+            f"ACTUAL PATCH:\n{patch_block}\n\n"
             f"WORKER SUMMARY:\n{body}\n\n"
             'Return ONLY the JSON object.'
         )
@@ -1354,6 +1396,25 @@ class Orchestrator:
         action = str(data.get("action", "approve")).strip().lower()
         feedback = str(data.get("feedback", "")).strip()
         return (action != "revise"), feedback
+
+    @staticmethod
+    def _turn_evidence(
+        patch: WorktreePatch,
+        version: int,
+        *,
+        reported_files: list[str] | None = None,
+    ) -> dict:
+        return {
+            "version": version,
+            "patch_sha": patch.patch_sha,
+            "base_sha": patch.base_sha,
+            "head_sha": patch.head_sha,
+            "changed_files": list(patch.changed_files),
+            "turn_reported_files": list(reported_files or []),
+            "status_lines": list(patch.status_lines),
+            "diff_status_lines": list(patch.diff_status_lines),
+            "patch_text": patch.patch_text,
+        }
 
     def _run_worker_dialogue(self, step: Step, run_worker, worker_name: str,
                              step_room: str, output_callback):

@@ -14,6 +14,11 @@ class WorktreePatch:
     worktree_path: str
     patch_text: str
     changed_files: list[str] = field(default_factory=list)
+    base_sha: str = ""
+    head_sha: str = ""
+    patch_sha: str = ""
+    status_lines: list[str] = field(default_factory=list)
+    diff_status_lines: list[str] = field(default_factory=list)
 
     @property
     def has_changes(self) -> bool:
@@ -140,10 +145,21 @@ class WorktreeManager:
         changed = self._git_in(
             path, "diff", "--cached", "--name-only", merge_base
         ).stdout.splitlines()
+        status_lines = self._git_in(
+            path, "status", "--short", "--untracked-files=all"
+        ).stdout.splitlines()
+        diff_status_lines = self._git_in(
+            path, "diff", "--cached", "--name-status", merge_base
+        ).stdout.splitlines()
         return WorktreePatch(
             worktree_path=str(path),
             patch_text=patch,
             changed_files=sorted(p for p in changed if p),
+            base_sha=merge_base,
+            head_sha=worktree_head,
+            patch_sha=hashlib.sha256(patch.encode("utf-8")).hexdigest()[:16],
+            status_lines=status_lines,
+            diff_status_lines=diff_status_lines,
         )
 
     def apply_check(self, patch_text: str) -> None:

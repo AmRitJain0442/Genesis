@@ -149,6 +149,41 @@ class BrainEvaluateTests(unittest.TestCase):
         approve, _ = orch._brain_evaluate(_step(), _result(["a.py"]))
         self.assertTrue(approve)
 
+    def test_brain_receives_versioned_patch_evidence(self) -> None:
+        captured = {}
+
+        def chat(system, messages, output_callback=None):
+            captured["prompt"] = messages[0]["content"]
+            return json.dumps({"action": "approve", "feedback": ""})
+
+        agent = types.SimpleNamespace(name="claude", chat=chat)
+        mem = types.SimpleNamespace(get_summary=lambda n: "")
+        orch = Orchestrator(
+            agent,
+            {"w": object()},
+            mem,
+            git=None,
+            config=GenesisConfig(),
+            work_dir=".",
+        )
+        result = _result(["app.py"])
+        result.evidence = {
+            "version": 2,
+            "patch_sha": "abc123",
+            "base_sha": "base",
+            "head_sha": "head",
+            "status_lines": ["M  app.py"],
+            "patch_text": "diff --git a/app.py b/app.py\n+value = 1\n",
+        }
+
+        approve, _ = orch._brain_evaluate(_step(), result)
+
+        self.assertTrue(approve)
+        self.assertIn("Version: 2", captured["prompt"])
+        self.assertIn("Patch ID: abc123", captured["prompt"])
+        self.assertIn("ACTUAL PATCH:", captured["prompt"])
+        self.assertIn("+value = 1", captured["prompt"])
+
 
 if __name__ == "__main__":
     unittest.main()

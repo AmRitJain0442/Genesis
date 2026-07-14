@@ -119,6 +119,13 @@ class PrepareMainTests(unittest.TestCase):
 
             self.assertEqual(["added.py", "seed.py"], patch.changed_files)
             self.assertTrue(patch.has_changes)
+            self.assertTrue(patch.base_sha)
+            self.assertTrue(patch.head_sha)
+            self.assertEqual(16, len(patch.patch_sha))
+            self.assertEqual([], patch.status_lines)
+            self.assertTrue(any(
+                "added.py" in line for line in patch.diff_status_lines
+            ))
             self.assertIn("added.py", patch.patch_text)
             manager.apply_check(patch.patch_text)
             manager.apply_patch(patch.patch_text)

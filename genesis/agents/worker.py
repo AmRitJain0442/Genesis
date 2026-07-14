@@ -3,7 +3,7 @@ import re
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import Any, TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from genesis.agents.base import BaseAgent
@@ -71,6 +71,7 @@ class WorkerResult:
     result_text: str
     code_blocks: list[CodeBlock] = field(default_factory=list)
     files_written: list[str] = field(default_factory=list)
+    evidence: dict[str, Any] = field(default_factory=dict)
     success: bool = True
     error: str = ""
 
