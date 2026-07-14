@@ -212,6 +212,33 @@ class PrepareMainTests(unittest.TestCase):
         finally:
             manager.remove(worktree)
 
+    def test_explicit_safe_ignored_artifact_is_force_staged(self):
+        (self.repo / ".gitignore").write_text(".env*\n", encoding="utf-8")
+        (self.repo / "seed.py").write_text("seed\n", encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-m", "init")
+        manager = self._wt()
+        worktree = manager.create("ignored-artifact", "step")
+        step = types.SimpleNamespace(
+            title="Add .env.example",
+            description="Create a tracked .env.example template.",
+            context_hint="",
+            expected_output=".env.example exists",
+            file_scope=[".env.example"],
+        )
+        try:
+            (worktree / ".env.example").write_text(
+                "API_KEY=your-api-key\n",
+                encoding="utf-8",
+            )
+
+            patch = manager.capture_patch(worktree, step)
+
+            self.assertIn(".env.example", patch.changed_files)
+            self.assertIn(".env.example", patch.patch_text)
+        finally:
+            manager.remove(worktree)
+
 
 if __name__ == "__main__":
     unittest.main()

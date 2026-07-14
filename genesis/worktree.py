@@ -197,7 +197,7 @@ class WorktreeManager:
             )
         return selected
 
-    def capture_patch(self, worktree_path: str | Path) -> WorktreePatch:
+    def capture_patch(self, worktree_path: str | Path, step=None) -> WorktreePatch:
         path = Path(worktree_path).resolve()
         self._assert_under(path, self.worktrees_root.resolve())
         # Stage only inside the isolated worktree so untracked files appear in
@@ -220,6 +220,11 @@ class WorktreeManager:
         overlays = self._overlay_records(path)
         overlay_paths = [str(record["path"]) for record in overlays]
         self._git_in(path, "add", "-A", "--", ".")
+        # A repository may broadly ignore files such as `.env*`. If the task
+        # explicitly requires a safe template/config artifact, include that
+        # exact path in evidence instead of silently losing the worker's work.
+        for relative in self._safe_referenced_ignored(path, step):
+            self._git_in(path, "add", "-f", "--", relative)
         # A worker may force-add or commit an overlaid ignored source. Reset its
         # index entry to the base; a safe modification patch is appended below.
         for relative in overlay_paths:
@@ -359,6 +364,33 @@ class WorktreeManager:
             "--exclude-standard",
         ).stdout
         return [item for item in output.split("\0") if item]
+
+    def _safe_referenced_ignored(self, worktree: Path, step) -> list[str]:
+        if step is None:
+            return []
+        safe_special = {".env.example", ".gitignore"}
+        selected: list[str] = []
+        for raw in self._referenced_paths(step):
+            relative = raw.replace("\\", "/")
+            while relative.startswith("./"):
+                relative = relative[2:]
+            if not relative or Path(relative).is_absolute() or ".." in relative.split("/"):
+                continue
+            candidate = worktree / relative
+            name = candidate.name.lower()
+            allowed = (
+                candidate.suffix.lower() in _SOURCE_SUFFIXES
+                or name in safe_special
+                or (name.startswith("requirements") and name.endswith(".txt"))
+            )
+            if not allowed or self._sensitive_path(relative) or not candidate.is_file():
+                continue
+            ignored = self._git_in(
+                worktree, "check-ignore", "--quiet", "--", relative, check=False
+            ).returncode == 0
+            if ignored and relative not in selected:
+                selected.append(relative)
+        return sorted(selected)
 
     def _sensitive_workspace_paths(self) -> list[str]:
         output = self._git(

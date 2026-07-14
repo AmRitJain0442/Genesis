@@ -15,7 +15,7 @@ from genesis.agents.worker import Worker, WorkerResult
 from genesis.agents.availability import is_exhaustion_error
 from genesis.memory import MemoryManager
 from genesis.git_ops import GitManager
-from genesis.evidence import evaluate_patch_evidence
+from genesis.evidence import evaluate_acceptance_gates, evaluate_patch_evidence
 from genesis.config import GenesisConfig
 from genesis.palace import PalaceStore
 from genesis.policy import ExecutionPolicy
@@ -956,13 +956,14 @@ class Orchestrator:
                 if result is not None and result.success:
                     turn_version += 1
                     reported_files = list(result.files_written or [])
-                    turn_patch = worktrees.capture_patch(worktree_path)
+                    turn_patch = worktrees.capture_patch(worktree_path, s)
                     result.files_written = turn_patch.changed_files
                     result.evidence = self._turn_evidence(
                         turn_patch,
                         turn_version,
                         step=s,
                         reported_files=reported_files,
+                        work_dir=worktree_path,
                     )
                     if self.runtime:
                         self.runtime.record_event(
@@ -1003,7 +1004,7 @@ class Orchestrator:
                 self._post_step(step_room, worker_name, "worker", f"Failed: {reason}", "status")
                 return execution
 
-            patch = worktrees.capture_patch(worktree_path)
+            patch = worktrees.capture_patch(worktree_path, step)
             # The captured patch is the authoritative review manifest. Never
             # leave a final-turn-only file list attached to an empty patch.
             result.files_written = patch.changed_files
@@ -1045,11 +1046,18 @@ class Orchestrator:
                 )
                 return execution
 
-            guard = evaluate_patch_evidence(step, patch)
-            if not guard.passed:
+            gates = evaluate_acceptance_gates(step, patch, worktree_path)
+            if self.runtime:
+                self.runtime.record_event(
+                    run_id,
+                    "deterministic_gates",
+                    step_id=step.step_id,
+                    payload={"patch_sha": patch.patch_sha, **gates.as_dict()},
+                )
+            if not gates.passed:
                 execution.failed_agent = worker_name
-                execution.failed_reason = "Evidence guard failed: " + " ".join(
-                    guard.violations
+                execution.failed_reason = "Deterministic acceptance gates failed: " + " ".join(
+                    gates.violations
                 )
                 execution.memory_note = execution.failed_reason
                 self._post_step(
@@ -1124,7 +1132,7 @@ class Orchestrator:
                     })
                     execution.review = review
                     break
-                patch = worktrees.capture_patch(worktree_path)
+                patch = worktrees.capture_patch(worktree_path, revised)
                 result.files_written = patch.changed_files
                 execution.patch = patch
                 execution.patch_id = self._store_patch(run_id, step.step_id, patch)
@@ -1139,6 +1147,25 @@ class Orchestrator:
                             "repair_attempts": execution.repair_attempts,
                         },
                     )
+                gates = evaluate_acceptance_gates(revised, patch, worktree_path)
+                if self.runtime:
+                    self.runtime.record_event(
+                        run_id,
+                        "deterministic_gates",
+                        step_id=step.step_id,
+                        payload={"patch_sha": patch.patch_sha, **gates.as_dict()},
+                    )
+                if not gates.passed:
+                    reason = "Deterministic acceptance gates failed: " + " ".join(gates.violations)
+                    review = review.model_copy(update={
+                        "verdict": "rejected",
+                        "quality_score": 1,
+                        "feedback": reason,
+                        "memory_note": reason,
+                        "should_retry": False,
+                    })
+                    execution.review = review
+                    break
                 review = self.review(
                     revised,
                     result,
@@ -1218,7 +1245,7 @@ class Orchestrator:
                         execution.memory_note = f"Verification repair failed: {execution.failed_reason}"
                         return execution
 
-                    patch = worktrees.capture_patch(worktree_path)
+                    patch = worktrees.capture_patch(worktree_path, revised)
                     result.files_written = patch.changed_files
                     execution.patch = patch
                     execution.patch_id = self._store_patch(run_id, step.step_id, patch)
@@ -1244,6 +1271,23 @@ class Orchestrator:
                                 "repair_attempts": execution.repair_attempts,
                             },
                         )
+
+                    gates = evaluate_acceptance_gates(revised, patch, worktree_path)
+                    if self.runtime:
+                        self.runtime.record_event(
+                            run_id,
+                            "deterministic_gates",
+                            step_id=step.step_id,
+                            payload={"patch_sha": patch.patch_sha, **gates.as_dict()},
+                        )
+                    if not gates.passed:
+                        execution.failed_agent = worker_name
+                        execution.failed_reason = (
+                            "Deterministic acceptance gates failed: "
+                            + " ".join(gates.violations)
+                        )
+                        execution.memory_note = execution.failed_reason
+                        return execution
 
                     review = self.review(
                         revised,
@@ -1452,8 +1496,14 @@ class Orchestrator:
         *,
         step: Step | None = None,
         reported_files: list[str] | None = None,
+        work_dir: str | Path | None = None,
     ) -> dict:
         guard = evaluate_patch_evidence(step, patch) if step is not None else None
+        gates = (
+            evaluate_acceptance_gates(step, patch, work_dir)
+            if step is not None and work_dir is not None
+            else None
+        )
         return {
             "version": version,
             "patch_sha": patch.patch_sha,
@@ -1464,7 +1514,12 @@ class Orchestrator:
             "status_lines": list(patch.status_lines),
             "diff_status_lines": list(patch.diff_status_lines),
             "patch_text": patch.patch_text,
-            "guard_violations": list(guard.violations) if guard else [],
+            "guard_violations": (
+                list(gates.violations)
+                if gates is not None
+                else list(guard.violations) if guard else []
+            ),
+            "acceptance_gates": gates.as_dict() if gates is not None else {},
         }
 
     def _run_worker_dialogue(self, step: Step, run_worker, worker_name: str,

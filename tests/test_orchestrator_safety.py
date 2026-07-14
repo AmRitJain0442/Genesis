@@ -247,6 +247,60 @@ class OrchestratorSafetyTests(unittest.TestCase):
             WorktreeManager(root).cleanup_run("run-safe")
             git.close()
 
+    def test_deterministic_gate_blocks_missing_artifacts_before_reviewer(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.verification.commands = []
+            cfg.dialogue.enabled = False
+            planner = FakePlanReviewAgent(
+                verdict="approved",
+                task_id="run-gated",
+                steps=[{
+                    "step_id": "step-1",
+                    "title": "Harden configuration",
+                    "description": (
+                        "Remove the hardcoded API key. Create a real .env.example and "
+                        "add requirements.txt with pinned dependencies."
+                    ),
+                    "type": "config",
+                    "preferred_agent": "any",
+                    "depends_on": [],
+                    "expected_output": "Required artifacts exist and secrets are removed.",
+                    "context_hint": "",
+                }],
+            )
+            runtime = RuntimeStore(cfg.runtime.state_db)
+            git = GitManager(str(root), cfg.git)
+            orchestrator = Orchestrator(
+                planner,
+                {"fake-worker": FakeWorkerAgent(filename="SECURITY.md", content="all clean")},
+                MemoryManager(str(root / "GENESIS_MEMORY.md")),
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=PalaceStore(cfg.runtime.state_db),
+                policy=ExecutionPolicy(),
+            )
+
+            orchestrator.run_task("harden configuration")
+
+            self.assertEqual({}, planner.review_counts)
+            self.assertEqual("blocked", runtime.get_run("run-gated").status)
+            step = runtime.get_step("run-gated", "step-1")
+            self.assertIn("acceptance gates failed", step.metadata["blocked_reason"].lower())
+            gate_events = [
+                event for event in runtime.events("run-gated")
+                if event.event_type == "deterministic_gates"
+            ]
+            self.assertEqual(1, len(gate_events))
+            self.assertFalse(gate_events[0].payload["passed"])
+            git.close()
+
     def test_approved_review_applies_patch_and_commits(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
