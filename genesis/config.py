@@ -37,13 +37,32 @@ timeout = 300                    # seconds to wait for a response
 
 [codex_cli]
 command = "codex"
-timeout = 600
+timeout = 600                    # inactivity timeout; active JSONL events reset it
 model = "auto"
 
 [[codex_cli.accounts]]
 name = "codex-main"
 home = ""
 model = "auto"
+
+[collaboration]
+enabled = true                   # two available brains debate and converge on the plan
+max_rounds = 4
+
+[dialogue]
+enabled = true                   # worker repairs objective/model feedback before review
+max_turns = 3
+
+[failover]
+enabled = true                   # move quota-limited work to the next normal account
+cooldown_seconds = 900
+
+[chatroom]
+enabled = true
+host = "127.0.0.1"
+port = 0
+persist = true
+open_browser = false
 
 [chatgpt_browser]
 # Settings for the optional ChatGPT browser agent.

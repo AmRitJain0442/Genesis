@@ -39,12 +39,13 @@ The result is a local command center for multi-step software work, with a visibl
 When you type `run <task>`, Genesis:
 
 1. Sends the task to the orchestrator, which returns a structured JSON execution plan.
-2. Assigns ready steps to worker agents based on dependencies and file scope.
-3. Runs each worker inside an isolated git worktree.
-4. Captures the patch and sends it to an independent reviewer role.
-5. Runs configured verification commands in isolation.
-6. Applies approved patches to the main repository and commits them.
-7. Records progress in local memory and SQLite runtime state.
+2. Snapshots the real repository state and checkpoints recoverable local work while excluding credentials.
+3. Assigns ready steps based on dependencies and file scope, then runs each worker in an isolated git worktree.
+4. Captures every turn as a base-relative Git patch with an immutable patch SHA and filters transient artifacts or unrelated deletions.
+5. Runs objective acceptance gates before spending a reviewer call, then binds the independent review verdict to that exact patch SHA.
+6. Runs configured verification commands in isolation.
+7. Applies only the reviewed changed-file manifest to the main repository and commits it.
+8. Records patches, gate results, reviews, repairs, verification, and progress in local memory and SQLite runtime state.
 
 During execution you see a live command-center dashboard with plan state, active workers, reviewer handoffs, streaming output, verification status, git activity, recent events, and usage metrics.
 
@@ -58,6 +59,10 @@ During execution you see a live command-center dashboard with plan state, active
 - Claude Code and Codex CLI integration through existing OAuth sessions.
 - Multi-account Codex worker support for parallel execution.
 - Isolated git worktrees for worker changes.
+- Inactivity-based worker watchdogs that stay alive while Codex is producing events.
+- Git-grounded, versioned evidence on every worker turn.
+- Deterministic acceptance gates before model review.
+- Reviewer verdicts bound to immutable patch versions.
 - Bounded self-repair when review or verification fails.
 - Durable runs with `resume`, `retry`, `inspect`, and `cleanup`.
 - Configurable verification gates before commit.
@@ -252,6 +257,27 @@ every non-reserve Codex worker has reported a rate, usage, or quota limit;
 workers that are merely busy do not unlock it. All Codex worker accounts use
 the same write-enabled execution mode inside their isolated git worktrees.
 
+For example, keep `CODEX-200` last while three Terra workers are available:
+
+```toml
+[[codex_cli.accounts]]
+name = "Codex-harshita"
+home = "C:/Users/you/.codex-harshita"
+
+[[codex_cli.accounts]]
+name = "Codex-post-1"
+home = "C:/Users/you/.codex-post-1"
+
+[[codex_cli.accounts]]
+name = "Codex-post-2"
+home = "C:/Users/you/.codex-post-2"
+
+[[codex_cli.accounts]]
+name = "CODEX-200"
+home = "C:/Users/you/.codex-200"
+reserve = true
+```
+
 Add an account:
 
 ```text
@@ -366,6 +392,31 @@ state and the configured memory file are excluded from the checkpoint.
 
 A worker patch is captured, stored in SQLite, reviewed, verified in isolation, checked with `git apply --check`, then applied to the main repository and committed. Failed or rejected steps leave the main repository unchanged and can be inspected or retried.
 
+### Evidence and review integrity
+
+Worker summaries are advisory. Genesis builds its own evidence from Git after
+every turn: base and head revisions, changed-file manifest, status, deletion
+status, patch content, and patch SHA. Brain feedback and independent review see
+that evidence rather than trusting a claim such as “all files were fixed.”
+
+Before review, deterministic gates reject cache/build noise, deletions outside
+the declared scope, explicitly requested artifacts that do not exist, tracked
+credential-shaped files, unpinned requirements when pinning was requested,
+literal secret fallbacks, and likely hardcoded secrets or endpoints. If a task
+explicitly requires `gitleaks` or `trufflehog`, an unavailable scanner is
+reported as unavailable and never mislabeled as a clean scan.
+
+Each verdict records the reviewed patch SHA and version. A repair creates a new
+patch version, marks the earlier verdict superseded, and requires a fresh
+review. The main repository refuses any patch whose current SHA does not match
+the approved SHA.
+
+Ignored source is not copied wholesale. Genesis may overlay only a source file
+explicitly named by the task, excludes credential-shaped files, and preserves
+its modification as a reviewable patch. Explicit safe templates such as
+`.env.example` can still be captured even when a broad `.env*` rule ignores
+them.
+
 Parallel execution is available when `runtime.max_parallel_workers` is greater than 1 and multiple workers are configured. Genesis leases non-overlapping file scopes to workers and still applies accepted patches one at a time to the main repository.
 
 ## Configuration Reference
@@ -387,12 +438,25 @@ timeout = 300
 
 [codex_cli]
 command = "codex"
-timeout = 600
+timeout = 600 # inactivity timeout; active worker events reset it
 
 [[codex_cli.accounts]]
 name = "codex-main"
 home = ""
 model = "auto"
+# reserve = true # last-resort account; unlocks after normal accounts exhaust
+
+[collaboration]
+enabled = true
+max_rounds = 4
+
+[dialogue]
+enabled = true
+max_turns = 3
+
+[failover]
+enabled = true
+cooldown_seconds = 900
 
 [git]
 auto_commit = true
@@ -446,6 +510,7 @@ genesis/
   runtime.py           Durable run events and artifacts
   scheduler.py         Dependency and file-scope worker leasing
   worktree.py          Isolated git worktrees and patch application
+  evidence.py          Patch guards and deterministic acceptance gates
   policy.py            Protected path and command policy checks
   verifier.py          Configurable verification gates
   memory.py            GENESIS_MEMORY.md reader and writer
@@ -487,6 +552,14 @@ The Codex account is not logged in, or the session expired. Run:
 ```powershell
 codex login
 ```
+
+### Codex worker reaches 600 seconds while still active
+
+`codex_cli.timeout` is an inactivity watchdog, not an absolute task deadline.
+Each streamed Codex JSONL event resets it. If a worker is terminated after this
+interval, it produced no observable event for the full window; any partial file
+changes are preserved for the next turn. A no-progress stall fails over to the
+next normal account without falsely marking the stalled account quota-exhausted.
 
 For a secondary account:
 
