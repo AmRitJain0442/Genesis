@@ -63,6 +63,7 @@ class WorkerDialogue:
         make_revision: Callable[["Step", str], "Step"],
         post: Callable[..., None],
         on_status: Callable[[str], None] | None = None,
+        fast_path: bool = False,
     ) -> None:
         self.step = step
         self.worker_name = worker_name
@@ -73,6 +74,7 @@ class WorkerDialogue:
         self.make_revision = make_revision
         self.post = post
         self.on_status = on_status
+        self.fast_path = fast_path
 
     def _status(self, msg: str) -> None:
         if self.on_status:
@@ -166,6 +168,19 @@ class WorkerDialogue:
                 self.post(self.brain_name, "brain", feedback, "status")
                 current = self.make_revision(current, feedback)
                 continue
+
+            if self.fast_path:
+                self._status(
+                    f"Deterministic preflight passed on {sid} - handing to independent review"
+                )
+                self.post(
+                    self.brain_name,
+                    "brain",
+                    "Deterministic preflight passed — handing directly to independent review.",
+                    "decision",
+                )
+                approved = True
+                break
 
             if turn >= self.max_turns:
                 self._status(f"Turn budget reached on {sid} - handing to independent review")

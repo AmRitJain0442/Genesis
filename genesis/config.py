@@ -47,11 +47,12 @@ model = "auto"
 
 [collaboration]
 enabled = true                   # two available brains debate and converge on the plan
-max_rounds = 4
+max_rounds = 2
 
 [dialogue]
-enabled = true                   # worker repairs objective/model feedback before review
-max_turns = 3
+enabled = true                   # deterministic fast path; reviewer still gates every patch
+max_turns = 2
+fast_path = true                 # skip redundant director critique when cheap gates pass
 
 [failover]
 enabled = true                   # move quota-limited work to the next normal account
@@ -81,7 +82,7 @@ commit_prefix = "[genesis]"
 [runtime]
 state_db = ""                    # empty = ~/.genesis/state/genesis.db
 retry_budget = 1                 # bounded self-repair attempts per failed review/verification
-max_parallel_workers = 1         # safe parallel worker leases; increase when multiple workers exist
+max_parallel_workers = 3         # run independent, non-overlapping steps concurrently
 checkpoint_mode = "always"
 
 [memory]
@@ -151,13 +152,14 @@ class CodexCLIConfig:
 @dataclass
 class CollaborationConfig:
     enabled: bool = True      # when two brains are available, have them debate the plan
-    max_rounds: int = 4       # hard backstop; if unresolved, the Claude brain arbitrates
+    max_rounds: int = 2       # hard backstop; if unresolved, the Claude brain arbitrates
 
 
 @dataclass
 class DialogueConfig:
     enabled: bool = True      # multi-turn brain<->worker conversation per step
-    max_turns: int = 3        # worker implementation turns before handing to review
+    max_turns: int = 2        # worker implementation turns before handing to review
+    fast_path: bool = True    # clean deterministic evidence goes directly to reviewer
 
 
 @dataclass
@@ -196,7 +198,7 @@ class GitConfig:
 class RuntimeConfig:
     state_db: str = ""
     retry_budget: int = 1
-    max_parallel_workers: int = 1
+    max_parallel_workers: int = 3
     checkpoint_mode: str = "always"
 
 
@@ -331,13 +333,14 @@ def load_config() -> GenesisConfig:
     if cl := data.get("collaboration"):
         cfg.collaboration = CollaborationConfig(
             enabled=cl.get("enabled", True),
-            max_rounds=cl.get("max_rounds", 4),
+            max_rounds=cl.get("max_rounds", 2),
         )
 
     if dl := data.get("dialogue"):
         cfg.dialogue = DialogueConfig(
             enabled=dl.get("enabled", True),
-            max_turns=dl.get("max_turns", 3),
+            max_turns=dl.get("max_turns", 2),
+            fast_path=dl.get("fast_path", True),
         )
 
     if fo := data.get("failover"):
@@ -359,7 +362,7 @@ def load_config() -> GenesisConfig:
         cfg.runtime = RuntimeConfig(
             state_db=r.get("state_db", ""),
             retry_budget=r.get("retry_budget", 1),
-            max_parallel_workers=r.get("max_parallel_workers", 1),
+            max_parallel_workers=r.get("max_parallel_workers", 3),
             checkpoint_mode=r.get("checkpoint_mode", "always"),
         )
 

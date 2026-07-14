@@ -79,7 +79,7 @@ model = "auto"              # pin e.g. "gpt-5.6-sol" for the Codex brain
 # any workers start. They debate until both agree; max_rounds is a hard backstop
 # after which the Claude brain arbitrates and synthesizes the final plan.
 enabled    = true
-max_rounds = 4
+max_rounds = 2
 
 [dialogue]
 # Multi-turn conversation between the directing brain and each worker. The
@@ -87,7 +87,8 @@ max_rounds = 4
 # the worker iterates — up to max_turns — before the work goes to the
 # independent reviewer. Watch it unfold in the per-step worker room.
 enabled   = true
-max_turns = 3
+max_turns = 2
+fast_path = true          # clean cheap gates go directly to independent review
 
 [failover]
 # When an account's CLI reports a rate/usage/quota limit, Genesis marks it
@@ -122,7 +123,7 @@ commit_prefix = "[genesis]"
 [runtime]
 state_db = ""              # empty = ~/.genesis/state/genesis.db
 retry_budget = 1           # bounded self-repair attempts per failed review/verification
-max_parallel_workers = 1   # safe parallel worker leases; increase when multiple workers exist
+max_parallel_workers = 3   # non-overlapping ready steps use the three normal workers
 checkpoint_mode = "always"
 
 [memory]

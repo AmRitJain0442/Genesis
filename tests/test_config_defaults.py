@@ -11,8 +11,11 @@ class DefaultConfigTests(unittest.TestCase):
 
         self.assertTrue(data["collaboration"]["enabled"])
         self.assertTrue(data["dialogue"]["enabled"])
+        self.assertTrue(data["dialogue"]["fast_path"])
+        self.assertEqual(2, data["dialogue"]["max_turns"])
         self.assertTrue(data["failover"]["enabled"])
         self.assertEqual(600, data["codex_cli"]["timeout"])
+        self.assertEqual(3, data["runtime"]["max_parallel_workers"])
 
     def test_tracked_example_config_is_valid(self) -> None:
         example = Path(__file__).parents[1] / "config.example.toml"
@@ -20,6 +23,8 @@ class DefaultConfigTests(unittest.TestCase):
             data = config_mod.tomllib.load(handle)
 
         self.assertTrue(data["dialogue"]["enabled"])
+        self.assertTrue(data["dialogue"]["fast_path"])
+        self.assertEqual(3, data["runtime"]["max_parallel_workers"])
         self.assertTrue(data["failover"]["enabled"])
         accounts = data["codex_cli"]["accounts"]
         self.assertTrue(accounts)

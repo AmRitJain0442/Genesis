@@ -5,7 +5,12 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from genesis.evidence import evaluate_acceptance_gates
+from genesis.evidence import (
+    _SCANNER_CACHE,
+    _run_secret_scanner,
+    _scanner_command,
+    evaluate_acceptance_gates,
+)
 from genesis.worktree import WorktreePatch
 
 
@@ -39,6 +44,7 @@ def _patch(files: list[str]) -> WorktreePatch:
 
 class AcceptanceGateTests(unittest.TestCase):
     def setUp(self) -> None:
+        _SCANNER_CACHE.clear()
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         _git(self.root, "init")
@@ -104,7 +110,7 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertTrue(any("fallback" in item.lower() for item in report.violations))
 
     def test_explicit_scanner_is_not_reported_clean_when_unavailable(self) -> None:
-        with patch("genesis.evidence.shutil.which", return_value=None):
+        with patch("genesis.evidence._find_scanner", return_value=None):
             report = evaluate_acceptance_gates(
                 _step("Run gitleaks clean on the working tree."),
                 _patch(["seed.txt"]),
@@ -113,6 +119,84 @@ class AcceptanceGateTests(unittest.TestCase):
 
         self.assertFalse(report.passed)
         self.assertTrue(any("unavailable" in item for item in report.violations))
+
+    def test_external_scanners_are_deferred_during_worker_dialogue(self) -> None:
+        with patch("genesis.evidence._run_secret_scanner") as scanner:
+            report = evaluate_acceptance_gates(
+                _step("Run gitleaks and trufflehog clean on the working tree."),
+                _patch(["seed.txt"]),
+                self.root,
+                run_external_scanners=False,
+            )
+
+        self.assertTrue(report.passed)
+        scanner.assert_not_called()
+        names = [check.name for check in report.checks]
+        self.assertIn("secret-scan:gitleaks:deferred", names)
+        self.assertIn("secret-scan:trufflehog:deferred", names)
+
+    def test_legacy_gitleaks_uses_detect_instead_of_unsupported_dir(self) -> None:
+        help_result = types.SimpleNamespace(
+            stdout="Available Commands:\n  detect  detect secrets\n",
+            stderr="",
+            returncode=0,
+        )
+        with patch("genesis.evidence.subprocess.run", return_value=help_result):
+            command = _scanner_command("gitleaks", "gitleaks.exe")
+
+        self.assertEqual("detect", command[1])
+        self.assertIn("--no-git", command)
+
+    def test_modern_gitleaks_uses_dir_when_capability_is_advertised(self) -> None:
+        help_result = types.SimpleNamespace(
+            stdout="Available Commands:\n  dir       scan a directory\n",
+            stderr="",
+            returncode=0,
+        )
+        with patch("genesis.evidence.subprocess.run", return_value=help_result):
+            command = _scanner_command("gitleaks", "gitleaks.exe")
+
+        self.assertEqual("dir", command[1])
+
+    def test_scanner_result_is_cached_by_patch_sha(self) -> None:
+        completed = types.SimpleNamespace(stdout="", stderr="", returncode=0)
+        executable = self.root / "gitleaks.exe"
+        executable.write_bytes(b"scanner")
+        with (
+            patch("genesis.evidence._find_scanner", return_value=str(executable)),
+            patch("genesis.evidence._scanner_command", return_value=[str(executable), "detect"]),
+            patch("genesis.evidence.subprocess.run", return_value=completed) as run,
+        ):
+            first = _run_secret_scanner("gitleaks", self.root, "patch-1")
+            second = _run_secret_scanner("gitleaks", self.root, "patch-1")
+
+        self.assertTrue(first.passed)
+        self.assertEqual(first, second)
+        run.assert_called_once()
+
+    def test_trufflehog_findings_fail_even_without_fail_flag(self) -> None:
+        completed = types.SimpleNamespace(
+            stdout='{"DetectorName":"Test secret"}\n',
+            stderr="",
+            returncode=0,
+        )
+        executable = self.root / "trufflehog.exe"
+        executable.write_bytes(b"scanner")
+        with (
+            patch("genesis.evidence._find_scanner", return_value=str(executable)),
+            patch(
+                "genesis.evidence._scanner_command",
+                return_value=[str(executable), "filesystem", "--json", "."],
+            ),
+            patch("genesis.evidence.subprocess.run", return_value=completed),
+        ):
+            check = _run_secret_scanner(
+                "trufflehog", self.root, "patch-with-secret"
+            )
+
+        self.assertFalse(check.passed)
+        self.assertIn("detected", check.detail)
+        self.assertNotIn("DetectorName", check.detail)
 
     def test_hardcoded_endpoint_is_rejected_when_env_migration_is_requested(self) -> None:
         (self.root / "app.py").write_text(

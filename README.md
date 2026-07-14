@@ -406,6 +406,14 @@ literal secret fallbacks, and likely hardcoded secrets or endpoints. If a task
 explicitly requires `gitleaks` or `trufflehog`, an unavailable scanner is
 reported as unavailable and never mislabeled as a clean scan.
 
+External secret scanners run at the final patch gate, not after every worker
+turn. Genesis detects the installed Gitleaks command set (`detect` on older
+versions and `dir` on newer versions), runs independent scanners concurrently,
+and caches results by repository, patch, scanner binary, command, and scanner
+configuration. Install scanners on `PATH`, in `~/go/bin`, or in
+`~/.genesis/tools`; Genesis does not execute binaries discovered in temporary
+download folders.
+
 Each verdict records the reviewed patch SHA and version. A repair creates a new
 patch version, marks the earlier verdict superseded, and requires a fresh
 review. The main repository refuses any patch whose current SHA does not match
@@ -417,7 +425,10 @@ its modification as a reviewable patch. Explicit safe templates such as
 `.env.example` can still be captured even when a broad `.env*` rule ignores
 them.
 
-Parallel execution is available when `runtime.max_parallel_workers` is greater than 1 and multiple workers are configured. Genesis leases non-overlapping file scopes to workers and still applies accepted patches one at a time to the main repository.
+Genesis uses up to three workers by default when independent steps have
+non-overlapping file scopes. A failed branch blocks its dependents but does not
+stop unrelated branches. Accepted patches are still applied one at a time to
+the main repository.
 
 ## Configuration Reference
 
@@ -448,11 +459,12 @@ model = "auto"
 
 [collaboration]
 enabled = true
-max_rounds = 4
+max_rounds = 2
 
 [dialogue]
 enabled = true
-max_turns = 3
+max_turns = 2
+fast_path = true # deterministic preflight passes go directly to independent review
 
 [failover]
 enabled = true
@@ -474,7 +486,7 @@ palace_enabled = true
 [runtime]
 state_db = ""
 retry_budget = 1
-max_parallel_workers = 1
+max_parallel_workers = 3
 checkpoint_mode = "always"
 
 [verification]

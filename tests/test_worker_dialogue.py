@@ -29,7 +29,7 @@ class _Recorder:
 
 
 class WorkerDialogueTests(unittest.TestCase):
-    def _dialogue(self, *, evaluations, max_turns=3, worker_results=None):
+    def _dialogue(self, *, evaluations, max_turns=3, worker_results=None, fast_path=False):
         step = _step()
         results = iter(worker_results or [_result(["a.py"]), _result(["a.py", "test_a.py"]),
                                           _result(["a.py"])])
@@ -48,6 +48,7 @@ class WorkerDialogueTests(unittest.TestCase):
         dlg = WorkerDialogue(
             step=step, worker_name="codex-main", brain_name="claude", max_turns=max_turns,
             run_worker=run_worker, evaluate=evaluate, make_revision=make_revision, post=rec,
+            fast_path=fast_path,
         )
         return dlg.run(), rec
 
@@ -78,6 +79,20 @@ class WorkerDialogueTests(unittest.TestCase):
             for (_, content), kind in zip(rec.posts, rec.kinds)
         ))
         self.assertFalse(any("Revise:" in content for _, content in rec.posts))
+
+    def test_fast_path_skips_redundant_director_review(self) -> None:
+        outcome, rec = self._dialogue(
+            evaluations=[],
+            worker_results=[_result(["a.py"])],
+            fast_path=True,
+        )
+
+        self.assertTrue(outcome.approved)
+        self.assertEqual(1, outcome.turns)
+        self.assertTrue(any(
+            "handing directly to independent review" in content
+            for _, content in rec.posts
+        ))
 
     def test_result_retains_files_from_all_dialogue_turns(self) -> None:
         outcome, _ = self._dialogue(

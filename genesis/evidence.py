@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 import fnmatch
+import hashlib
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
+import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -24,6 +28,9 @@ _ARTIFACT_PARTS = {
 }
 _ARTIFACT_SUFFIXES = {".pyc", ".pyo", ".tmp", ".swp"}
 _ARTIFACT_NAMES = {".coverage", "coverage.xml"}
+_SCANNER_CACHE: dict[tuple[str, ...], "AcceptanceCheck"] = {}
+_SCANNER_CACHE_LOCK = threading.Lock()
+_SCANNER_KEY_LOCKS: dict[tuple[str, ...], threading.Lock] = {}
 
 
 @dataclass(frozen=True)
@@ -100,6 +107,8 @@ def evaluate_acceptance_gates(
     step: "Step",
     patch: "WorktreePatch",
     work_dir: str | Path,
+    *,
+    run_external_scanners: bool = True,
 ) -> AcceptanceGateReport:
     """Evaluate objective acceptance clauses against the actual worktree.
 
@@ -201,8 +210,21 @@ def evaluate_acceptance_gates(
     requested_scanners = [
         name for name in ("gitleaks", "trufflehog") if name in lowered
     ]
-    for scanner in requested_scanners:
-        checks.append(_run_secret_scanner(scanner, root))
+    if run_external_scanners and requested_scanners:
+        snapshot_id = f"{patch.base_sha}:{patch.patch_sha}"
+        with ThreadPoolExecutor(max_workers=min(2, len(requested_scanners))) as pool:
+            futures = [
+                pool.submit(_run_secret_scanner, scanner, root, snapshot_id)
+                for scanner in requested_scanners
+            ]
+            checks.extend(future.result() for future in futures)
+    else:
+        for scanner in requested_scanners:
+            checks.append(AcceptanceCheck(
+                f"secret-scan:{scanner}:deferred",
+                True,
+                f"{scanner} scan deferred until the final patch gate.",
+            ))
 
     return AcceptanceGateReport(checks=checks)
 
@@ -383,41 +405,171 @@ def _hardcoded_secret_lines(
     return findings
 
 
-def _run_secret_scanner(scanner: str, root: Path) -> AcceptanceCheck:
-    executable = shutil.which(scanner)
+def _run_secret_scanner(
+    scanner: str,
+    root: Path,
+    patch_sha: str = "",
+) -> AcceptanceCheck:
+    executable = _find_scanner(scanner)
     if not executable:
         return AcceptanceCheck(
             f"secret-scan:{scanner}",
             False,
             f"{scanner} was explicitly required but is unavailable; do not report the scan as clean.",
         )
-    command = (
-        [executable, "dir", ".", "--no-banner", "--redact"]
-        if scanner == "gitleaks"
-        else [executable, "filesystem", ".", "--no-update", "--fail", "--json"]
-    )
     try:
-        result = subprocess.run(
-            command,
-            cwd=root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=120,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        command = _scanner_command(scanner, executable)
+        binary = Path(executable).resolve()
+        stat = binary.stat()
+    except (OSError, subprocess.SubprocessError) as exc:
         return AcceptanceCheck(
             f"secret-scan:{scanner}",
             False,
-            f"{scanner} could not complete: {exc}",
+            f"{scanner} could not be inspected: {exc}",
         )
-    output = (result.stdout + "\n" + result.stderr).strip().replace("\n", " ")[-600:]
-    return AcceptanceCheck(
-        f"secret-scan:{scanner}",
-        result.returncode == 0,
-        f"{scanner} working-tree scan completed cleanly."
-        if result.returncode == 0
-        else f"{scanner} scan failed with exit {result.returncode}: {output}",
+    cache_key = (
+        "scanner-cache-v2",
+        scanner,
+        str(root.resolve()),
+        patch_sha or "unversioned",
+        str(binary),
+        _file_digest(binary),
+        "\0".join(command),
+        _scanner_config_digest(scanner, root),
     )
+    with _SCANNER_CACHE_LOCK:
+        cached = _SCANNER_CACHE.get(cache_key)
+        key_lock = _SCANNER_KEY_LOCKS.setdefault(cache_key, threading.Lock())
+    if cached is not None:
+        return cached
+
+    with key_lock:
+        with _SCANNER_CACHE_LOCK:
+            cached = _SCANNER_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            result = subprocess.run(
+                command,
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return AcceptanceCheck(
+                f"secret-scan:{scanner}",
+                False,
+                f"{scanner} could not complete: {exc}",
+            )
+        output = (result.stdout + "\n" + result.stderr).strip().replace("\n", " ")[-600:]
+        trufflehog_findings = (
+            scanner == "trufflehog"
+            and "--fail" not in command
+            and bool(result.stdout.strip())
+        )
+        passed = result.returncode == 0 and not trufflehog_findings
+        check = AcceptanceCheck(
+            f"secret-scan:{scanner}",
+            passed,
+            f"{scanner} working-tree scan completed cleanly ({Path(executable).name})."
+            if passed
+            else (
+                "trufflehog detected one or more findings in the working tree."
+                if trufflehog_findings
+                else f"{scanner} scan failed with exit {result.returncode}: {output}"
+            ),
+        )
+        tool_error = any(marker in output.lower() for marker in (
+            "unknown command",
+            "unknown flag",
+            "flag provided but not defined",
+            "not recognized as the name",
+        ))
+        if not tool_error:
+            with _SCANNER_CACHE_LOCK:
+                _SCANNER_CACHE[cache_key] = check
+        return check
+
+
+def _find_scanner(scanner: str) -> str | None:
+    executable_name = scanner + (".exe" if os.name == "nt" else "")
+    candidates: list[Path] = []
+    found = shutil.which(scanner)
+    if found:
+        candidates.append(Path(found))
+    candidates.extend([
+        Path.home() / "go" / "bin" / executable_name,
+        Path.home() / ".genesis" / "tools" / executable_name,
+    ])
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _scanner_command(scanner: str, executable: str) -> list[str]:
+    help_result = subprocess.run(
+        [executable, "--help"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        check=False,
+    )
+    help_text = (help_result.stdout + "\n" + help_result.stderr).lower()
+    if scanner == "gitleaks":
+        # Gitleaks v8.24+ uses `dir`; older supported releases use `detect`.
+        if re.search(r"(?m)^\s*dir\s+", help_text):
+            return [executable, "dir", ".", "--no-banner", "--redact"]
+        return [
+            executable,
+            "detect",
+            "--source", ".",
+            "--no-git",
+            "--no-banner",
+            "--redact",
+        ]
+
+    command = [executable, "filesystem", "--no-verification", "--json"]
+    filesystem_help = subprocess.run(
+        [executable, "filesystem", "--help"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        check=False,
+    )
+    fs_help = (filesystem_help.stdout + "\n" + filesystem_help.stderr).lower()
+    if "--fail" in fs_help:
+        command.append("--fail")
+    command.append(".")
+    return command
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _scanner_config_digest(scanner: str, root: Path) -> str:
+    names = (
+        (".gitleaks.toml", ".gitleaksignore")
+        if scanner == "gitleaks"
+        else (".trufflehog-exclude-paths.txt",)
+    )
+    digest = hashlib.sha256()
+    for name in names:
+        path = root / name
+        digest.update(name.encode("utf-8"))
+        if path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()

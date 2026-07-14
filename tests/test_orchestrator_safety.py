@@ -721,6 +721,72 @@ class OrchestratorSafetyTests(unittest.TestCase):
             self.assertEqual("completed", runtime.get_run("run-parallel").status)
             git.close()
 
+    def test_failed_branch_does_not_stop_an_independent_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.runtime.max_parallel_workers = 2
+            cfg.verification.commands = []
+            cfg.dialogue.enabled = False
+            runtime = RuntimeStore(cfg.runtime.state_db)
+            git = GitManager(str(root), cfg.git)
+            steps = [
+                {
+                    "step_id": "step-1",
+                    "title": "Rejected branch",
+                    "description": "Create rejected.txt.",
+                    "type": "code",
+                    "preferred_agent": "any",
+                    "depends_on": [],
+                    "file_scope": ["rejected.txt"],
+                    "expected_output": "rejected.txt exists.",
+                    "context_hint": "",
+                },
+                {
+                    "step_id": "step-2",
+                    "title": "Independent branch",
+                    "description": "Create accepted.txt.",
+                    "type": "code",
+                    "preferred_agent": "any",
+                    "depends_on": [],
+                    "file_scope": ["accepted.txt"],
+                    "expected_output": "accepted.txt exists.",
+                    "context_hint": "",
+                },
+            ]
+            planner = FakePlanReviewAgent(
+                task_id="run-partial",
+                steps=steps,
+                verdicts_by_step={"step-1": "rejected", "step-2": "approved"},
+            )
+            worker = FakeWorkerAgent(files_by_step={
+                "step-1": ("rejected.txt", "no"),
+                "step-2": ("accepted.txt", "yes"),
+            })
+            orchestrator = Orchestrator(
+                planner,
+                {"worker-a": worker, "worker-b": worker},
+                MemoryManager(str(root / "GENESIS_MEMORY.md")),
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=PalaceStore(cfg.runtime.state_db),
+                policy=ExecutionPolicy(),
+            )
+
+            orchestrator.run_task("run independent branches")
+
+            self.assertFalse((root / "rejected.txt").exists())
+            self.assertEqual("yes\n", (root / "accepted.txt").read_text(encoding="utf-8"))
+            self.assertEqual("blocked", runtime.get_step("run-partial", "step-1").status)
+            self.assertEqual("committed", runtime.get_step("run-partial", "step-2").status)
+            self.assertEqual("blocked", runtime.get_run("run-partial").status)
+            git.close()
+
     def test_retry_scope_includes_downstream_dependents(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

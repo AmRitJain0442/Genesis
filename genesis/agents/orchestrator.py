@@ -108,9 +108,12 @@ When asked to plan a task, return ONLY a JSON object — no prose before or afte
 }
 
 Planning rules:
-- Break tasks into 3–10 concrete, atomic steps — each must produce a real artifact.
-- Use depends_on to express ordering (step-2 depends on step-1 means step-1 runs first).
-- Fill file_scope with concrete files/directories whenever known; use ["*"] for unclear, dependency, config, or repo-wide work.
+- Use the fewest useful steps (usually 1–6); each must produce a real artifact.
+- Maximize safe parallelism. Add depends_on only for a real data/build dependency,
+  never merely because one step appears earlier in the plan.
+- Split independent work into non-overlapping file_scope entries so multiple
+  workers can run at once. Use ["*"] only when repo-wide writes are truly required.
+- Fill file_scope with concrete files/directories whenever known.
 - Write description as if briefing a senior engineer: precise, complete, unambiguous.
 - Study the memory context and do NOT re-plan work that is already done.
 
@@ -283,7 +286,7 @@ class Orchestrator:
         try:
             from genesis.agents.collaboration import BrainCollaboration
 
-            max_rounds = collab_cfg.max_rounds if collab_cfg else 4
+            max_rounds = collab_cfg.max_rounds if collab_cfg else 2
             collab = BrainCollaboration(
                 self.agent, self.co_brain, chatroom=self.chatroom, max_rounds=max_rounds
             )
@@ -659,64 +662,61 @@ class Orchestrator:
         active: dict[Future[_StepExecution], tuple[ScheduledStep, str]] = {}
         active_scopes: dict[str, StepScope] = {}
         active_workers: set[str] = set()
-        halted_new_work = False
-
         fire(
             "on_status",
             f"Executing {len(steps)} steps with up to {max_parallel} parallel worker(s)...",
         )
         with ThreadPoolExecutor(max_workers=max_parallel) as executor:
             while completed < len(steps):
-                if not halted_new_work:
-                    open_slots = max_parallel - len(active)
-                    available_workers = len(
-                        self._eligible_worker_candidates(active_workers)
-                    )
-                    batch = scheduler.select_ready(
-                        committed_ids=committed_ids,
-                        unavailable_ids=blocked_ids | set(active_scopes),
-                        active_scopes=active_scopes.values(),
-                        limit=min(open_slots, available_workers),
-                    )
-                    for scheduled in batch:
-                        step = scheduled.step
-                        worker_name, worker_agent = self._assign_worker(step, unavailable=active_workers)
-                        active_workers.add(worker_name)
-                        active_scopes[step.step_id] = scheduled.scope
-                        fire("on_step_start", step, completed + len(active), len(steps))
-                        fire("on_worker_assigned", step, worker_name)
-                        if self.runtime:
-                            self.runtime.upsert_step(
-                                run_id,
-                                step.step_id,
-                                title=step.title,
-                                status="running",
-                                worker=worker_name,
-                                metadata=self._scope_metadata(scheduled.step, scheduled.scope, lease="active"),
-                            )
-                            self.runtime.record_event(
-                                run_id,
-                                "step_leased",
-                                step_id=step.step_id,
-                                payload={
-                                    "worker": worker_name,
-                                    "effective_scope": list(scheduled.scope.paths),
-                                    "scope_source": scheduled.scope.source,
-                                    "max_parallel": max_parallel,
-                                },
-                            )
-                        future = executor.submit(
-                            self._run_step_in_worktree,
+                open_slots = max_parallel - len(active)
+                available_workers = len(
+                    self._eligible_worker_candidates(active_workers)
+                )
+                batch = scheduler.select_ready(
+                    committed_ids=committed_ids,
+                    unavailable_ids=blocked_ids | set(active_scopes),
+                    active_scopes=active_scopes.values(),
+                    limit=min(open_slots, available_workers),
+                )
+                for scheduled in batch:
+                    step = scheduled.step
+                    worker_name, worker_agent = self._assign_worker(step, unavailable=active_workers)
+                    active_workers.add(worker_name)
+                    active_scopes[step.step_id] = scheduled.scope
+                    fire("on_step_start", step, completed + len(active), len(steps))
+                    fire("on_worker_assigned", step, worker_name)
+                    if self.runtime:
+                        self.runtime.upsert_step(
                             run_id,
-                            plan,
-                            step,
-                            worker_name,
-                            worker_agent,
-                            worktrees,
-                            guarded_output,
-                            worktree_lock,
+                            step.step_id,
+                            title=step.title,
+                            status="running",
+                            worker=worker_name,
+                            metadata=self._scope_metadata(scheduled.step, scheduled.scope, lease="active"),
                         )
-                        active[future] = (scheduled, worker_name)
+                        self.runtime.record_event(
+                            run_id,
+                            "step_leased",
+                            step_id=step.step_id,
+                            payload={
+                                "worker": worker_name,
+                                "effective_scope": list(scheduled.scope.paths),
+                                "scope_source": scheduled.scope.source,
+                                "max_parallel": max_parallel,
+                            },
+                        )
+                    future = executor.submit(
+                        self._run_step_in_worktree,
+                        run_id,
+                        plan,
+                        step,
+                        worker_name,
+                        worker_agent,
+                        worktrees,
+                        guarded_output,
+                        worktree_lock,
+                    )
+                    active[future] = (scheduled, worker_name)
 
                 if not active:
                     reason = (
@@ -785,7 +785,6 @@ class Orchestrator:
                             fire,
                         )
                         blocked_ids.add(step.step_id)
-                        halted_new_work = True
                         continue
 
                     if not execution.patch:
@@ -798,7 +797,6 @@ class Orchestrator:
                             fire,
                         )
                         blocked_ids.add(step.step_id)
-                        halted_new_work = True
                         continue
 
                     if (
@@ -820,7 +818,6 @@ class Orchestrator:
                             fire,
                         )
                         blocked_ids.add(step.step_id)
-                        halted_new_work = True
                         continue
 
                     try:
@@ -829,7 +826,6 @@ class Orchestrator:
                     except Exception as e:
                         self._block_step(run_id, step, "git-apply", f"Patch apply failed: {e}", str(e), fire)
                         blocked_ids.add(step.step_id)
-                        halted_new_work = True
                         continue
 
                     sha = self.git.commit_step(
@@ -847,7 +843,6 @@ class Orchestrator:
                             fire,
                         )
                         blocked_ids.add(step.step_id)
-                        halted_new_work = True
                         continue
                     if sha and self.config.git.auto_push:
                         self.git.push()
@@ -882,9 +877,6 @@ class Orchestrator:
                     committed_ids.add(step.step_id)
                     completed += 1
                     fire("on_step_complete", step, execution.review, completed, len(steps))
-
-                if halted_new_work and not active:
-                    break
 
         if completed == len(steps) and not blocked_ids:
             release_summary = self._release_summary(plan, completed, len(steps))
@@ -1575,7 +1567,12 @@ class Orchestrator:
     ) -> dict:
         guard = evaluate_patch_evidence(step, patch) if step is not None else None
         gates = (
-            evaluate_acceptance_gates(step, patch, work_dir)
+            evaluate_acceptance_gates(
+                step,
+                patch,
+                work_dir,
+                run_external_scanners=False,
+            )
             if step is not None and work_dir is not None
             else None
         )
@@ -1613,6 +1610,7 @@ class Orchestrator:
             post=lambda sender, role, content, kind="message": self._post_step(
                 step_room, sender, role, content, kind),
             on_status=output_callback,
+            fast_path=getattr(self.config.dialogue, "fast_path", True),
         )
         outcome = dialogue.run()
         if output_callback:
