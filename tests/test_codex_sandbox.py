@@ -2,7 +2,7 @@ import unittest
 from unittest import mock
 
 from genesis.agents.base import AgentInfo
-from genesis.agents.codex_cli import CodexCLIAgent
+from genesis.agents.codex_cli import CodexCLIAgent, _InactivityWatchdog
 
 
 class SandboxFlagTests(unittest.TestCase):
@@ -41,6 +41,44 @@ class SandboxFlagTests(unittest.TestCase):
                 ["--dangerously-bypass-approvals-and-sandbox"],
                 worker._sandbox_flags(True),
             )
+
+
+class InactivityWatchdogTests(unittest.TestCase):
+    def test_activity_replaces_deadline_and_stale_timer_cannot_fire(self):
+        timers = []
+        fired = []
+
+        class FakeTimer:
+            def __init__(self, timeout, callback):
+                self.timeout = timeout
+                self.callback = callback
+                self.cancelled = False
+                self.started = False
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                self.cancelled = True
+
+        watchdog = _InactivityWatchdog(
+            600,
+            lambda: fired.append(True),
+            timer_factory=FakeTimer,
+        )
+        watchdog.start()
+        first = timers[-1]
+        watchdog.touch()
+        second = timers[-1]
+
+        self.assertTrue(first.cancelled)
+        self.assertTrue(second.started)
+        first.callback()
+        self.assertEqual([], fired)
+        second.callback()
+        self.assertEqual([True], fired)
 
 
 if __name__ == "__main__":

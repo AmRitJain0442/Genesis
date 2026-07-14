@@ -43,7 +43,7 @@ timeout = 300               # seconds per call
 [codex_cli]
 # Requires: Codex CLI installed + logged in via `codex login`
 command = "codex"           # auto-detected from PATH
-timeout = 600               # codex tasks take longer (it runs code)
+timeout = 600               # worker inactivity timeout; active JSONL events reset it
 
 # ── Multiple Codex accounts ────────────────────────────────────────────────
 # Add one [[codex_cli.accounts]] block per ChatGPT Pro account.

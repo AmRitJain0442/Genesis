@@ -82,8 +82,31 @@ class CodexWorker:
         before = self._snapshot()
 
         try:
-            summary = self.agent.execute_task(prompt, output_callback=self.output_callback)
+            # Always use streaming execution so the inactivity watchdog can
+            # observe progress even when no UI callback is configured.
+            callback = self.output_callback or (lambda _message: None)
+            summary = self.agent.execute_task(prompt, output_callback=callback)
         except Exception as e:
+            files_written = self._diff(before)
+            is_timeout = (
+                "timed out" in str(e).lower()
+                or "no activity for" in str(e).lower()
+            )
+            if is_timeout and files_written:
+                logger.warning(
+                    "Codex became inactive after changing %d file(s); preserving partial work",
+                    len(files_written),
+                )
+                return WorkerResult(
+                    step_id=step.step_id,
+                    raw_response="",
+                    result_text=(
+                        f"Codex became inactive, but {len(files_written)} changed "
+                        "file(s) were preserved for review and continuation."
+                    ),
+                    files_written=files_written,
+                    success=True,
+                )
             logger.error("CodexWorker error on %s: %s", step.step_id, e, exc_info=True)
             return WorkerResult(
                 step_id=step.step_id,

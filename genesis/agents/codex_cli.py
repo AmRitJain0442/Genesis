@@ -24,6 +24,52 @@ from genesis.agents.base import BaseAgent, AgentInfo, terminate_process_tree
 logger = logging.getLogger(__name__)
 
 
+class _InactivityWatchdog:
+    """Resettable, race-safe timer used by streaming worker executions."""
+
+    def __init__(self, timeout: float, on_timeout, timer_factory=threading.Timer):
+        self.timeout = timeout
+        self.on_timeout = on_timeout
+        self.timer_factory = timer_factory
+        self._lock = threading.Lock()
+        self._timer = None
+        self._generation = 0
+        self._stopped = False
+
+    def start(self) -> None:
+        self.touch()
+
+    def touch(self) -> None:
+        with self._lock:
+            if self._stopped:
+                return
+            self._generation += 1
+            generation = self._generation
+            if self._timer is not None:
+                self._timer.cancel()
+            timer = self.timer_factory(
+                self.timeout,
+                lambda: self._fire(generation),
+            )
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+
+    def _fire(self, generation: int) -> None:
+        with self._lock:
+            if self._stopped or generation != self._generation:
+                return
+            self._stopped = True
+        self.on_timeout()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._stopped = True
+            self._generation += 1
+            if self._timer is not None:
+                self._timer.cancel()
+
+
 def find_codex_binary() -> str | None:
     """Return the path to the `codex` binary, or None if not found."""
     return shutil.which("codex")
@@ -298,20 +344,21 @@ class CodexCLIAgent(BaseAgent):
         except (BrokenPipeError, OSError):
             pass
 
-        # Streaming reads block indefinitely, so enforce the configured timeout
-        # with a watchdog that kills the process and ends the stdout iterator.
+        # Treat the configured interval as an inactivity timeout. Long-running
+        # workers remain alive while JSONL progress events continue to arrive.
         timed_out = threading.Event()
 
         def _abort_on_timeout() -> None:
             timed_out.set()
             terminate_process_tree(proc)
 
-        watchdog = threading.Timer(self.timeout, _abort_on_timeout)
+        watchdog = _InactivityWatchdog(self.timeout, _abort_on_timeout)
         watchdog.start()
 
         last_message = ""
         try:
             for raw_line in proc.stdout:
+                watchdog.touch()
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -372,7 +419,9 @@ class CodexCLIAgent(BaseAgent):
             stderr_thread.join(timeout=5)
 
         if timed_out.is_set():
-            raise RuntimeError(f"Codex timed out after {self.timeout}s")
+            raise RuntimeError(
+                f"Codex produced no activity for {self.timeout}s and was stopped"
+            )
 
         if proc.returncode != 0 and not last_message:
             stderr = "".join(stderr_chunks).strip()

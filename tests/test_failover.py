@@ -161,6 +161,42 @@ class WorkerFailoverTests(unittest.TestCase):
         self.assertEqual("codex-pro2", state["name"])          # took over
         self.assertIn("codex-main", orch.registry.exhausted_names())
 
+    def test_inactive_worker_fails_over_without_marking_quota_exhausted(self) -> None:
+        A = types.SimpleNamespace(name="codex-main")
+        B = types.SimpleNamespace(name="codex-pro2")
+
+        def fake_make_worker(agent, mem, wd, output_callback=None):
+            if agent is A:
+                return types.SimpleNamespace(execute=lambda s: WorkerResult(
+                    step_id=s.step_id,
+                    raw_response="",
+                    result_text="",
+                    success=False,
+                    error="Codex produced no activity for 600s and was stopped",
+                ))
+            return types.SimpleNamespace(execute=lambda s: WorkerResult(
+                step_id=s.step_id,
+                raw_response="",
+                result_text="continued",
+                files_written=["x.py"],
+                success=True,
+            ))
+
+        orig = orch_mod._make_worker
+        orch_mod._make_worker = fake_make_worker
+        try:
+            orch = _orch({"codex-main": A, "codex-pro2": B})
+            state = {"name": "codex-main", "agent": A}
+            result = orch._worker_execute_with_failover(
+                _step(), ".", None, state, ""
+            )
+        finally:
+            orch_mod._make_worker = orig
+
+        self.assertTrue(result.success)
+        self.assertEqual("codex-pro2", state["name"])
+        self.assertNotIn("codex-main", orch.registry.exhausted_names())
+
     def test_no_alternate_surfaces_exhaustion(self) -> None:
         A = types.SimpleNamespace(name="codex-main")
 

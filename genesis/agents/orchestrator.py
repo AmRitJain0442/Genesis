@@ -1795,6 +1795,16 @@ class Orchestrator:
         self._post_step(room_id, name, "system",
                         f"{name} hit its rate/usage limit{target}", "status")
 
+    def _notify_timeout_failover(self, name: str, room_id: str, alt: str) -> None:
+        logger.warning("Worker '%s' became inactive; routing to %s", name, alt)
+        self._post_step(
+            room_id,
+            name,
+            "system",
+            f"{name} stopped producing activity — continuing with {alt}",
+            "status",
+        )
+
     def _brain_candidates(self, primary: BaseAgent) -> list[BaseAgent]:
         """Ordered, de-duplicated brain-capable agents for a role: the preferred
         agent, the two brains, then any account (each CLI can plan/review)."""
@@ -1874,16 +1884,26 @@ class Orchestrator:
                 output_callback=output_callback,
             )
             result = worker.execute(step)
-            if result.success or not self._failover_enabled() or not is_exhaustion_error(result.error):
+            exhausted = is_exhaustion_error(result.error)
+            inactive = (
+                "timed out" in (result.error or "").lower()
+                or "no activity for" in (result.error or "").lower()
+            )
+            if result.success or not self._failover_enabled() or not (exhausted or inactive):
                 return result
 
-            self.registry.mark_exhausted(name)
+            if exhausted:
+                self.registry.mark_exhausted(name)
             alt = self._alternate_worker(step, exclude=tried)
             if alt is None:
-                self._notify_failover(name, room_id)
-                return result   # nobody left to take over — surface the exhaustion
+                if exhausted:
+                    self._notify_failover(name, room_id)
+                return result   # nobody left to take over — surface the failure
             alt_name, alt_agent = alt
-            self._notify_failover(name, room_id, alt=alt_name)
+            if exhausted:
+                self._notify_failover(name, room_id, alt=alt_name)
+            else:
+                self._notify_timeout_failover(name, room_id, alt_name)
             state["name"], state["agent"] = alt_name, alt_agent
 
     @staticmethod
