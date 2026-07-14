@@ -100,6 +100,36 @@ class PrepareMainTests(unittest.TestCase):
             self._git_output("diff", "--cached", "--name-only").splitlines(),
         )
 
+    def test_capture_patch_includes_worker_commits_on_takeover_branch(self):
+        (self.repo / "seed.py").write_text("old\n", encoding="utf-8")
+        _git(self.repo, "add", "seed.py")
+        _git(self.repo, "commit", "-m", "init")
+        manager = self._wt()
+        worktree = manager.create("run", "step")
+        try:
+            _git(worktree, "switch", "-c", "takeover/test")
+            (worktree / "seed.py").write_text("new\n", encoding="utf-8")
+            _git(worktree, "add", "seed.py")
+            _git(worktree, "commit", "-m", "worker committed implementation")
+            (worktree / "added.py").write_text("value = 1\n", encoding="utf-8")
+            _git(worktree, "add", "added.py")
+            _git(worktree, "commit", "-m", "worker committed final documentation")
+
+            patch = manager.capture_patch(worktree)
+
+            self.assertEqual(["added.py", "seed.py"], patch.changed_files)
+            self.assertTrue(patch.has_changes)
+            self.assertIn("added.py", patch.patch_text)
+            manager.apply_check(patch.patch_text)
+            manager.apply_patch(patch.patch_text)
+            self.assertEqual("new\n", (self.repo / "seed.py").read_text(encoding="utf-8"))
+            self.assertEqual(
+                "value = 1\n",
+                (self.repo / "added.py").read_text(encoding="utf-8"),
+            )
+        finally:
+            manager.remove(worktree)
+
 
 if __name__ == "__main__":
     unittest.main()

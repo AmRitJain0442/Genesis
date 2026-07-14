@@ -33,11 +33,17 @@ class DialogueOutcome:
     last_step: "Step"       # the (possibly revised) step behind the final result
 
 
-def _summary(result: "WorkerResult", turn: int) -> str:
-    files = getattr(result, "files_written", None) or []
-    head = f"Turn {turn}: wrote {len(files)} file(s)"
-    if files:
-        head += ": " + ", ".join(files)
+def _summary(
+    result: "WorkerResult",
+    turn: int,
+    files: list[str] | None = None,
+) -> str:
+    files = list(files if files is not None else (getattr(result, "files_written", None) or []))
+    head = (
+        f"Turn {turn}: wrote {len(files)} file(s): {', '.join(files)}"
+        if files
+        else f"Turn {turn}: completed without file changes"
+    )
     note = (getattr(result, "result_text", "") or "").strip().splitlines()
     if note:
         head += f"\n{note[0][:200]}"
@@ -80,20 +86,68 @@ class WorkerDialogue:
         result = None
         approved = False
         turns = 0
+        cumulative_files: list[str] = []
         sid = self.step.step_id
         cap = self.max_turns
 
         for turn in range(1, self.max_turns + 1):
             turns = turn
             self._status(f"{self.worker_name} implementing {sid} (turn {turn}/{cap})...")
+            self.post(
+                self.worker_name,
+                "worker",
+                f"Actively working on {sid} (turn {turn}/{cap})...",
+                "status",
+            )
             result = self.run_worker(current)
-            self.post(self.worker_name, "worker", _summary(result, turn), "code")
+
+            turn_files = list(getattr(result, "files_written", None) or [])
+            for path in turn_files:
+                if path not in cumulative_files:
+                    cumulative_files.append(path)
+            # Each Codex turn reports only files changed during that turn. Keep
+            # the cumulative manifest on the result handed to later brain and
+            # independent-review phases so earlier implementation evidence is
+            # never lost when the final turn touches just one file.
+            try:
+                result.files_written = list(cumulative_files)
+            except Exception:
+                pass
+            result_text = (getattr(result, "result_text", "") or "").strip()
+            made_progress = bool(turn_files or result_text)
+            if made_progress:
+                self.post(
+                    self.worker_name,
+                    "worker",
+                    _summary(result, turn, turn_files),
+                    "code",
+                )
+            elif getattr(result, "success", False):
+                retrying = turn < self.max_turns
+                status = (
+                    f"No file changes returned on turn {turn}; retrying implementation."
+                    if retrying
+                    else f"No file changes returned on turn {turn}."
+                )
+                self._status(status)
+                self.post(self.worker_name, "worker", status, "status")
 
             if not getattr(result, "success", False):
                 self._status(f"{self.worker_name} failed on {sid} - handing to review")
                 self.post(self.brain_name, "brain",
                           f"Worker failed: {getattr(result, 'error', '') or 'unknown error'}", "status")
                 break
+
+            # An empty successful CLI response is not reviewable. Retry it
+            # directly without spending a brain call or posting a misleading
+            # "wrote 0 files" implementation message.
+            if not made_progress and turn < self.max_turns:
+                current = self.make_revision(
+                    current,
+                    "No output or file changes were produced. Execute the step now "
+                    "and make the concrete requested changes.",
+                )
+                continue
 
             if turn >= self.max_turns:
                 self._status(f"Turn budget reached on {sid} - handing to independent review")

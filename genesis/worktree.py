@@ -117,10 +117,29 @@ class WorktreeManager:
         path = Path(worktree_path).resolve()
         self._assert_under(path, self.worktrees_root.resolve())
         # Stage only inside the isolated worktree so untracked files appear in
-        # the binary patch. The main repository index is not touched.
+        # the binary patch. The main repository index is not touched. Compare
+        # the staged worktree against its shared base with main, rather than
+        # only against the worktree's HEAD: autonomous workers may create a
+        # takeover branch and commit their work before Genesis captures it.
         self._git_in(path, "add", "-A")
-        patch = self._git_in(path, "diff", "--cached", "--binary").stdout
-        changed = self._git_in(path, "diff", "--cached", "--name-only").stdout.splitlines()
+        main_head = self._git("rev-parse", "HEAD").stdout.strip()
+        worktree_head = self._git_in(path, "rev-parse", "HEAD").stdout.strip()
+        merge_base = self._git_in(
+            path,
+            "merge-base",
+            worktree_head,
+            main_head,
+        ).stdout.strip()
+        if not merge_base:
+            raise RuntimeError(
+                "worker history no longer shares a base with the main repository"
+            )
+        patch = self._git_in(
+            path, "diff", "--cached", "--binary", merge_base
+        ).stdout
+        changed = self._git_in(
+            path, "diff", "--cached", "--name-only", merge_base
+        ).stdout.splitlines()
         return WorktreePatch(
             worktree_path=str(path),
             patch_text=patch,

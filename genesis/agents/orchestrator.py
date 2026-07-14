@@ -948,8 +948,9 @@ class Orchestrator:
                 return execution
 
             patch = worktrees.capture_patch(worktree_path)
-            if patch.changed_files:
-                result.files_written = patch.changed_files
+            # The captured patch is the authoritative review manifest. Never
+            # leave a final-turn-only file list attached to an empty patch.
+            result.files_written = patch.changed_files
             execution.patch = patch
             execution.patch_id = self._store_patch(run_id, step.step_id, patch)
             if self.runtime:
@@ -971,6 +972,22 @@ class Orchestrator:
                         "repair_attempts": execution.repair_attempts,
                     },
                 )
+
+            if not patch.has_changes:
+                execution.failed_agent = worker_name
+                execution.failed_reason = (
+                    "Worker completed without a reviewable patch. No reviewer "
+                    "was called because the changed-file manifest is empty."
+                )
+                execution.memory_note = execution.failed_reason
+                self._post_step(
+                    step_room,
+                    worker_name,
+                    "worker",
+                    execution.failed_reason,
+                    "status",
+                )
+                return execution
 
             review = self.review(
                 step,
@@ -1036,8 +1053,7 @@ class Orchestrator:
                     execution.review = review
                     break
                 patch = worktrees.capture_patch(worktree_path)
-                if patch.changed_files:
-                    result.files_written = patch.changed_files
+                result.files_written = patch.changed_files
                 execution.patch = patch
                 execution.patch_id = self._store_patch(run_id, step.step_id, patch)
                 if self.runtime:
@@ -1131,8 +1147,7 @@ class Orchestrator:
                         return execution
 
                     patch = worktrees.capture_patch(worktree_path)
-                    if patch.changed_files:
-                        result.files_written = patch.changed_files
+                    result.files_written = patch.changed_files
                     execution.patch = patch
                     execution.patch_id = self._store_patch(run_id, step.step_id, patch)
                     if self.runtime:

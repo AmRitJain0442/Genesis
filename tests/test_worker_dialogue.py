@@ -21,9 +21,11 @@ def _step(step_id="s1"):
 class _Recorder:
     def __init__(self):
         self.posts = []
+        self.kinds = []
 
     def __call__(self, sender, role, content, kind="message"):
         self.posts.append((role, content))
+        self.kinds.append(kind)
 
 
 class WorkerDialogueTests(unittest.TestCase):
@@ -53,10 +55,43 @@ class WorkerDialogueTests(unittest.TestCase):
         outcome, rec = self._dialogue(evaluations=[(False, "add tests"), (True, "")])
         self.assertTrue(outcome.approved)
         self.assertEqual(2, outcome.turns)
-        roles = [r for r, _ in rec.posts]
+        roles = [
+            role
+            for (role, _), kind in zip(rec.posts, rec.kinds)
+            if kind != "status"
+        ]
         # worker, brain(revise), worker, brain(approve)
         self.assertEqual(["worker", "brain", "worker", "brain"], roles)
         self.assertIn("Revise: add tests", [c for _, c in rec.posts])
+
+    def test_empty_turn_is_status_only_and_retries_without_brain_noise(self) -> None:
+        outcome, rec = self._dialogue(
+            evaluations=[(True, "")],
+            worker_results=[_result(files=[], text=""), _result(["a.py"])],
+        )
+
+        self.assertTrue(outcome.approved)
+        self.assertEqual(2, outcome.turns)
+        self.assertFalse(any("wrote 0" in content for _, content in rec.posts))
+        self.assertTrue(any(
+            kind == "status" and "Actively working" in content
+            for (_, content), kind in zip(rec.posts, rec.kinds)
+        ))
+        self.assertFalse(any("Revise:" in content for _, content in rec.posts))
+
+    def test_result_retains_files_from_all_dialogue_turns(self) -> None:
+        outcome, _ = self._dialogue(
+            evaluations=[(False, "add docs"), (True, "")],
+            worker_results=[
+                _result(["app.py", "tests/test_app.py"]),
+                _result(["SECURITY.md"]),
+            ],
+        )
+
+        self.assertEqual(
+            ["app.py", "tests/test_app.py", "SECURITY.md"],
+            outcome.result.files_written,
+        )
 
     def test_hits_turn_budget_without_approval(self) -> None:
         outcome, rec = self._dialogue(evaluations=[(False, "more"), (False, "more")], max_turns=2)
