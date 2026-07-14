@@ -73,6 +73,68 @@ def _step(step_id="s1", stype="code"):
 
 
 class WorkerFailoverTests(unittest.TestCase):
+    @staticmethod
+    def _agent(name: str, *, reserve: bool = False):
+        return types.SimpleNamespace(
+            name=name,
+            provider="codex-cli",
+            reserve=reserve,
+        )
+
+    def test_reserve_worker_is_skipped_while_terra_workers_have_quota(self) -> None:
+        reserve = self._agent("CODEX-200", reserve=True)
+        terra_1 = self._agent("Codex-harshita")
+        terra_2 = self._agent("Codex-post-1")
+        terra_3 = self._agent("Codex-post-2")
+        orch = _orch({
+            "CODEX-200": reserve,
+            "Codex-harshita": terra_1,
+            "Codex-post-1": terra_2,
+            "Codex-post-2": terra_3,
+        })
+
+        assigned = [
+            orch._assign_worker(_step(), unavailable=set())[0],
+            orch._assign_worker(_step(), unavailable={"Codex-harshita"})[0],
+            orch._assign_worker(
+                _step(),
+                unavailable={"Codex-harshita", "Codex-post-1"},
+            )[0],
+        ]
+
+        self.assertEqual(
+            ["Codex-harshita", "Codex-post-1", "Codex-post-2"],
+            assigned,
+        )
+        with self.assertRaisesRegex(RuntimeError, "No worker agents available"):
+            orch._assign_worker(
+                _step(),
+                unavailable={"Codex-harshita", "Codex-post-1", "Codex-post-2"},
+            )
+
+    def test_reserve_worker_unlocks_only_after_all_terra_workers_exhaust(self) -> None:
+        reserve = self._agent("CODEX-200", reserve=True)
+        terra_names = ["Codex-harshita", "Codex-post-1", "Codex-post-2"]
+        workers = {"CODEX-200": reserve}
+        workers.update({name: self._agent(name) for name in terra_names})
+        orch = _orch(workers)
+        for name in terra_names:
+            orch.registry.mark_exhausted(name)
+
+        name, agent = orch._assign_worker(_step())
+
+        self.assertEqual("CODEX-200", name)
+        self.assertIs(reserve, agent)
+
+    def test_brain_failover_orders_reserve_worker_last(self) -> None:
+        reserve = self._agent("CODEX-200", reserve=True)
+        terra = self._agent("Codex-harshita")
+        orch = _orch({"CODEX-200": reserve, "Codex-harshita": terra})
+
+        names = [agent.name for agent in orch._brain_candidates(orch.agent)]
+
+        self.assertLess(names.index("Codex-harshita"), names.index("CODEX-200"))
+
     def test_exhausted_worker_fails_over_to_another_account(self) -> None:
         A = types.SimpleNamespace(name="codex-main")
         B = types.SimpleNamespace(name="codex-pro2")

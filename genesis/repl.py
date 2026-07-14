@@ -326,10 +326,16 @@ class GenesisREPL:
             accounts = cfg.codex_cli.accounts
             if not accounts and not cfg.codex_cli.accounts_explicit:
                 accounts = [CodexAccount(name="codex-main", home="", model=cfg.codex_cli.model)]
+            # A reserve login must not spend quota on planning/review before the
+            # normal worker accounts have even had a chance to run.
+            brain_index = next(
+                (i for i, account in enumerate(accounts) if not account.reserve),
+                0,
+            )
             for i, account in enumerate(accounts):
                 model = account.model if account.model != "auto" else "auto"
-                # Orchestrator slot: first account only (claude-cli preferred)
-                if i == 0:
+                # Orchestrator slot: first non-reserve account (Claude preferred)
+                if i == brain_index:
                     self._agents["codex-orchestrator"] = CodexCLIAgent(
                         AgentInfo("codex-orchestrator", "codex-cli", model, max_tokens=8096),
                         command=codex_cmd,
@@ -337,6 +343,7 @@ class GenesisREPL:
                         work_dir=self.work_dir,
                         codex_home=account.home,
                         reasoning=account.reasoning,
+                        reserve=False,
                     )
                 # Every account registers as a worker
                 worker_key = account.name if account.name else f"codex-worker-{i+1}"
@@ -347,6 +354,7 @@ class GenesisREPL:
                     work_dir=self.work_dir,
                     codex_home=account.home,
                     reasoning=account.reasoning,
+                    reserve=account.reserve,
                 )
 
         # ChatGPT browser agent (optional — requires playwright)
@@ -706,7 +714,7 @@ class GenesisREPL:
 
         console.print(command_panel(f"[bold]{markup(task, 120)}[/bold]", "PLAN PREVIEW", border_style="cyan"))
         try:
-            plan = orchestrator.plan(task)
+            plan = orchestrator.plan_and_save(task)
         except Exception as e:
             console.print(f"[red]Planning failed: {e}[/red]")
             return
@@ -732,6 +740,10 @@ class GenesisREPL:
             )
 
         console.print(tbl)
+        console.print(
+            f"[dim]Saved as run {markup(plan.task_id)}; "
+            f"`run {markup(task, 80)}` will reuse this plan.[/dim]"
+        )
 
     @staticmethod
     def _agent_account_label(agent) -> str:

@@ -1,12 +1,70 @@
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import genesis.config as config_mod
+from genesis.config import CodexAccount, GenesisConfig
+from genesis.repl import GenesisREPL
 from genesis.repl import _rewrite_codex_accounts_text
 
 
 class CodexAccountConfigTests(unittest.TestCase):
+    def test_reserve_account_is_not_used_as_codex_brain(self) -> None:
+        repl = GenesisREPL.__new__(GenesisREPL)
+        repl.config = GenesisConfig()
+        repl.work_dir = "."
+        repl._orch_provider = "claude-cli"
+        repl._worker_provider = "codex-cli"
+        repl.config.codex_cli.accounts = [
+            CodexAccount(
+                name="CODEX-200",
+                home="reserve-home",
+                reserve=True,
+            ),
+            CodexAccount(
+                name="terra",
+                home="terra-home",
+                model="gpt-5.6-terra",
+            ),
+        ]
+        repl.config.codex_cli.accounts_explicit = True
+
+        with (
+            mock.patch("genesis.repl.find_claude_binary", return_value=None),
+            mock.patch("genesis.repl.find_codex_binary", return_value="codex"),
+        ):
+            repl._build_agents()
+
+        self.assertEqual("terra-home", repl._agents["codex-orchestrator"].codex_home)
+        self.assertFalse(repl._agents["codex-orchestrator"].reserve)
+        self.assertTrue(repl._agents["CODEX-200"].reserve)
+
+    def test_loader_marks_reserve_account(self) -> None:
+        original_file = config_mod.CONFIG_FILE
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                """\
+[[codex_cli.accounts]]
+name = "terra"
+
+[[codex_cli.accounts]]
+name = "codex-200"
+reserve = true
+""",
+                encoding="utf-8",
+            )
+            try:
+                config_mod.CONFIG_FILE = path
+                loaded = config_mod.load_config()
+            finally:
+                config_mod.CONFIG_FILE = original_file
+
+        terra, reserve = loaded.codex_cli.accounts
+        self.assertFalse(terra.reserve)
+        self.assertTrue(reserve.reserve)
+
     def test_remove_one_codex_account_preserves_remaining_blocks(self) -> None:
         text = """\
 [codex_cli]

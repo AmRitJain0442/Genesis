@@ -56,10 +56,11 @@ name  = "codex-main"        # used as the worker key in Genesis
 home  = ""                  # empty = default ~/.codex (your current login)
 model = "auto"              # pin e.g. "gpt-5.6-sol" for the Codex brain
 # reasoning = "high"        # model_reasoning_effort: minimal|low|medium|high
+# reserve = false            # true = use only after normal Codex accounts exhaust
                             # (the "high" in "gpt-5.6-sol high"); omit for default
 #
-# The FIRST codex account is also the Codex brain (co-planner / reviewer). To
-# make it e.g. "gpt-5.6-sol high", set model = "gpt-5.6-sol" and reasoning = "high".
+# The first non-reserve Codex account is also the Codex brain (co-planner /
+# reviewer). Reserve accounts remain dormant until normal Codex workers exhaust.
 
 # Uncomment and fill in additional accounts:
 # [[codex_cli.accounts]]

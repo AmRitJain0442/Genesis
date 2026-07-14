@@ -117,6 +117,7 @@ class CodexAccount:
     home: str = ""          # CODEX_HOME — empty = system default (~/.codex)
     model: str = "auto"
     reasoning: str = ""     # model_reasoning_effort: "", minimal, low, medium, high
+    reserve: bool = False    # use only after normal accounts exhaust their limits
 
 
 @dataclass
@@ -278,6 +279,7 @@ def load_config() -> GenesisConfig:
                 home=a.get("home", ""),
                 model=a.get("model", "auto"),
                 reasoning=a.get("reasoning", ""),
+                reserve=bool(a.get("reserve", False)),
             )
             for i, a in enumerate(accounts_data)
             if isinstance(a, dict)

@@ -217,7 +217,7 @@ If either CLI is missing, run `claude login` or `codex login` again in the same 
 | Command | Description |
 | --- | --- |
 | `run <task>` | Execute a task through the AI orchestrator. |
-| `plan <task>` | Generate and preview a plan without executing it. |
+| `plan <task>` | Generate, save, and preview a plan without executing it. |
 | `resume <run_id>` | Resume a durable run from stored state. |
 | `retry <run_id> <step_id>` | Retry a blocked step, then continue the run. |
 | `runs` | Show recent durable runs. |
@@ -245,6 +245,12 @@ If either CLI is missing, run `claude login` or `codex login` again in the same 
 ## Codex Account Management
 
 Genesis can register multiple Codex accounts as separate workers. Each account uses a separate `CODEX_HOME` directory and its own login session.
+
+Set `reserve = true` on a last-resort account to keep it out of normal worker
+assignment and the Codex brain slot. Genesis unlocks that account only after
+every non-reserve Codex worker has reported a rate, usage, or quota limit;
+workers that are merely busy do not unlock it. All Codex worker accounts use
+the same write-enabled execution mode inside their isolated git worktrees.
 
 Add an account:
 
@@ -288,11 +294,19 @@ The live dashboard is designed for repeated software work rather than a one-off 
 
 Static REPL views use the same command-center styling. `status` shows the agent roster and runtime controls, `runs` lists recent runs, `inspect <run_id>` opens the diagnostic view, and `plan <task>` previews dependencies and file scopes before execution.
 
+Plans are retained in SQLite as soon as planning completes. Running the same
+task text reuses its saved unfinished plan; interrupted runs continue from their
+stored step state, and repeating a blocked task retries its blocked portion
+without paying for another planning pass.
+
 ## Memory
 
 Genesis writes a `GENESIS_MEMORY.md` file to the root of your repository. This records task plans, step outcomes, review verdicts, and completion timestamps.
 
-The memory file is injected into planning and review prompts so the orchestrator understands what already exists before it proposes new work.
+Workers and reviewers receive the retained task, complete plan, dependency
+state, prior step results, and project memory. Review prompts include a bounded
+sample of large patches plus a bounded changed-file manifest, preventing a
+generated or binary file from overflowing the reviewer's context window.
 
 Genesis also keeps a local SQLite state database:
 
@@ -343,6 +357,12 @@ Genesis runs workers in isolated git worktrees under:
 ```text
 ~/.genesis/worktrees/
 ```
+
+A task can start with tracked, staged, or untracked local changes. Genesis first
+preserves those changes in a visible `[genesis] checkpoint` commit, then creates
+isolated worktrees from that exact project state. In a brand-new `git init`
+repository, this checkpoint also becomes the initial commit. Genesis runtime
+state and the configured memory file are excluded from the checkpoint.
 
 A worker patch is captured, stored in SQLite, reviewed, verified in isolation, checked with `git apply --check`, then applied to the main repository and committed. Failed or rejected steps leave the main repository unchanged and can be inspected or retried.
 

@@ -55,6 +55,7 @@ class CodexCLIAgent(BaseAgent):
         work_dir: str = ".",
         codex_home: str = "",   # empty = use system default (~/.codex)
         reasoning: str = "",    # model_reasoning_effort; empty = account default
+        reserve: bool = False,   # last-resort account after normal accounts exhaust
     ):
         super().__init__(info)
         self.command = command
@@ -63,6 +64,7 @@ class CodexCLIAgent(BaseAgent):
         # Normalise codex_home to OS path (config may use forward slashes on Windows)
         self.codex_home = str(Path(codex_home)) if codex_home else ""
         self.reasoning = (reasoning or "").strip()
+        self.reserve = bool(reserve)
 
     # ── BaseAgent interface ────────────────────────────────────────────────
 
@@ -107,6 +109,7 @@ class CodexCLIAgent(BaseAgent):
             work_dir=work_dir,
             codex_home=self.codex_home,
             reasoning=self.reasoning,
+            reserve=self.reserve,
         )
 
     @staticmethod

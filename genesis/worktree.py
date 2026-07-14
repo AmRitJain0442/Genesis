@@ -34,41 +34,73 @@ class WorktreeManager:
         return self._git("rev-parse", "--verify", "--quiet", "HEAD",
                           check=False).returncode == 0
 
-    def ensure_clean_main(self, ignore_paths: list[str] | None = None) -> None:
-        # A brand-new `git init` (no commit yet) has no HEAD to create worktrees
-        # from. That's a different problem from a dirty tree, so report it plainly
-        # instead of the misleading "commit or stash current changes".
-        if not self.has_head():
-            raise RuntimeError(
-                "This repository has no commits yet, so Genesis has no base "
-                "revision to build from. Make an initial commit first:\n"
-                '    git add -A && git commit -m "initial commit"'
-            )
+    def prepare_main(self, ignore_paths: list[str] | None = None) -> str | None:
+        """Create a recoverable base revision for isolated execution.
 
-        ignored = [p.replace("\\", "/").lstrip("./") for p in (ignore_paths or [])]
-        dirty = []
-        for line in self._git("status", "--porcelain").stdout.splitlines():
-            path = line[3:].replace("\\", "/").lstrip("./")
-            if " -> " in path:
-                path = path.split(" -> ", 1)[1]
-            if any(path == item or path.startswith(item.rstrip("/") + "/") for item in ignored):
-                continue
-            dirty.append(line)
-        if dirty:
-            preview = "\n".join("    " + line for line in dirty[:10])
-            more = f"\n    ... and {len(dirty) - 10} more" if len(dirty) > 10 else ""
-            only_untracked = all(line.startswith("??") for line in dirty)
-            hint = (
-                "These are untracked files. Commit them so Genesis uses them as "
-                "the base (git add -A && git commit), or add them to .gitignore."
-                if only_untracked else
-                "Commit or stash these changes before running "
-                "(e.g. git add -A && git commit)."
-            )
-            raise RuntimeError(
-                "Genesis isolated execution requires a clean git worktree, but "
-                f"found {len(dirty)} uncommitted change(s):\n{preview}{more}\n{hint}"
-            )
+        Git worktrees require a commit to branch from. Rather than rejecting a
+        repository with local edits (or an unborn repository), preserve the
+        current project state in a dedicated checkpoint commit. Explicitly
+        ignored runtime files are neither staged nor included in that commit.
+
+        Returns the abbreviated checkpoint SHA, or ``None`` when the existing
+        HEAD was already a usable base.
+        """
+        ignored = self._normalize_paths(ignore_paths or [])
+        pathspec = [".", *[f":(top,exclude){path}" for path in ignored]]
+        had_head = self.has_head()
+
+        # Supplying pathspecs to both add and commit is important: it keeps an
+        # already-staged memory/runtime file staged but out of the checkpoint.
+        self._git("add", "-A", "--", *pathspec)
+        staged = self._git(
+            "diff", "--cached", "--quiet", "--", *pathspec, check=False
+        ).returncode == 1
+        if had_head and not staged:
+            return None
+
+        message = (
+            "[genesis] checkpoint: preserve worktree before isolated run"
+            if had_head
+            else "[genesis] checkpoint: initial project state"
+        )
+        # An entirely empty unborn repository has no path that can match `.`.
+        # Omit the pathspec only in that case so --allow-empty can create HEAD.
+        commit_pathspec = (
+            ["--", *pathspec]
+            if self._git("ls-files", "--cached").stdout.strip()
+            else []
+        )
+        self._git(
+            "-c", "user.name=Genesis",
+            "-c", "user.email=genesis@localhost",
+            "-c", "commit.gpgSign=false",
+            "commit", "--no-verify", "--allow-empty", "-m", message,
+            *commit_pathspec,
+        )
+        return self._git("rev-parse", "--short", "HEAD").stdout.strip()
+
+    def ensure_clean_main(self, ignore_paths: list[str] | None = None) -> None:
+        """Backward-compatible alias that now prepares instead of rejecting."""
+        self.prepare_main(ignore_paths=ignore_paths)
+
+    def _normalize_paths(self, paths: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in paths:
+            path = Path(value)
+            if path.is_absolute():
+                try:
+                    path = path.resolve().relative_to(self.repo_root)
+                except ValueError:
+                    # A configured file outside the repository cannot affect
+                    # this worktree and needs no exclusion pathspec.
+                    continue
+            item = path.as_posix()
+            if item.startswith("./"):
+                item = item[2:]
+            item = item.rstrip("/")
+            if item and item != "." and item not in normalized:
+                normalized.append(item)
+        return normalized
 
     def create(self, run_id: str, step_id: str) -> Path:
         safe_run = _safe_name(run_id)

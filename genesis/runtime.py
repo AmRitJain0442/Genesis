@@ -465,6 +465,29 @@ class RuntimeStore:
             ).fetchall()
         return [self._run(row) for row in rows]
 
+    def find_reusable_run(self, task: str) -> RunRecord | None:
+        """Return the newest unfinished run with a saved plan for this task."""
+        with self._connect() as con:
+            row = con.execute(
+                """
+                SELECT r.*
+                FROM runs AS r
+                WHERE lower(trim(r.task)) = lower(trim(?))
+                  AND r.status IN ('planned', 'running', 'blocked')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM checkpoints AS c
+                      WHERE c.run_id = r.run_id
+                        AND c.step_id = ''
+                        AND c.checkpoint_name = 'plan_created'
+                  )
+                ORDER BY r.updated_at DESC
+                LIMIT 1
+                """,
+                (task,),
+            ).fetchone()
+        return self._run(row) if row else None
+
     def events(self, run_id: str, limit: int = 100) -> list[RuntimeEvent]:
         with self._connect() as con:
             rows = con.execute(

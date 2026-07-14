@@ -2,6 +2,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import json
+import re
 import uuid
 import logging
 from pathlib import Path
@@ -150,6 +151,13 @@ Return ONLY a JSON object:
 
 Rules:
 - Approve only complete, runnable work that matches the step.
+- Treat declared file scope as a planning and scheduling hint, not a hard
+  acceptance boundary. Relevant supporting changes outside it are allowed.
+- Judge against the full task, step description, dependency state, worker
+  summary, changed-file manifest, and bounded patch evidence supplied.
+- A truncated patch is not by itself grounds for rejection. Use the manifest,
+  representative excerpts, and file samples; request a focused revision only
+  when you can identify a concrete defect or missing artifact.
 - Use needs_revision only when the worker can likely repair it with one focused retry.
 - Use rejected for unsafe, unrelated, or fundamentally wrong work.
 - Never approve syntax errors, broken imports, failing tests, placeholders, or unreviewable output.
@@ -302,25 +310,30 @@ class Orchestrator:
         step: Step,
         result: WorkerResult,
         *,
+        plan: Plan | None = None,
+        run_id: str = "",
         work_dir: str | Path | None = None,
         diff_text: str | None = None,
     ) -> Review:
-        # Read actual file contents so Claude reviews real code, not just a summary.
-        # Cap per-file at 3 KB and total file content at 10 KB.
-        _PER_FILE = 3000
-        _TOTAL_CAP = 10000
+        # Read bounded file samples so the reviewer sees real code without a
+        # generated file or binary artifact consuming its entire context window.
+        _PER_FILE = 2500
+        _TOTAL_CAP = 7500
         file_sections: list[str] = []
         total = 0
         review_dir = Path(work_dir or self.work_dir)
         for fname in result.files_written:
             fpath = review_dir / fname
             try:
-                content = fpath.read_text(encoding="utf-8", errors="replace")
+                size = fpath.stat().st_size
+                with fpath.open("r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read(_PER_FILE + 1)
             except OSError:
+                size = 0
                 content = "<file not readable>"
             snippet = content[:_PER_FILE]
-            truncated = len(content) > _PER_FILE
-            header = f"--- {fname} ({len(content)} chars{', truncated' if truncated else ''}) ---"
+            truncated = size > len(snippet)
+            header = f"--- {fname} ({size} bytes{', sampled' if truncated else ''}) ---"
             section = f"{header}\n{snippet}"
             file_sections.append(section)
             total += len(section)
@@ -333,20 +346,37 @@ class Orchestrator:
         else:
             files_block = result.result_text[:3000] or "No output captured."
 
-        diff_block = diff_text if diff_text is not None else self.git.diff_text(result.files_written, max_chars=12000)
-        if not diff_block:
-            diff_block = "No git diff available."
+        raw_diff = (
+            diff_text
+            if diff_text is not None
+            else self.git.diff_text(result.files_written, max_chars=24000)
+        ) or "No git diff available."
+        diff_block = self._bounded_diff(raw_diff, max_chars=16000)
+        changed_manifest = self._bounded_manifest(result.files_written)
+        run_context = self._run_context(plan, run_id, step, max_chars=8000)
+        project_memory = self.memory.get_summary(
+            min(6000, self.config.memory.max_context_chars)
+        )
+        worker_summary = (result.result_text or "No worker summary captured.")[:3000]
 
         msg = (
             f"Review this step result.\n\n"
+            f"SHARED RUN CONTEXT:\n{run_context}\n\n"
+            f"SHARED PROJECT MEMORY:\n{project_memory}\n\n"
             f"STEP:\n"
             f"  ID: {step.step_id}\n"
             f"  Title: {step.title}\n"
             f"  Type: {step.type}\n"
-            f"  Declared File Scope: {', '.join(step.file_scope) if step.file_scope else 'None'}\n"
-            f"  Expected Output: {step.expected_output}\n\n"
+            f"  Description: {step.description[:6000]}\n"
+            f"  Declared File Scope (scheduling hint): "
+            f"{', '.join(step.file_scope) if step.file_scope else 'None'}\n"
+            f"  Expected Output: {step.expected_output[:3000]}\n"
+            f"  Context Hint: {(step.context_hint or 'None')[:2000]}\n\n"
+            f"WORKER SUMMARY:\n{worker_summary}\n\n"
+            f"CHANGED-FILE MANIFEST ({len(result.files_written)}):\n"
+            f"{changed_manifest}\n\n"
             f"FILES WRITTEN ({len(result.files_written)}):\n\n{files_block}\n\n"
-            f"GIT DIFF:\n\n{diff_block}\n\n"
+            f"BOUNDED GIT DIFF ({len(raw_diff)} source chars):\n\n{diff_block}\n\n"
             f"Return your review as JSON."
         )
         def _do_review(agent):
@@ -362,6 +392,49 @@ class Orchestrator:
         data = self._extract_json(raw)
         return Review(**data)
 
+    @staticmethod
+    def _bounded_manifest(paths: list[str], max_chars: int = 4000) -> str:
+        if not paths:
+            return "No files changed."
+        manifest = "\n".join(f"- {path}" for path in paths)
+        if len(manifest) <= max_chars:
+            return manifest
+        return manifest[:max_chars].rstrip() + "\n... (manifest truncated)"
+
+    @staticmethod
+    def _bounded_diff(diff_text: str, max_chars: int = 24000) -> str:
+        """Keep representative patch evidence within reviewer context limits."""
+        if len(diff_text) <= max_chars:
+            return diff_text
+
+        sections = re.split(r"(?=^diff --git )", diff_text, flags=re.MULTILINE)
+        sections = [section for section in sections if section]
+        if len(sections) <= 1:
+            head = int(max_chars * 0.7)
+            tail = max_chars - head - 100
+            return (
+                diff_text[:head]
+                + "\n... (middle of oversized diff omitted) ...\n"
+                + diff_text[-tail:]
+            )
+
+        # Sample both ends so large multi-file patches do not hide either the
+        # main implementation or late test/config changes.
+        chosen = sections if len(sections) <= 12 else sections[:8] + sections[-4:]
+        per_section = max(600, (max_chars - 800) // len(chosen))
+        excerpts: list[str] = []
+        for section in chosen:
+            if len(section) > per_section:
+                section = section[:per_section].rstrip() + "\n... (file diff sampled)\n"
+            excerpts.append(section)
+        omitted = len(sections) - len(chosen)
+        note = (
+            f"\n... ({omitted} additional file diff(s) omitted; see manifest) ...\n"
+            if omitted > 0 else ""
+        )
+        bounded = note.join(("\n".join(excerpts[:8]), "\n".join(excerpts[8:]))) if omitted else "\n".join(excerpts)
+        return bounded[:max_chars]
+
     def _review_agent(self) -> BaseAgent:
         """The dedicated reviewer. Prefer the peer brain so review is an
         independent check rather than the plan synthesizer grading itself;
@@ -369,8 +442,47 @@ class Orchestrator:
         return self.co_brain or self.agent
 
     def run_task(self, task: str, callbacks: dict[str, Callable] | None = None) -> None:
+        if self.runtime:
+            saved = self.runtime.find_reusable_run(task)
+            if saved:
+                payload = self.runtime.get_checkpoint(saved.run_id, "plan_created")
+                if payload:
+                    plan = Plan(**payload)
+                    cb = callbacks or {}
+                    if fn := cb.get("on_status"):
+                        fn(f"Reusing saved plan {saved.run_id}; planning is already complete.")
+                    if saved.status == "blocked":
+                        retry_ids: set[str] = set()
+                        for record in self.runtime.steps(saved.run_id):
+                            if record.status == "blocked":
+                                retry_ids.update(self._retry_step_ids(plan, record.step_id))
+                        for step_id in retry_ids:
+                            record = self.runtime.get_step(saved.run_id, step_id)
+                            if record and record.status != "committed":
+                                self.runtime.reset_step_for_retry(saved.run_id, step_id)
+                    else:
+                        self.runtime.update_run_status(saved.run_id, "running")
+                    if fn := cb.get("on_plan"):
+                        fn(plan)
+                    self._execute_plan_isolated(plan, callbacks=callbacks)
+                    return
         self._run_fresh_task(task, callbacks)
-        return
+
+    def plan_and_save(self, task: str, on_status=None) -> Plan:
+        """Create a durable plan preview, reusing one already saved for task."""
+        if self.runtime:
+            saved = self.runtime.find_reusable_run(task)
+            if saved:
+                payload = self.runtime.get_checkpoint(saved.run_id, "plan_created")
+                if payload:
+                    if on_status:
+                        on_status(f"Reusing saved plan {saved.run_id}.")
+                    return Plan(**payload)
+        plan = self.plan(task, on_status=on_status)
+        if not plan.steps:
+            raise ValueError("Orchestrator returned an empty plan - no steps to execute.")
+        self._save_plan(task, plan, status="planned")
+        return plan
 
     def _run_fresh_task(
         self,
@@ -389,12 +501,20 @@ class Orchestrator:
             raise ValueError("Orchestrator returned an empty plan - no steps to execute.")
         fire("on_plan", plan)
 
+        self._save_plan(task, plan, status="running")
+        self._execute_plan_isolated(plan, callbacks=callbacks)
+
+    def _save_plan(self, task: str, plan: Plan, *, status: str) -> None:
         run_id = plan.task_id
         if self.runtime:
             self.runtime.start_run(
-                plan.task_summary,
+                task,
                 run_id=run_id,
-                metadata={"estimated_steps": plan.estimated_steps},
+                metadata={
+                    "estimated_steps": plan.estimated_steps,
+                    "task_summary": plan.task_summary,
+                    "plan_retained": True,
+                },
             )
             self.runtime.checkpoint(run_id, "plan_created", payload=plan.model_dump())
             for step in _topo_sort(plan.steps):
@@ -405,6 +525,7 @@ class Orchestrator:
                     status="pending",
                     metadata={"step": step.model_dump()},
                 )
+            self.runtime.update_run_status(run_id, status)
 
         if self.config.memory.auto_append_plan:
             self.memory.append_plan(plan)
@@ -417,7 +538,6 @@ class Orchestrator:
             content=json.dumps(plan.model_dump(), indent=2, ensure_ascii=False),
             status="planned",
         )
-        self._execute_plan_isolated(plan, callbacks=callbacks)
 
     def resume_task(
         self,
@@ -480,7 +600,14 @@ class Orchestrator:
             len(steps) or 1,
         ))
         worktrees = WorktreeManager(self.work_dir)
-        worktrees.ensure_clean_main(ignore_paths=[self.config.memory.file, ".genesis/"])
+        checkpoint_sha = worktrees.prepare_main(
+            ignore_paths=[self.config.memory.file, ".genesis/"]
+        )
+        if checkpoint_sha:
+            fire(
+                "on_status",
+                f"Saved current project state as checkpoint {checkpoint_sha}.",
+            )
 
         committed_ids: set[str] = set()
         blocked_ids: set[str] = set()
@@ -517,7 +644,9 @@ class Orchestrator:
             while completed < len(steps):
                 if not halted_new_work:
                     open_slots = max_parallel - len(active)
-                    available_workers = len(self.worker_agents) - len(active_workers)
+                    available_workers = len(
+                        self._eligible_worker_candidates(active_workers)
+                    )
                     batch = scheduler.select_ready(
                         committed_ids=committed_ids,
                         unavailable_ids=blocked_ids | set(active_scopes),
@@ -554,6 +683,7 @@ class Orchestrator:
                         future = executor.submit(
                             self._run_step_in_worktree,
                             run_id,
+                            plan,
                             step,
                             worker_name,
                             worker_agent,
@@ -747,6 +877,7 @@ class Orchestrator:
     def _run_step_in_worktree(
         self,
         run_id: str,
+        plan: Plan,
         step: Step,
         worker_name: str,
         worker_agent: BaseAgent,
@@ -781,7 +912,14 @@ class Orchestrator:
 
             def run_turn(s):
                 return self._worker_execute_with_failover(
-                    s, worktree_path, output_callback, worker_state, step_room)
+                    s,
+                    worktree_path,
+                    output_callback,
+                    worker_state,
+                    step_room,
+                    plan=plan,
+                    run_id=run_id,
+                )
 
             # Phase 3b: a multi-turn brain<->worker dialogue shapes the work
             # before the independent reviewer gates it. Single-shot when disabled.
@@ -837,6 +975,8 @@ class Orchestrator:
             review = self.review(
                 step,
                 result,
+                plan=plan,
+                run_id=run_id,
                 work_dir=worktree_path,
                 diff_text=patch.patch_text or "No git diff available.",
             )
@@ -914,6 +1054,8 @@ class Orchestrator:
                 review = self.review(
                     revised,
                     result,
+                    plan=plan,
+                    run_id=run_id,
                     work_dir=worktree_path,
                     diff_text=patch.patch_text or "No git diff available.",
                 )
@@ -1019,6 +1161,8 @@ class Orchestrator:
                     review = self.review(
                         revised,
                         result,
+                        plan=plan,
+                        run_id=run_id,
                         work_dir=worktree_path,
                         diff_text=patch.patch_text or "No git diff available.",
                     )
@@ -1234,7 +1378,58 @@ class Orchestrator:
     def _specialty_for(self, step: Step) -> str:
         return self._SPECIALTIES.get((step.type or "").lower(), "implementation")
 
-    def _step_memory(self, step: Step) -> str:
+    def _run_context(
+        self,
+        plan: Plan | None,
+        run_id: str,
+        current_step: Step | None = None,
+        max_chars: int = 12000,
+    ) -> str:
+        if plan is None:
+            return "No retained plan context is available."
+
+        original_task = plan.task_summary
+        records = {}
+        if self.runtime and run_id:
+            run = self.runtime.get_run(run_id)
+            if run:
+                original_task = run.task
+            records = {record.step_id: record for record in self.runtime.steps(run_id)}
+
+        lines = [
+            f"Original task: {original_task}",
+            f"Plan summary: {plan.task_summary}",
+            "Retained plan and current state:",
+        ]
+        for planned_step in plan.steps:
+            record = records.get(planned_step.step_id)
+            status = record.status if record else "pending"
+            marker = " (current)" if current_step and planned_step.step_id == current_step.step_id else ""
+            lines.append(
+                f"- {planned_step.step_id} [{status}]{marker}: {planned_step.title}; "
+                f"depends on {', '.join(planned_step.depends_on) or 'none'}; "
+                f"success: {planned_step.expected_output}"
+            )
+            description = " ".join(planned_step.description.split())[:800]
+            if description:
+                lines.append(f"  Brief: {description}")
+            if record and record.review_json.get("memory_note"):
+                lines.append(f"  Result: {record.review_json['memory_note']}")
+            changed = record.metadata.get("changed_files", []) if record else []
+            if changed:
+                lines.append(f"  Files: {', '.join(str(path) for path in changed)}")
+
+        context = "\n".join(lines)
+        if len(context) > max_chars:
+            context = context[:max_chars].rstrip() + "\n... (run context truncated)"
+        return context
+
+    def _step_memory(
+        self,
+        step: Step,
+        plan: Plan | None = None,
+        run_id: str = "",
+    ) -> str:
         mem_summary = self.memory.get_summary(self.config.memory.max_context_chars)
         if self.palace and self.config.memory.palace_enabled:
             palace_context = self.palace.wakeup_context(
@@ -1251,7 +1446,12 @@ class Orchestrator:
             f"YOUR SPECIALTY FOR THIS STEP: {specialty}. "
             f"Produce complete, fully-tested, production-quality work in this area."
         )
-        return f"{directive}\n\n---\n\n{mem_summary}"
+        run_context = self._run_context(plan, run_id, step)
+        return (
+            f"{directive}\n\n---\n\n"
+            f"SHARED RETAINED RUN CONTEXT:\n{run_context}\n\n---\n\n"
+            f"PROJECT MEMORY:\n{mem_summary}"
+        )
 
     def _store_patch(self, run_id: str, step_id: str, patch: WorktreePatch) -> str:
         if not self.runtime:
@@ -1513,14 +1713,7 @@ class Orchestrator:
         )
 
     def _assign_worker(self, step: Step, unavailable: set[str] | None = None) -> tuple[str, BaseAgent]:
-        unavailable = set(unavailable or set())
-        if self._failover_enabled():
-            unavailable |= self.registry.exhausted_names()
-        candidates = {
-            name: agent
-            for name, agent in self.worker_agents.items()
-            if name not in unavailable
-        }
+        candidates = self._eligible_worker_candidates(unavailable)
         if not candidates:
             raise RuntimeError("No worker agents available")
 
@@ -1538,6 +1731,44 @@ class Orchestrator:
         name, agent = next(iter(candidates.items()))
         return name, agent
 
+    def _eligible_worker_candidates(
+        self,
+        unavailable: set[str] | None = None,
+    ) -> dict[str, BaseAgent]:
+        """Return available workers while keeping reserve accounts dormant.
+
+        A reserve becomes eligible only after every normal account from the
+        same provider is marked exhausted. Merely being busy on another step
+        does not unlock the reserve, so parallel scheduling cannot consume the
+        last-resort account early.
+        """
+        unavailable = set(unavailable or set())
+        exhausted = (
+            self.registry.exhausted_names()
+            if self._failover_enabled()
+            else set()
+        )
+        blocked = unavailable | exhausted
+        candidates = {
+            name: agent
+            for name, agent in self.worker_agents.items()
+            if name not in blocked
+        }
+
+        for name, agent in list(candidates.items()):
+            if not getattr(agent, "reserve", False):
+                continue
+            provider = getattr(agent, "provider", "")
+            normal_peers = {
+                peer_name
+                for peer_name, peer in self.worker_agents.items()
+                if not getattr(peer, "reserve", False)
+                and getattr(peer, "provider", "") == provider
+            }
+            if normal_peers and not normal_peers.issubset(exhausted):
+                candidates.pop(name)
+        return candidates
+
     # ── Account failover ─────────────────────────────────────────────────────
 
     def _failover_enabled(self) -> bool:
@@ -1554,7 +1785,21 @@ class Orchestrator:
         agent, the two brains, then any account (each CLI can plan/review)."""
         out: list[BaseAgent] = []
         seen: set[str] = set()
-        for agent in [primary, self.agent, self.co_brain, *self.worker_agents.values()]:
+        normal_workers = [
+            agent for agent in self.worker_agents.values()
+            if not getattr(agent, "reserve", False)
+        ]
+        reserve_workers = [
+            agent for agent in self.worker_agents.values()
+            if getattr(agent, "reserve", False)
+        ]
+        for agent in [
+            primary,
+            self.agent,
+            self.co_brain,
+            *normal_workers,
+            *reserve_workers,
+        ]:
             if agent is None:
                 continue
             name = getattr(agent, "name", "")
@@ -1591,8 +1836,17 @@ class Orchestrator:
         except RuntimeError:
             return None
 
-    def _worker_execute_with_failover(self, step: Step, worktree_path, output_callback,
-                                      state: dict, room_id: str) -> WorkerResult:
+    def _worker_execute_with_failover(
+        self,
+        step: Step,
+        worktree_path,
+        output_callback,
+        state: dict,
+        room_id: str,
+        *,
+        plan: Plan | None = None,
+        run_id: str = "",
+    ) -> WorkerResult:
         """Run one worker turn; if the account is exhausted, mark it and retry on
         an alternate worker. `state` ({name, agent}) is updated in place so later
         turns and the runtime record reflect the account actually used."""
@@ -1601,7 +1855,7 @@ class Orchestrator:
             name, agent = state["name"], state["agent"]
             tried.add(name)
             worker = _make_worker(
-                agent, self._step_memory(step), str(worktree_path),
+                agent, self._step_memory(step, plan, run_id), str(worktree_path),
                 output_callback=output_callback,
             )
             result = worker.execute(step)

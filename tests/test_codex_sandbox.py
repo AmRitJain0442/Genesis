@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 
+from genesis.agents.base import AgentInfo
 from genesis.agents.codex_cli import CodexCLIAgent
 
 
@@ -25,6 +26,21 @@ class SandboxFlagTests(unittest.TestCase):
                 flags = CodexCLIAgent._sandbox_flags(False)
             self.assertIn("read-only", flags)
             self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", flags)
+
+    def test_reserve_worker_keeps_full_access_in_its_worktree_copy(self):
+        agent = CodexCLIAgent(
+            AgentInfo("codex-200", "codex-cli", "auto", max_tokens=8096),
+            reserve=True,
+        )
+
+        worker = agent.for_work_dir(".")
+
+        self.assertTrue(worker.reserve)
+        with mock.patch("genesis.agents.codex_cli.os.name", "nt"):
+            self.assertEqual(
+                ["--dangerously-bypass-approvals-and-sandbox"],
+                worker._sandbox_flags(True),
+            )
 
 
 if __name__ == "__main__":

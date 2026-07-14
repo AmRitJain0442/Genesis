@@ -49,11 +49,13 @@ class FakePlanReviewAgent(BaseAgent):
             for step_id, verdicts in (verdict_sequences_by_step or {}).items()
         }
         self.review_counts: dict[str, int] = {}
+        self.plan_calls = 0
 
     def chat(self, system: str, messages: list[dict], output_callback=None) -> str:
         return self.chat_plan(system, messages)
 
     def chat_plan(self, system: str, messages: list[dict]) -> str:
+        self.plan_calls += 1
         return json.dumps(
             {
                 "task_id": self.task_id,
@@ -129,6 +131,77 @@ class FakeWorkerAgent(BaseAgent):
 
 
 class OrchestratorSafetyTests(unittest.TestCase):
+    def test_saved_plan_preview_is_reused_when_task_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.verification.commands = []
+            cfg.dialogue.enabled = False
+            planner = FakePlanReviewAgent(verdict="approved", task_id="run-retained")
+            runtime = RuntimeStore(cfg.runtime.state_db)
+            git = GitManager(str(root), cfg.git)
+            orchestrator = Orchestrator(
+                planner,
+                {"fake-worker": FakeWorkerAgent(filename="saved.txt", content="saved")},
+                MemoryManager(str(root / "GENESIS_MEMORY.md")),
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=PalaceStore(cfg.runtime.state_db),
+                policy=ExecutionPolicy(),
+            )
+
+            first = orchestrator.plan_and_save("retain this exact plan")
+            second = orchestrator.plan_and_save("  RETAIN THIS EXACT PLAN  ")
+            orchestrator.run_task("retain this exact plan")
+            git.close()
+
+            self.assertEqual(first, second)
+            self.assertEqual(1, planner.plan_calls)
+            self.assertEqual("saved\n", (root / "saved.txt").read_text(encoding="utf-8"))
+            self.assertEqual("completed", runtime.get_run("run-retained").status)
+
+    def test_repeating_blocked_task_retries_retained_plan_without_replanning(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.verification.commands = []
+            cfg.dialogue.enabled = False
+            planner = FakePlanReviewAgent(
+                task_id="run-blocked-reuse",
+                verdict_sequences_by_step={"step-1": ["rejected", "approved"]},
+            )
+            runtime = RuntimeStore(cfg.runtime.state_db)
+            git = GitManager(str(root), cfg.git)
+            orchestrator = Orchestrator(
+                planner,
+                {"fake-worker": FakeWorkerAgent(filename="retried.txt", content="ok")},
+                MemoryManager(str(root / "GENESIS_MEMORY.md")),
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=PalaceStore(cfg.runtime.state_db),
+                policy=ExecutionPolicy(),
+            )
+
+            orchestrator.run_task("retry this retained task")
+            first_status = runtime.get_run("run-blocked-reuse").status
+            orchestrator.run_task("retry this retained task")
+            git.close()
+
+            self.assertEqual("blocked", first_status)
+            self.assertEqual(1, planner.plan_calls)
+            self.assertEqual("ok\n", (root / "retried.txt").read_text(encoding="utf-8"))
+            self.assertEqual("completed", runtime.get_run("run-blocked-reuse").status)
+
     def test_rejected_review_does_not_commit_changes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -211,6 +284,59 @@ class OrchestratorSafetyTests(unittest.TestCase):
             self.assertIn("review_completed", event_types)
             self.assertIn("verification_completed", event_types)
             self.assertIn("release_summary", event_types)
+            git.close()
+
+    def test_dirty_worktree_is_checkpointed_before_isolated_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+            (root / "README.md").write_text("local tracked work\n", encoding="utf-8")
+            (root / "draft.txt").write_text("local untracked work\n", encoding="utf-8")
+
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.verification.commands = []
+            memory = MemoryManager(str(root / "GENESIS_MEMORY.md"))
+            git = GitManager(str(root), cfg.git)
+            runtime = RuntimeStore(cfg.runtime.state_db)
+            statuses: list[str] = []
+
+            orchestrator = Orchestrator(
+                FakePlanReviewAgent(verdict="approved", task_id="run-dirty"),
+                {"fake-worker": FakeWorkerAgent(filename="ok.txt", content="ok")},
+                memory,
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=PalaceStore(cfg.runtime.state_db),
+                policy=ExecutionPolicy(),
+            )
+
+            orchestrator.run_task(
+                "work from local changes",
+                callbacks={"on_status": statuses.append},
+            )
+
+            subjects = self._git_output(root, "log", "--pretty=%s").splitlines()
+            checkpoint = next(
+                subject for subject in subjects if subject.startswith("[genesis] checkpoint:")
+            )
+            self.assertIn("preserve worktree", checkpoint)
+            checkpoint_sha = self._git_output(
+                root, "log", "--format=%H", "--grep=^\\[genesis\\] checkpoint:"
+            ).splitlines()[0]
+            self.assertEqual(
+                "local tracked work\n",
+                self._git_output(root, "show", f"{checkpoint_sha}:README.md"),
+            )
+            self.assertEqual(
+                "local untracked work\n",
+                self._git_output(root, "show", f"{checkpoint_sha}:draft.txt"),
+            )
+            self.assertEqual("ok\n", (root / "ok.txt").read_text(encoding="utf-8"))
+            self.assertTrue(any("Saved current project state" in item for item in statuses))
+            self.assertEqual("completed", runtime.get_run("run-dirty").status)
             git.close()
 
     def test_review_retry_records_repair_and_reviewer_metadata(self) -> None:
@@ -587,14 +713,16 @@ class OrchestratorSafetyTests(unittest.TestCase):
         subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
 
     def _commit_count(self, root: Path) -> int:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD"],
+        return int(self._git_output(root, "rev-list", "--count", "HEAD").strip())
+
+    def _git_output(self, root: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args],
             cwd=root,
             check=True,
             capture_output=True,
             text=True,
-        )
-        return int(result.stdout.strip())
+        ).stdout
 
 
 if __name__ == "__main__":

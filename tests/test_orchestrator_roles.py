@@ -1,9 +1,14 @@
+import json
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
 from genesis.agents.orchestrator import Orchestrator
+from genesis.agents.worker import WorkerResult
 from genesis.chatroom import ChatroomManager, RoomKind
 from genesis.config import GenesisConfig
+from genesis.schemas.plan import Plan, Step
 
 
 def _make_orch(co_brain=None, chatroom=None):
@@ -47,6 +52,88 @@ class ReviewerSelectionTests(unittest.TestCase):
     def test_falls_back_to_primary_when_alone(self) -> None:
         orch = _make_orch(co_brain=None)
         self.assertEqual("claude-cli-orchestrator", orch._reviewer_name())
+
+
+class ReviewerContextTests(unittest.TestCase):
+    def test_large_diff_is_bounded_and_samples_both_ends(self) -> None:
+        diff = (
+            "diff --git a/first.py b/first.py\n" + "a" * 40000
+            + "\ndiff --git a/last.py b/last.py\n" + "z" * 40000
+        )
+
+        bounded = Orchestrator._bounded_diff(diff, max_chars=8000)
+
+        self.assertLessEqual(len(bounded), 8000)
+        self.assertIn("first.py", bounded)
+        self.assertIn("last.py", bounded)
+        self.assertIn("sampled", bounded)
+
+    def test_reviewer_receives_full_step_and_retained_plan_context(self) -> None:
+        class CapturingReviewer:
+            name = "reviewer"
+
+            def __init__(self):
+                self.prompt = ""
+
+            def chat_review(self, system, messages):
+                self.prompt = messages[0]["content"]
+                return json.dumps({
+                    "step_id": "step-1",
+                    "verdict": "approved",
+                    "quality_score": 9,
+                    "feedback": "",
+                    "memory_note": "Implemented the requested behavior.",
+                    "should_retry": False,
+                    "suggested_revision": "",
+                })
+
+        reviewer = CapturingReviewer()
+        memory = types.SimpleNamespace(get_summary=lambda n: "MEM")
+        orch = Orchestrator(
+            reviewer,
+            {"worker": object()},
+            memory,
+            git=None,
+            config=GenesisConfig(),
+            work_dir=".",
+        )
+        step = Step(
+            step_id="step-1",
+            title="Implement feature",
+            description="Preserve the detailed implementation requirement.",
+            type="code",
+            file_scope=["src/expected.py"],
+            expected_output="The feature works end to end.",
+            context_hint="Also inspect src/support.py.",
+        )
+        plan = Plan(
+            task_id="run-context",
+            task_summary="Build the complete feature",
+            estimated_steps=1,
+            steps=[step],
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "actual.py").write_text("value = 1\n", encoding="utf-8")
+            result = WorkerResult(
+                step_id="step-1",
+                raw_response="done",
+                result_text="Changed a supporting file because it was required.",
+                files_written=["actual.py"],
+            )
+            orch.review(
+                step,
+                result,
+                plan=plan,
+                work_dir=root,
+                diff_text="diff --git a/actual.py b/actual.py\n+value = 1\n",
+            )
+
+        self.assertIn("Build the complete feature", reviewer.prompt)
+        self.assertIn("Preserve the detailed implementation requirement", reviewer.prompt)
+        self.assertIn("scheduling hint", reviewer.prompt)
+        self.assertIn("Changed a supporting file", reviewer.prompt)
+        self.assertIn("SHARED PROJECT MEMORY:\nMEM", reviewer.prompt)
 
 
 class StepRoomTests(unittest.TestCase):
