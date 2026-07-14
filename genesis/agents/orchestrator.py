@@ -601,6 +601,21 @@ class Orchestrator:
             len(steps) or 1,
         ))
         worktrees = WorktreeManager(self.work_dir)
+        workspace_snapshot = worktrees.workspace_snapshot()
+        if self.runtime:
+            self.runtime.checkpoint(
+                run_id,
+                "workspace_preflight",
+                payload=workspace_snapshot,
+            )
+        fire(
+            "on_status",
+            "Workspace preflight: "
+            f"{workspace_snapshot['tracked_count']} tracked, "
+            f"{len(workspace_snapshot['dirty'])} dirty, "
+            f"{len(workspace_snapshot['untracked'])} untracked, "
+            f"{len(workspace_snapshot['ignored_source'])} ignored source file(s).",
+        )
         checkpoint_sha = worktrees.prepare_main(
             ignore_paths=[self.config.memory.file, ".genesis/"]
         )
@@ -786,7 +801,11 @@ class Orchestrator:
                         halted_new_work = True
                         continue
 
-                    sha = self.git.commit_step(step.step_id, step.title)
+                    sha = self.git.commit_step(
+                        step.step_id,
+                        step.title,
+                        paths=execution.patch.changed_files,
+                    )
                     if not sha and execution.patch.has_changes:
                         self._block_step(
                             run_id,
@@ -894,6 +913,17 @@ class Orchestrator:
             if not worktree_path or not worktree_path.exists():
                 with worktree_lock:
                     worktree_path = worktrees.create(run_id, step.step_id)
+                    overlaid = worktrees.materialize_referenced_ignored(
+                        worktree_path,
+                        step,
+                    )
+                    if overlaid and self.runtime:
+                        self.runtime.record_event(
+                            run_id,
+                            "workspace_overlay",
+                            step_id=step.step_id,
+                            payload={"files": overlaid},
+                        )
             execution.worktree_path = worktree_path
             if self.runtime:
                 self.runtime.upsert_step(
@@ -1492,12 +1522,27 @@ class Orchestrator:
             if run:
                 original_task = run.task
             records = {record.step_id: record for record in self.runtime.steps(run_id)}
+            workspace = self.runtime.get_checkpoint(run_id, "workspace_preflight")
+        else:
+            workspace = None
 
         lines = [
             f"Original task: {original_task}",
             f"Plan summary: {plan.task_summary}",
             "Retained plan and current state:",
         ]
+        if workspace:
+            lines.extend([
+                "Workspace preflight:",
+                f"- HEAD: {workspace.get('head') or 'unborn'}; "
+                f"tracked files: {workspace.get('tracked_count', 0)}",
+                "- Dirty: " + (", ".join(workspace.get("dirty", [])[:20]) or "none"),
+                "- Untracked: " + (", ".join(workspace.get("untracked", [])[:20]) or "none"),
+                "- Ignored source available for task overlay: "
+                + (", ".join(workspace.get("ignored_source", [])[:20]) or "none"),
+                "- Credential-sensitive paths excluded from checkpoints: "
+                + (", ".join(workspace.get("sensitive_paths", [])[:20]) or "none"),
+            ])
         for planned_step in plan.steps:
             record = records.get(planned_step.step_id)
             status = record.status if record else "pending"

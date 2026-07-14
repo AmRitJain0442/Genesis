@@ -1,5 +1,6 @@
 import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -100,6 +101,40 @@ class PrepareMainTests(unittest.TestCase):
             self._git_output("diff", "--cached", "--name-only").splitlines(),
         )
 
+    def test_sensitive_untracked_credential_is_excluded_from_checkpoint(self):
+        (self.repo / "seed.py").write_text("old\n", encoding="utf-8")
+        _git(self.repo, "add", "seed.py")
+        _git(self.repo, "commit", "-m", "init")
+        (self.repo / "seed.py").write_text("new\n", encoding="utf-8")
+        credential = self.repo / "my-product-sa-key.json"
+        credential.write_text('{"private_key": "live"}\n', encoding="utf-8")
+
+        sha = self._wt().prepare_main()
+
+        self.assertTrue(sha)
+        self.assertEqual("new\n", self._git_output("show", "HEAD:seed.py"))
+        self.assertNotIn(
+            "my-product-sa-key.json",
+            self._git_output("ls-tree", "--name-only", "HEAD").splitlines(),
+        )
+        self.assertTrue(credential.exists())
+
+    def test_workspace_snapshot_reports_ignored_source_and_sensitive_paths(self):
+        (self.repo / ".gitignore").write_text("legacy.py\n", encoding="utf-8")
+        (self.repo / "seed.py").write_text("seed\n", encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-m", "init")
+        (self.repo / "legacy.py").write_text("value = 1\n", encoding="utf-8")
+        (self.repo / "service-account.json").write_text(
+            '{"private_key": "live"}\n',
+            encoding="utf-8",
+        )
+
+        snapshot = self._wt().workspace_snapshot()
+
+        self.assertIn("legacy.py", snapshot["ignored_source"])
+        self.assertIn("service-account.json", snapshot["sensitive_paths"])
+
     def test_capture_patch_includes_worker_commits_on_takeover_branch(self):
         (self.repo / "seed.py").write_text("old\n", encoding="utf-8")
         _git(self.repo, "add", "seed.py")
@@ -133,6 +168,46 @@ class PrepareMainTests(unittest.TestCase):
             self.assertEqual(
                 "value = 1\n",
                 (self.repo / "added.py").read_text(encoding="utf-8"),
+            )
+        finally:
+            manager.remove(worktree)
+
+    def test_referenced_ignored_source_is_overlaid_and_patched_safely(self):
+        (self.repo / ".gitignore").write_text("tribe.py\n.env\n", encoding="utf-8")
+        (self.repo / "seed.py").write_text("seed\n", encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-m", "init")
+        (self.repo / "tribe.py").write_text("KEY = 'old'\n", encoding="utf-8")
+        (self.repo / ".env").write_text("SECRET=live\n", encoding="utf-8")
+        manager = self._wt()
+        worktree = manager.create("overlay", "step")
+        step = types.SimpleNamespace(
+            title="Harden tribe.py",
+            description="Move secrets out of tribe.py and never copy .env.",
+            context_hint="",
+            expected_output="tribe.py reads environment variables",
+            file_scope=["tribe.py", ".env"],
+        )
+        try:
+            overlaid = manager.materialize_referenced_ignored(worktree, step)
+
+            self.assertEqual(["tribe.py"], overlaid)
+            self.assertTrue((worktree / "tribe.py").exists())
+            self.assertFalse((worktree / ".env").exists())
+            (worktree / "tribe.py").write_text(
+                "import os\nKEY = os.environ['TRIBE_API_KEY']\n",
+                encoding="utf-8",
+            )
+
+            patch = manager.capture_patch(worktree)
+
+            self.assertIn("tribe.py", patch.changed_files)
+            self.assertIn("M\ttribe.py", patch.diff_status_lines)
+            manager.apply_check(patch.patch_text)
+            manager.apply_patch(patch.patch_text)
+            self.assertIn(
+                "os.environ",
+                (self.repo / "tribe.py").read_text(encoding="utf-8"),
             )
         finally:
             manager.remove(worktree)

@@ -70,11 +70,24 @@ class GitManager:
             logger.warning("Could not read diff: %s", e)
             return ""
 
-    def commit_step(self, step_id: str, title: str) -> str | None:
-        if not self._available or not self.has_changes():
+    def commit_step(
+        self,
+        step_id: str,
+        title: str,
+        paths: list[str] | None = None,
+    ) -> str | None:
+        if not self._available:
             return None
         try:
-            self.repo.git.add("-A", "--", ".", ":(exclude).genesis")
+            if paths:
+                # Commit exactly the independently reviewed patch manifest.
+                # -f is required for a task-referenced source file that was
+                # intentionally ignored before Genesis safely overlaid it.
+                self.repo.git.add("-A", "-f", "--", *paths)
+            else:
+                self.repo.git.add("-A", "--", ".", ":(exclude).genesis")
+            if not self.repo.git.diff("--cached", "--name-only").strip():
+                return None
             message = f"{self.config.commit_prefix} {step_id}: {title}"
             self.repo.index.commit(message)
             sha = self.repo.head.commit.hexsha[:7]
