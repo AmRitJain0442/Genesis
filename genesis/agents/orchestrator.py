@@ -61,6 +61,8 @@ class _StepExecution:
     result: WorkerResult | None = None
     patch: WorktreePatch | None = None
     patch_id: str = ""
+    patch_version: int = 0
+    reviewed_patch_sha: str = ""
     review: Review | None = None
     verification: VerificationResult | None = None
     repair_attempts: int = 0
@@ -359,6 +361,9 @@ class Orchestrator:
             min(6000, self.config.memory.max_context_chars)
         )
         worker_summary = (result.result_text or "No worker summary captured.")[:3000]
+        evidence = getattr(result, "evidence", None) or {}
+        patch_version = evidence.get("version", "unknown")
+        patch_sha = evidence.get("patch_sha", "unknown")
 
         msg = (
             f"Review this step result.\n\n"
@@ -373,6 +378,10 @@ class Orchestrator:
             f"{', '.join(step.file_scope) if step.file_scope else 'None'}\n"
             f"  Expected Output: {step.expected_output[:3000]}\n"
             f"  Context Hint: {(step.context_hint or 'None')[:2000]}\n\n"
+            f"AUTHORITATIVE PATCH VERSION:\n"
+            f"  Version: {patch_version}\n"
+            f"  Patch SHA: {patch_sha}\n"
+            f"  This verdict applies only to this exact patch SHA.\n\n"
             f"WORKER SUMMARY:\n{worker_summary}\n\n"
             f"CHANGED-FILE MANIFEST ({len(result.files_written)}):\n"
             f"{changed_manifest}\n\n"
@@ -792,6 +801,28 @@ class Orchestrator:
                         halted_new_work = True
                         continue
 
+                    if (
+                        execution.review is None
+                        or execution.review.verdict != "approved"
+                        or execution.reviewed_patch_sha != execution.patch.patch_sha
+                    ):
+                        reason = (
+                            "Refusing to apply an unreviewed or stale patch: "
+                            f"current={execution.patch.patch_sha}, "
+                            f"reviewed={execution.reviewed_patch_sha or 'none'}."
+                        )
+                        self._block_step(
+                            run_id,
+                            step,
+                            "review-integrity",
+                            reason,
+                            reason,
+                            fire,
+                        )
+                        blocked_ids.add(step.step_id)
+                        halted_new_work = True
+                        continue
+
                     try:
                         worktrees.apply_check(execution.patch.patch_text)
                         worktrees.apply_patch(execution.patch.patch_text)
@@ -835,6 +866,9 @@ class Orchestrator:
                                 extra={
                                     "reviewer": execution.reviewer_name,
                                     "review_verdict": execution.review.verdict if execution.review else "",
+                                    "current_patch_sha": execution.patch.patch_sha,
+                                    "reviewed_patch_sha": execution.reviewed_patch_sha,
+                                    "review_state": "committed",
                                     "repair_attempts": execution.repair_attempts,
                                 },
                             ),
@@ -965,6 +999,12 @@ class Orchestrator:
                         reported_files=reported_files,
                         work_dir=worktree_path,
                     )
+                    self._record_patch_version(
+                        run_id,
+                        step,
+                        turn_patch,
+                        turn_version,
+                    )
                     if self.runtime:
                         self.runtime.record_event(
                             run_id,
@@ -1009,6 +1049,7 @@ class Orchestrator:
             # leave a final-turn-only file list attached to an empty patch.
             result.files_written = patch.changed_files
             execution.patch = patch
+            execution.patch_version = turn_version
             execution.patch_id = self._store_patch(run_id, step.step_id, patch)
             if self.runtime:
                 self.runtime.upsert_step(
@@ -1078,8 +1119,10 @@ class Orchestrator:
                 diff_text=patch.patch_text or "No git diff available.",
             )
             execution.review = review
+            execution.reviewed_patch_sha = patch.patch_sha
             self._post_step(
                 step_room, execution.reviewer_name, "reviewer",
+                f"[patch v{execution.patch_version} {patch.patch_sha}] "
                 f"{review.verdict} ({review.quality_score}/10): {review.feedback}",
                 "decision",
             )
@@ -1093,6 +1136,9 @@ class Orchestrator:
                     metadata={
                         "reviewer": execution.reviewer_name,
                         "review_verdict": review.verdict,
+                        "reviewed_patch_sha": patch.patch_sha,
+                        "review_patch_version": execution.patch_version,
+                        "review_state": "current",
                         "repair_attempts": execution.repair_attempts,
                     },
                 )
@@ -1103,6 +1149,8 @@ class Orchestrator:
                 review,
                 reviewer=execution.reviewer_name,
                 repair_attempts=execution.repair_attempts,
+                patch=patch,
+                patch_version=execution.patch_version,
             )
 
             retries_left = max(0, self.config.runtime.retry_budget)
@@ -1135,6 +1183,7 @@ class Orchestrator:
                 patch = worktrees.capture_patch(worktree_path, revised)
                 result.files_written = patch.changed_files
                 execution.patch = patch
+                execution.patch_version = turn_version
                 execution.patch_id = self._store_patch(run_id, step.step_id, patch)
                 if self.runtime:
                     self.runtime.record_event(
@@ -1175,6 +1224,15 @@ class Orchestrator:
                     diff_text=patch.patch_text or "No git diff available.",
                 )
                 execution.review = review
+                execution.reviewed_patch_sha = patch.patch_sha
+                self._post_step(
+                    step_room,
+                    execution.reviewer_name,
+                    "reviewer",
+                    f"[patch v{execution.patch_version} {patch.patch_sha}] "
+                    f"{review.verdict} ({review.quality_score}/10): {review.feedback}",
+                    "decision",
+                )
                 if self.runtime:
                     self.runtime.upsert_step(
                         run_id,
@@ -1185,6 +1243,9 @@ class Orchestrator:
                         review=review.model_dump(),
                         metadata={
                             "changed_files": patch.changed_files,
+                            "reviewed_patch_sha": patch.patch_sha,
+                            "review_patch_version": execution.patch_version,
+                            "review_state": "current",
                             "repair_attempts": execution.repair_attempts,
                         },
                     )
@@ -1194,6 +1255,8 @@ class Orchestrator:
                     review,
                     reviewer=execution.reviewer_name,
                     repair_attempts=execution.repair_attempts,
+                    patch=patch,
+                    patch_version=execution.patch_version,
                 )
 
             if review.verdict != "approved":
@@ -1248,6 +1311,7 @@ class Orchestrator:
                     patch = worktrees.capture_patch(worktree_path, revised)
                     result.files_written = patch.changed_files
                     execution.patch = patch
+                    execution.patch_version = turn_version
                     execution.patch_id = self._store_patch(run_id, step.step_id, patch)
                     if self.runtime:
                         self.runtime.record_event(
@@ -1298,6 +1362,15 @@ class Orchestrator:
                         diff_text=patch.patch_text or "No git diff available.",
                     )
                     execution.review = review
+                    execution.reviewed_patch_sha = patch.patch_sha
+                    self._post_step(
+                        step_room,
+                        execution.reviewer_name,
+                        "reviewer",
+                        f"[patch v{execution.patch_version} {patch.patch_sha}] "
+                        f"{review.verdict} ({review.quality_score}/10): {review.feedback}",
+                        "decision",
+                    )
                     if self.runtime:
                         self.runtime.upsert_step(
                             run_id,
@@ -1312,6 +1385,8 @@ class Orchestrator:
                         review,
                         reviewer=execution.reviewer_name,
                         repair_attempts=execution.repair_attempts,
+                        patch=patch,
+                        patch_version=execution.patch_version,
                     )
                     if review.verdict != "approved":
                         execution.failed_agent = worker_name
@@ -1662,6 +1737,9 @@ class Orchestrator:
             metadata={
                 "worktree_path": patch.worktree_path,
                 "changed_files": patch.changed_files,
+                "base_sha": patch.base_sha,
+                "head_sha": patch.head_sha,
+                "patch_sha": patch.patch_sha,
             },
         )
 
@@ -1699,6 +1777,8 @@ class Orchestrator:
         *,
         reviewer: str,
         repair_attempts: int,
+        patch: WorktreePatch,
+        patch_version: int,
     ) -> None:
         if not self.runtime:
             return
@@ -1710,6 +1790,8 @@ class Orchestrator:
             "should_retry": review.should_retry,
             "suggested_revision": review.suggested_revision,
             "repair_attempts": repair_attempts,
+            "patch_sha": patch.patch_sha,
+            "patch_version": patch_version,
         }
         self.runtime.record_event(
             run_id,
@@ -1724,7 +1806,62 @@ class Orchestrator:
             metadata={
                 "reviewer": reviewer,
                 "review_verdict": review.verdict,
+                "current_patch_sha": patch.patch_sha,
+                "current_patch_version": patch_version,
+                "reviewed_patch_sha": patch.patch_sha,
+                "review_patch_version": patch_version,
+                "review_state": "current",
                 "repair_attempts": repair_attempts,
+            },
+        )
+
+    def _record_patch_version(
+        self,
+        run_id: str,
+        step: Step,
+        patch: WorktreePatch,
+        version: int,
+    ) -> None:
+        if not self.runtime:
+            return
+        current = self.runtime.get_step(run_id, step.step_id)
+        metadata = current.metadata if current else {}
+        reviewed_sha = str(metadata.get("reviewed_patch_sha", "") or "")
+        reviewed_version = metadata.get("review_patch_version", 0)
+        if reviewed_sha and reviewed_sha != patch.patch_sha:
+            self.runtime.record_event(
+                run_id,
+                "review_superseded",
+                step_id=step.step_id,
+                payload={
+                    "reviewed_patch_sha": reviewed_sha,
+                    "review_patch_version": reviewed_version,
+                    "replacement_patch_sha": patch.patch_sha,
+                    "replacement_patch_version": version,
+                },
+            )
+        self.runtime.record_event(
+            run_id,
+            "patch_version_captured",
+            step_id=step.step_id,
+            payload={
+                "patch_sha": patch.patch_sha,
+                "patch_version": version,
+                "base_sha": patch.base_sha,
+                "head_sha": patch.head_sha,
+                "changed_files": patch.changed_files,
+            },
+        )
+        self.runtime.upsert_step(
+            run_id,
+            step.step_id,
+            title=step.title,
+            review={},
+            metadata={
+                "current_patch_sha": patch.patch_sha,
+                "current_patch_version": version,
+                "review_state": "unreviewed",
+                "review_verdict": "",
             },
         )
 

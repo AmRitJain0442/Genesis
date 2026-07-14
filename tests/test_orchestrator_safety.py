@@ -413,7 +413,13 @@ class OrchestratorSafetyTests(unittest.TestCase):
             )
             orchestrator = Orchestrator(
                 reviewer,
-                {"fake-worker": FakeWorkerAgent(filename="ok.txt", content="ok")},
+                {
+                    "fake-worker": FakeWorkerAgent(
+                        filename="ok.txt",
+                        content="first",
+                        repair_files_by_step={"step-1": ("ok.txt", "fixed")},
+                    )
+                },
                 memory,
                 git,
                 cfg,
@@ -430,8 +436,27 @@ class OrchestratorSafetyTests(unittest.TestCase):
             self.assertEqual("fake-orchestrator", step.metadata.get("reviewer"))
             self.assertEqual("approved", step.metadata.get("review_verdict"))
             self.assertEqual(1, step.metadata.get("repair_attempts"))
-            event_types = [event.event_type for event in runtime.events("run-review-repair")]
+            self.assertEqual("committed", step.metadata.get("review_state"))
+            self.assertEqual(
+                step.metadata.get("current_patch_sha"),
+                step.metadata.get("reviewed_patch_sha"),
+            )
+            events = runtime.events("run-review-repair")
+            event_types = [event.event_type for event in events]
             self.assertIn("repair_attempted", event_types)
+            self.assertIn("review_superseded", event_types)
+            versions = [
+                event.payload for event in events
+                if event.event_type == "patch_version_captured"
+            ]
+            reviews = [
+                event.payload for event in events
+                if event.event_type == "review_completed"
+            ]
+            self.assertEqual([1, 2], [item["patch_version"] for item in versions])
+            self.assertEqual([1, 2], [item["patch_version"] for item in reviews])
+            self.assertNotEqual(reviews[0]["patch_sha"], reviews[1]["patch_sha"])
+            self.assertEqual("fixed\n", (root / "ok.txt").read_text(encoding="utf-8"))
             git.close()
 
     def test_verification_failure_can_be_repaired_with_retry(self) -> None:

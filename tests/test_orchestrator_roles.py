@@ -120,6 +120,7 @@ class ReviewerContextTests(unittest.TestCase):
                 raw_response="done",
                 result_text="Changed a supporting file because it was required.",
                 files_written=["actual.py"],
+                evidence={"version": 3, "patch_sha": "abc123def456"},
             )
             orch.review(
                 step,
@@ -134,6 +135,9 @@ class ReviewerContextTests(unittest.TestCase):
         self.assertIn("scheduling hint", reviewer.prompt)
         self.assertIn("Changed a supporting file", reviewer.prompt)
         self.assertIn("SHARED PROJECT MEMORY:\nMEM", reviewer.prompt)
+        self.assertIn("Version: 3", reviewer.prompt)
+        self.assertIn("Patch SHA: abc123def456", reviewer.prompt)
+        self.assertIn("verdict applies only to this exact patch SHA", reviewer.prompt)
 
 
 class StepRoomTests(unittest.TestCase):
