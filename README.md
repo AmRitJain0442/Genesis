@@ -45,7 +45,7 @@ When you type `run <task>`, Genesis:
 5. Runs objective acceptance gates before spending a reviewer call, then binds the independent review verdict to that exact patch SHA.
 6. Runs configured verification commands in isolation.
 7. Applies only the reviewed changed-file manifest to the main repository and commits it.
-8. Records patches, gate results, reviews, repairs, verification, and progress in local memory and SQLite runtime state.
+8. Stores the authoritative patch artifact and audit trail in SQLite, then records only committed outcomes (or blocked failures) in project memory.
 
 During execution you see a live command-center dashboard with plan state, active workers, reviewer handoffs, streaming output, verification status, git activity, recent events, and usage metrics.
 
@@ -327,7 +327,7 @@ without paying for another planning pass.
 
 ## Memory
 
-Genesis writes a `GENESIS_MEMORY.md` file to the root of your repository. This records task plans, step outcomes, review verdicts, and completion timestamps.
+Genesis writes a `GENESIS_MEMORY.md` file to the root of your repository. This records task plans, committed step outcomes, blocked attempts, and completion timestamps. Writes are synchronized and durable, and prompt wakeups read only the bounded tail rather than scanning an ever-growing file.
 
 Workers and reviewers receive the retained task, complete plan, dependency
 state, prior step results, and project memory. Review prompts include a bounded
@@ -340,7 +340,7 @@ Genesis also keeps a local SQLite state database:
 ~/.genesis/state/genesis.db
 ```
 
-SQLite stores durable run events, checkpoints, verification results, patch artifacts, and searchable memory entries. Markdown memory remains the human-readable project log.
+SQLite stores durable run events, checkpoints, verification results, patch artifacts, and searchable memory entries. State transitions and their audit events commit together under a WAL-backed concurrency policy. Markdown memory remains the human-readable project log, while full patches are retained once as runtime artifacts instead of being duplicated into the search index.
 
 Search memory:
 

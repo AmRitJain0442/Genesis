@@ -205,27 +205,123 @@ class Orchestrator:
         cooldown = getattr(getattr(config, "failover", None), "cooldown_seconds", 900)
         self.registry = registry if registry is not None else AccountRegistry(cooldown)
 
+    @staticmethod
+    def _notify_callback(
+        callback: Callable | None,
+        name: str,
+        *args,
+        **kwargs,
+    ) -> None:
+        """Invoke an observer without allowing it to affect task execution."""
+        if callback is None:
+            return
+        try:
+            callback(*args, **kwargs)
+        except Exception:
+            logger.warning("Observer callback %s failed", name, exc_info=True)
+
+    def _fire_callback(
+        self,
+        callbacks: dict[str, Callable] | None,
+        name: str,
+        *args,
+        **kwargs,
+    ) -> None:
+        callback = (callbacks or {}).get(name)
+        self._notify_callback(callback, name, *args, **kwargs)
+
+    def _try_memory_write(
+        self,
+        operation: str,
+        write: Callable[[], None],
+        *,
+        run_id: str = "",
+        step_id: str = "",
+    ) -> bool:
+        """Persist supplemental Markdown memory without corrupting run state.
+
+        The SQLite runtime journal remains authoritative. A full/read-only disk
+        must be visible in that journal, but it must not turn already committed
+        code back into a pending or failed step.
+        """
+
+        try:
+            write()
+            return True
+        except Exception as exc:
+            logger.error("Memory %s failed: %s", operation, exc, exc_info=True)
+            if self.runtime and run_id:
+                try:
+                    self.runtime.record_event(
+                        run_id,
+                        "memory_write_failed",
+                        step_id=step_id,
+                        payload={"operation": operation, "error": str(exc)},
+                    )
+                except Exception:
+                    logger.warning("Could not journal the memory write failure", exc_info=True)
+            return False
+
+    @staticmethod
+    def _fit_memory_sections(
+        markdown: str,
+        palace: str,
+        max_chars: int,
+    ) -> tuple[str, str]:
+        """Fit recent Markdown and relevant Palace memory into one real budget."""
+
+        limit = max(0, int(max_chars))
+        if limit == 0:
+            return "", ""
+        if not markdown:
+            return "", palace[:limit]
+        if not palace:
+            return markdown[-limit:], ""
+
+        separator_size = len("\n\n---\n\n")
+        if limit <= separator_size:
+            return markdown[-limit:], ""
+        available = max(0, limit - separator_size)
+        if len(markdown) + len(palace) <= available:
+            return markdown, palace
+
+        markdown_size = min(len(markdown), available // 2)
+        palace_size = min(len(palace), available - markdown_size)
+        remaining = available - markdown_size - palace_size
+        if remaining and markdown_size < len(markdown):
+            extra = min(remaining, len(markdown) - markdown_size)
+            markdown_size += extra
+            remaining -= extra
+        if remaining and palace_size < len(palace):
+            palace_size += min(remaining, len(palace) - palace_size)
+        return (
+            markdown[-markdown_size:] if markdown_size else "",
+            palace[:palace_size] if palace_size else "",
+        )
+
     # ── Public API ─────────────────────────────────────────────────────────
 
     def plan(self, task: str, on_status=None) -> Plan:
         def status(msg: str) -> None:
-            if on_status:
-                try:
-                    on_status(msg)
-                except Exception:
-                    pass
+            self._notify_callback(on_status, "on_status", msg)
 
-        mem = self.memory.get_summary(self.config.memory.max_context_chars)
+        memory_budget = max(0, int(self.config.memory.max_context_chars))
+        try:
+            mem = self.memory.get_summary(memory_budget)
+        except Exception as exc:
+            logger.warning("Markdown memory wakeup failed: %s", exc)
+            mem = ""
         palace_mem = ""
-        if self.palace and self.config.memory.palace_enabled:
+        if memory_budget and self.palace and self.config.memory.palace_enabled:
             try:
                 palace_mem = self.palace.wakeup_context(
                     task,
-                    max_chars=self.config.memory.max_context_chars,
+                    max_chars=memory_budget,
                     wing=str(Path(self.work_dir).resolve()),
                 )
             except Exception as e:
                 logger.warning("Palace wakeup failed: %s", e)
+        mem, palace_mem = self._fit_memory_sections(mem, palace_mem, memory_budget)
         # Phase 2: let the two brains debate first; fold their agreed discussion
         # into the planning context so self.agent synthesizes the shared plan.
         discussion = self._run_brain_debate(task, context=mem, on_status=on_status)
@@ -295,12 +391,12 @@ class Orchestrator:
             logger.warning("Brain debate failed, falling back to single-brain plan: %s", e)
             return ""
 
-        if on_status:
-            try:
-                on_status("Brains reached consensus" if result.converged
-                          else "Round cap reached - arbitrating the plan")
-            except Exception:
-                pass
+        self._notify_callback(
+            on_status,
+            "on_status",
+            "Brains reached consensus" if result.converged
+            else "Round cap reached - arbitrating the plan",
+        )
 
         if not result.transcript:
             return ""
@@ -360,9 +456,13 @@ class Orchestrator:
         diff_block = self._bounded_diff(raw_diff, max_chars=16000)
         changed_manifest = self._bounded_manifest(result.files_written)
         run_context = self._run_context(plan, run_id, step, max_chars=8000)
-        project_memory = self.memory.get_summary(
-            min(6000, self.config.memory.max_context_chars)
-        )
+        try:
+            project_memory = self.memory.get_summary(
+                max(0, min(6000, int(self.config.memory.max_context_chars)))
+            )
+        except Exception as exc:
+            logger.warning("Markdown memory read failed during review: %s", exc)
+            project_memory = ""
         worker_summary = (result.result_text or "No worker summary captured.")[:3000]
         evidence = getattr(result, "evidence", None) or {}
         patch_version = evidence.get("version", "unknown")
@@ -461,9 +561,11 @@ class Orchestrator:
                 payload = self.runtime.get_checkpoint(saved.run_id, "plan_created")
                 if payload:
                     plan = Plan(**payload)
-                    cb = callbacks or {}
-                    if fn := cb.get("on_status"):
-                        fn(f"Reusing saved plan {saved.run_id}; planning is already complete.")
+                    self._fire_callback(
+                        callbacks,
+                        "on_status",
+                        f"Reusing saved plan {saved.run_id}; planning is already complete.",
+                    )
                     if saved.status == "blocked":
                         retry_ids: set[str] = set()
                         for record in self.runtime.steps(saved.run_id):
@@ -475,8 +577,7 @@ class Orchestrator:
                                 self.runtime.reset_step_for_retry(saved.run_id, step_id)
                     else:
                         self.runtime.update_run_status(saved.run_id, "running")
-                    if fn := cb.get("on_plan"):
-                        fn(plan)
+                    self._fire_callback(callbacks, "on_plan", plan)
                     self._execute_plan_isolated(plan, callbacks=callbacks)
                     return
         self._run_fresh_task(task, callbacks)
@@ -488,8 +589,11 @@ class Orchestrator:
             if saved:
                 payload = self.runtime.get_checkpoint(saved.run_id, "plan_created")
                 if payload:
-                    if on_status:
-                        on_status(f"Reusing saved plan {saved.run_id}.")
+                    self._notify_callback(
+                        on_status,
+                        "on_status",
+                        f"Reusing saved plan {saved.run_id}.",
+                    )
                     return Plan(**payload)
         plan = self.plan(task, on_status=on_status)
         if not plan.steps:
@@ -502,11 +606,8 @@ class Orchestrator:
         task: str,
         callbacks: dict[str, Callable] | None = None,
     ) -> None:
-        cb = callbacks or {}
-
         def fire(name: str, *args, **kwargs) -> None:
-            if fn := cb.get(name):
-                fn(*args, **kwargs)
+            self._fire_callback(callbacks, name, *args, **kwargs)
 
         fire("on_status", "Planning task...")
         plan = self.plan(task, on_status=lambda m: fire("on_status", m))
@@ -519,6 +620,7 @@ class Orchestrator:
 
     def _save_plan(self, task: str, plan: Plan, *, status: str) -> None:
         run_id = plan.task_id
+        ordered_steps = _topo_sort(plan.steps)
         if self.runtime:
             self.runtime.start_run(
                 task,
@@ -530,7 +632,7 @@ class Orchestrator:
                 },
             )
             self.runtime.checkpoint(run_id, "plan_created", payload=plan.model_dump())
-            for step in _topo_sort(plan.steps):
+            for step in ordered_steps:
                 self.runtime.upsert_step(
                     run_id,
                     step.step_id,
@@ -541,7 +643,11 @@ class Orchestrator:
             self.runtime.update_run_status(run_id, status)
 
         if self.config.memory.auto_append_plan:
-            self.memory.append_plan(plan)
+            self._try_memory_write(
+                "append_plan",
+                lambda: self.memory.append_plan(plan),
+                run_id=run_id,
+            )
         self._palace_add(
             run_id=run_id,
             step_id="",
@@ -572,8 +678,7 @@ class Orchestrator:
                     self.runtime.reset_step_for_retry(run_id, step_id)
         else:
             self.runtime.update_run_status(run_id, "running")
-        if callbacks and (fn := callbacks.get("on_plan")):
-            fn(plan)
+        self._fire_callback(callbacks, "on_plan", plan)
         self._execute_plan_isolated(plan, callbacks=callbacks)
 
     def _execute_plan_isolated(
@@ -588,13 +693,12 @@ class Orchestrator:
         worktree_lock = Lock()
 
         def fire(name: str, *args, **kwargs) -> None:
-            if fn := cb.get(name):
-                fn(*args, **kwargs)
+            self._fire_callback(callbacks, name, *args, **kwargs)
 
         def guarded_output(text: str) -> None:
             if output_callback:
                 with output_lock:
-                    output_callback(text)
+                    self._notify_callback(output_callback, "on_output", text)
 
         if not self.config.git.auto_commit:
             raise RuntimeError(
@@ -759,21 +863,6 @@ class Orchestrator:
                         fire("on_step_result", step, execution.result, execution.worker_name)
                     if execution.review:
                         fire("on_review", step, execution.review)
-                        if execution.patch:
-                            self.memory.append_step(
-                                step.step_id,
-                                step.title,
-                                execution.worker_name,
-                                execution.review.memory_note,
-                                execution.review.verdict,
-                            )
-                            self._remember_step(
-                                run_id,
-                                step,
-                                execution.worker_name,
-                                execution.review,
-                                execution.patch,
-                            )
 
                     if execution.failed:
                         self._block_step(
@@ -834,19 +923,32 @@ class Orchestrator:
                         paths=execution.patch.changed_files,
                     )
                     if not sha and execution.patch.has_changes:
+                        rollback_error = ""
+                        try:
+                            worktrees.rollback_patch(
+                                execution.patch.patch_text,
+                                execution.patch.changed_files,
+                            )
+                        except Exception as exc:
+                            rollback_error = f" Automatic rollback also failed: {exc}"
+                            logger.exception(
+                                "Could not roll back uncommitted patch for %s",
+                                step.step_id,
+                            )
+                        reason = (
+                            "Commit failed after applying approved patch."
+                            + rollback_error
+                        )
                         self._block_step(
                             run_id,
                             step,
                             "git",
-                            "Commit failed after applying approved patch.",
-                            "commit failed",
+                            reason,
+                            reason,
                             fire,
                         )
                         blocked_ids.add(step.step_id)
                         continue
-                    if sha and self.config.git.auto_push:
-                        self.git.push()
-                    fire("on_commit", step, sha)
                     if self.runtime:
                         self.runtime.upsert_step(
                             run_id,
@@ -868,6 +970,32 @@ class Orchestrator:
                                 },
                             ),
                         )
+                    self._try_memory_write(
+                        "append_step",
+                        lambda: self.memory.append_step(
+                            step.step_id,
+                            step.title,
+                            execution.worker_name,
+                            execution.review.memory_note,
+                            execution.review.verdict,
+                        ),
+                        run_id=run_id,
+                        step_id=step.step_id,
+                    )
+                    self._remember_step(
+                        run_id,
+                        step,
+                        execution.worker_name,
+                        execution.review,
+                        execution.patch,
+                        patch_artifact_id=execution.patch_id,
+                        commit_sha=sha or "",
+                    )
+                    # External publication and observers happen only after the
+                    # durable committed transition has been recorded.
+                    if sha and self.config.git.auto_push:
+                        self.git.push()
+                    fire("on_commit", step, sha)
                     if execution.worktree_path:
                         try:
                             worktrees.remove(execution.worktree_path)
@@ -880,7 +1008,11 @@ class Orchestrator:
 
         if completed == len(steps) and not blocked_ids:
             release_summary = self._release_summary(plan, completed, len(steps))
-            self.memory.complete_task(plan.task_id)
+            self._try_memory_write(
+                "complete_task",
+                lambda: self.memory.complete_task(plan.task_id),
+                run_id=run_id,
+            )
             if self.runtime:
                 self.runtime.record_event(
                     run_id,
@@ -967,6 +1099,11 @@ class Orchestrator:
             # current one hits its rate/usage limit.
             worker_state = {"name": worker_name, "agent": worker_agent}
             turn_version = 0
+            # Run context does not change during implementation turns; revision
+            # instructions travel in the revised Step itself. Reusing this
+            # bounded snapshot avoids rereading Markdown and querying FTS for
+            # every dialogue/retry turn.
+            step_memory = self._step_memory(step, plan, run_id)
 
             def run_turn(s):
                 nonlocal turn_version
@@ -978,6 +1115,7 @@ class Orchestrator:
                     step_room,
                     plan=plan,
                     run_id=run_id,
+                    memory_summary=step_memory,
                 )
                 if result is not None and result.success:
                     turn_version += 1
@@ -1700,15 +1838,31 @@ class Orchestrator:
         plan: Plan | None = None,
         run_id: str = "",
     ) -> str:
-        mem_summary = self.memory.get_summary(self.config.memory.max_context_chars)
-        if self.palace and self.config.memory.palace_enabled:
-            palace_context = self.palace.wakeup_context(
-                f"{step.title}\n{step.description}",
-                max_chars=self.config.memory.max_context_chars,
-                wing=str(Path(self.work_dir).resolve()),
-            )
-            if palace_context:
-                mem_summary = mem_summary + "\n\n---\n\n" + palace_context
+        memory_budget = max(0, int(self.config.memory.max_context_chars))
+        try:
+            markdown_context = self.memory.get_summary(memory_budget)
+        except Exception as exc:
+            logger.warning("Markdown memory wakeup failed for %s: %s", step.step_id, exc)
+            markdown_context = ""
+        palace_context = ""
+        if memory_budget and self.palace and self.config.memory.palace_enabled:
+            try:
+                palace_context = self.palace.wakeup_context(
+                    f"{step.title}\n{step.description}",
+                    max_chars=memory_budget,
+                    wing=str(Path(self.work_dir).resolve()),
+                )
+            except Exception as exc:
+                logger.warning("Palace wakeup failed for %s: %s", step.step_id, exc)
+        markdown_context, palace_context = self._fit_memory_sections(
+            markdown_context,
+            palace_context,
+            memory_budget,
+        )
+        mem_summary = markdown_context
+        if palace_context:
+            separator = "\n\n---\n\n" if mem_summary else ""
+            mem_summary += separator + palace_context
         # Phase 3: give the worker a specialty framing so it focuses on producing
         # fully-tested, production-quality work in the area this step needs.
         specialty = self._specialty_for(step)
@@ -1748,6 +1902,9 @@ class Orchestrator:
         worker_name: str,
         review: Review,
         patch: WorktreePatch,
+        *,
+        patch_artifact_id: str = "",
+        commit_sha: str = "",
     ) -> None:
         self._palace_add(
             run_id=run_id,
@@ -1761,10 +1918,18 @@ class Orchestrator:
                 f"Score: {review.quality_score}/10\n\n"
                 f"Memory note:\n{review.memory_note}\n\n"
                 f"Files:\n{chr(10).join(patch.changed_files)}\n\n"
-                f"Patch:\n{patch.patch_text}"
+                f"Commit: {commit_sha or 'not recorded'}\n"
+                f"Patch SHA: {patch.patch_sha}\n"
+                f"Patch artifact: {patch_artifact_id or 'not retained'}"
             ),
             status=review.verdict,
-            metadata={"worker": worker_name, "files": patch.changed_files},
+            metadata={
+                "worker": worker_name,
+                "files": patch.changed_files,
+                "commit_sha": commit_sha,
+                "patch_sha": patch.patch_sha,
+                "patch_artifact_id": patch_artifact_id,
+            },
         )
 
     def _record_review(
@@ -1952,7 +2117,18 @@ class Orchestrator:
         fire: Callable,
     ) -> None:
         fire("on_error", step, reason)
-        self.memory.append_step(step.step_id, step.title, agent, memory_note, "rejected")
+        self._try_memory_write(
+            "append_blocked_step",
+            lambda: self.memory.append_step(
+                step.step_id,
+                step.title,
+                agent,
+                memory_note,
+                "rejected",
+            ),
+            run_id=run_id,
+            step_id=step.step_id,
+        )
         if self.runtime:
             self.runtime.upsert_step(
                 run_id,
@@ -2188,6 +2364,7 @@ class Orchestrator:
         *,
         plan: Plan | None = None,
         run_id: str = "",
+        memory_summary: str | None = None,
     ) -> WorkerResult:
         """Run one worker turn; if the account is exhausted, mark it and retry on
         an alternate worker. `state` ({name, agent}) is updated in place so later
@@ -2197,7 +2374,13 @@ class Orchestrator:
             name, agent = state["name"], state["agent"]
             tried.add(name)
             worker = _make_worker(
-                agent, self._step_memory(step, plan, run_id), str(worktree_path),
+                agent,
+                (
+                    memory_summary
+                    if memory_summary is not None
+                    else self._step_memory(step, plan, run_id)
+                ),
+                str(worktree_path),
                 output_callback=output_callback,
             )
             result = worker.execute(step)
@@ -2312,7 +2495,24 @@ class Orchestrator:
 
 def _topo_sort(steps: list[Step]) -> list[Step]:
     """Return steps in dependency order via DFS with cycle detection."""
-    by_id = {s.step_id: s for s in steps}
+    by_id: dict[str, Step] = {}
+    for step in steps:
+        if not step.step_id.strip():
+            raise ValueError("Plan contains an empty step ID")
+        if step.step_id in by_id:
+            raise ValueError(f"Duplicate step ID: '{step.step_id}'")
+        by_id[step.step_id] = step
+
+    unknown_dependencies = sorted({
+        dependency
+        for step in steps
+        for dependency in step.depends_on
+        if dependency not in by_id
+    })
+    if unknown_dependencies:
+        names = ", ".join(repr(dependency) for dependency in unknown_dependencies)
+        raise ValueError(f"Unknown step dependencies: {names}")
+
     result: list[Step] = []
     visited: set[str] = set()
     visiting: set[str] = set()  # current DFS path — detects cycles

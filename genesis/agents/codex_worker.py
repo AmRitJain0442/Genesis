@@ -8,8 +8,9 @@ reads the git diff to discover which files were created or modified.
 from __future__ import annotations
 import logging
 import hashlib
+import os
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -20,6 +21,13 @@ if TYPE_CHECKING:
 from genesis.agents.worker import WorkerResult
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _WorkspaceSnapshot:
+    fingerprints: dict[str, str]
+    head: str = ""
+    git_backed: bool = False
 
 _WORKER_PROMPT_TEMPLATE = """\
 You are an expert software engineer executing a single task.
@@ -131,18 +139,54 @@ class CodexWorker:
 
     # ── File change detection ──────────────────────────────────────────────
 
-    def _snapshot(self) -> dict[str, str]:
-        """Return {relative_path: sha256} for all relevant files in work_dir."""
-        snap: dict[str, str] = {}
-        for relative in self._git_visible_files():
-            p = self.work_dir / relative
-            if not p.is_file():
-                continue
-            try:
-                snap[relative] = hashlib.sha256(p.read_bytes()).hexdigest()
-            except Exception:
-                pass
-        return snap
+    def _snapshot(self) -> _WorkspaceSnapshot:
+        """Snapshot only Git-dirty paths, falling back outside repositories.
+
+        A clean tracked file is represented implicitly by the current HEAD.
+        This changes the common path from hashing every byte in the repository
+        twice per worker turn to hashing only files that are already dirty or
+        become dirty. HEAD-to-HEAD comparison still detects workers that commit
+        their changes before returning (including timeout/partial-work cases).
+        """
+
+        try:
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.work_dir),
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                ],
+                capture_output=True,
+                check=True,
+            )
+            head_result = subprocess.run(
+                ["git", "-C", str(self.work_dir), "rev-parse", "--verify", "HEAD"],
+                capture_output=True,
+                check=False,
+            )
+            head = (
+                head_result.stdout.decode("ascii", errors="replace").strip()
+                if head_result.returncode == 0
+                else ""
+            )
+            fingerprints = {
+                relative: self._fingerprint(relative)
+                for relative in self._porcelain_paths(status.stdout)
+                if not _is_ignored(self.work_dir / relative, self.work_dir)
+            }
+            return _WorkspaceSnapshot(fingerprints, head=head, git_backed=True)
+        except (OSError, subprocess.SubprocessError):
+            snap: dict[str, str] = {}
+            for relative in self._git_visible_files():
+                try:
+                    snap[relative] = self._fingerprint(relative)
+                except OSError:
+                    pass
+            return _WorkspaceSnapshot(snap)
 
     def _git_visible_files(self) -> list[str]:
         """Tracked and non-ignored untracked files, excluding cache noise."""
@@ -174,14 +218,88 @@ class CodexWorker:
                 if path.is_file() and not _is_ignored(path, self.work_dir)
             )
 
-    def _diff(self, before: dict[str, str]) -> list[str]:
+    def _diff(self, before: _WorkspaceSnapshot) -> list[str]:
         """Return files that are new or modified since the snapshot."""
         after = self._snapshot()
-        return sorted(
+        changed = {
             path
-            for path in set(before) | set(after)
-            if before.get(path) != after.get(path)
-        )
+            for path in set(before.fingerprints) | set(after.fingerprints)
+            if before.fingerprints.get(path) != after.fingerprints.get(path)
+        }
+        if before.git_backed and after.git_backed and before.head != after.head:
+            changed.update(self._head_changed_paths(before.head, after.head))
+        return sorted(changed)
+
+    def _fingerprint(self, relative: str) -> str:
+        path = self.work_dir / relative
+        if path.is_symlink():
+            return "link:" + os.readlink(path)
+        if path.is_file():
+            mode = path.stat().st_mode & 0o777
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            return f"file:{mode:o}:{digest}"
+        if path.is_dir():
+            result = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                return "dir:" + result.stdout.decode("ascii", errors="replace").strip()
+            return "dir"
+        return "missing"
+
+    @staticmethod
+    def _porcelain_paths(output: bytes) -> list[str]:
+        """Parse NUL-delimited porcelain output without quoted-path ambiguity."""
+
+        records = output.split(b"\0")
+        paths: list[str] = []
+        index = 0
+        while index < len(records):
+            record = records[index]
+            index += 1
+            if not record or len(record) < 4:
+                continue
+            status = record[:2].decode("ascii", errors="replace")
+            path = record[3:].decode("utf-8", errors="replace")
+            if path:
+                paths.append(path.replace("\\", "/"))
+            if "R" in status or "C" in status:
+                if index < len(records) and records[index]:
+                    original = records[index].decode("utf-8", errors="replace")
+                    paths.append(original.replace("\\", "/"))
+                index += 1
+        return sorted(set(paths))
+
+    def _head_changed_paths(self, before: str, after: str) -> list[str]:
+        if not after:
+            return []
+        if before:
+            args = ["diff", "--name-only", "-z", before, after]
+        else:
+            args = [
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "-z",
+                after,
+            ]
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(self.work_dir), *args],
+                capture_output=True,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return [
+            item.decode("utf-8", errors="replace").replace("\\", "/")
+            for item in result.stdout.split(b"\0")
+            if item
+        ]
 
 
 def _is_ignored(path: Path, root: Path) -> bool:

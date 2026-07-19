@@ -20,11 +20,14 @@ def terminate_process_tree(proc: "subprocess.Popen") -> None:
         return
     try:
         if os.name == "nt":
-            subprocess.run(
+            result = subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                 capture_output=True,
                 check=False,
+                timeout=10,
             )
+            if result.returncode != 0 and proc.poll() is None:
+                proc.kill()
         else:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)

@@ -2,18 +2,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, ContextManager
 
+from genesis._sqlite import enable_wal, sqlite_connection
 from genesis.config import CONFIG_DIR, GenesisConfig
 
 
+logger = logging.getLogger(__name__)
+
+_QUERY_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "do", "for",
+    "from", "in", "into", "is", "it", "of", "on", "or", "please", "that",
+    "the", "this", "to", "with",
+}
+
+
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _json(data: dict[str, Any] | None) -> str:
@@ -21,8 +32,28 @@ def _json(data: dict[str, Any] | None) -> str:
 
 
 def _terms(query: str) -> str:
-    parts = re.findall(r"[\w./:-]+", query)
-    return " ".join(parts) if parts else query
+    """Build a safe, recall-oriented FTS query from natural language.
+
+    Full task descriptions contain plenty of words that will not occur in a
+    useful memory. Requiring every word (FTS' implicit AND) therefore hides the
+    relevant record. Quoted OR terms are safe from FTS operators and let bm25
+    rank records matching several terms ahead of one-word matches.
+    """
+
+    parts = _query_terms(query)
+    if not parts:
+        return ""
+    quoted = [f'"{part}"' for part in parts]
+    if len(quoted) == 1:
+        return quoted[0]
+    phrase = '"' + " ".join(parts) + '"'
+    return " OR ".join([phrase, *quoted])
+
+
+def _query_terms(query: str) -> list[str]:
+    all_parts = list(dict.fromkeys(re.findall(r"\w+", query, flags=re.UNICODE)))
+    meaningful = [part for part in all_parts if part.casefold() not in _QUERY_STOP_WORDS]
+    return (meaningful or all_parts)[:16]
 
 
 @dataclass(frozen=True)
@@ -50,19 +81,19 @@ class PalaceStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fts_enabled = False
         self._ensure_schema()
 
     @classmethod
     def from_config(cls, config: GenesisConfig) -> "PalaceStore":
         return cls(resolve_state_db(config))
 
-    def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.db_path, timeout=30.0)
-        con.row_factory = sqlite3.Row
-        return con
+    def _connect(self) -> ContextManager[sqlite3.Connection]:
+        return sqlite_connection(self.db_path)
 
     def _ensure_schema(self) -> None:
         with self._connect() as con:
+            enable_wal(con)
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS palace_drawers (
@@ -85,19 +116,6 @@ class PalaceStore:
                 """
             )
             con.execute(
-                """
-                CREATE VIRTUAL TABLE IF NOT EXISTS palace_fts USING fts5(
-                    drawer_id UNINDEXED,
-                    wing,
-                    room,
-                    closet,
-                    title,
-                    content,
-                    tokenize='unicode61'
-                )
-                """
-            )
-            con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_palace_run ON palace_drawers(run_id)"
             )
             con.execute(
@@ -106,6 +124,40 @@ class PalaceStore:
             con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_palace_scope ON palace_drawers(wing, room, closet)"
             )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_palace_recent ON palace_drawers(created_at DESC)"
+            )
+            try:
+                con.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS palace_fts USING fts5(
+                        drawer_id UNINDEXED,
+                        wing,
+                        room,
+                        closet,
+                        title,
+                        content,
+                        tokenize='unicode61'
+                    )
+                    """
+                )
+                # Recover canonical rows written while FTS was unavailable.
+                con.execute(
+                    """
+                    INSERT INTO palace_fts(drawer_id, wing, room, closet, title, content)
+                    SELECT d.id, d.wing, d.room, d.closet, d.title, d.content
+                    FROM palace_drawers AS d
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM palace_fts AS f WHERE f.drawer_id = d.id
+                    )
+                    """
+                )
+                self._fts_enabled = True
+            except sqlite3.DatabaseError as exc:
+                # FTS5 is optional in some Python/SQLite builds. Canonical
+                # verbatim memory remains available through the LIKE fallback.
+                logger.warning("Palace full-text index unavailable; using fallback search: %s", exc)
+                self._fts_enabled = False
 
     def add_drawer(
         self,
@@ -125,19 +177,51 @@ class PalaceStore:
     ) -> str:
         content = content or ""
         created_at = _utc_now()
-        digest = hashlib.sha256(
-            "\n".join([wing, room, closet, kind, title, source, content]).encode("utf-8")
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        # Provenance is part of record identity. The same words produced by two
+        # runs must remain independently attributable instead of one run
+        # replacing the other's canonical memory.
+        identity_hash = hashlib.sha256(
+            "\n".join(
+                [
+                    wing,
+                    room,
+                    closet,
+                    kind,
+                    title,
+                    source,
+                    run_id,
+                    step_id,
+                    file_path,
+                    status,
+                    content_hash,
+                ]
+            ).encode("utf-8")
         ).hexdigest()
-        drawer_id = "mem_" + digest[:20]
+        drawer_id = "mem_" + identity_hash[:20]
         with self._connect() as con:
             con.execute(
                 """
-                INSERT OR REPLACE INTO palace_drawers (
+                INSERT INTO palace_drawers (
                     id, wing, room, closet, kind, title, content, source,
                     run_id, step_id, file_path, status, content_hash,
                     metadata_json, created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    wing = excluded.wing,
+                    room = excluded.room,
+                    closet = excluded.closet,
+                    kind = excluded.kind,
+                    title = excluded.title,
+                    content = excluded.content,
+                    source = excluded.source,
+                    run_id = excluded.run_id,
+                    step_id = excluded.step_id,
+                    file_path = excluded.file_path,
+                    status = excluded.status,
+                    content_hash = excluded.content_hash,
+                    metadata_json = excluded.metadata_json
                 """,
                 (
                     drawer_id,
@@ -152,19 +236,26 @@ class PalaceStore:
                     step_id,
                     file_path,
                     status,
-                    digest,
+                    content_hash,
                     _json(metadata),
                     created_at,
                 ),
             )
-            con.execute("DELETE FROM palace_fts WHERE drawer_id = ?", (drawer_id,))
-            con.execute(
-                """
-                INSERT INTO palace_fts(drawer_id, wing, room, closet, title, content)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (drawer_id, wing, room, closet, title, content),
-            )
+            if self._fts_enabled:
+                try:
+                    con.execute("DELETE FROM palace_fts WHERE drawer_id = ?", (drawer_id,))
+                    con.execute(
+                        """
+                        INSERT INTO palace_fts(drawer_id, wing, room, closet, title, content)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (drawer_id, wing, room, closet, title, content),
+                    )
+                except sqlite3.DatabaseError as exc:
+                    # Index damage/unavailability must never discard the
+                    # canonical verbatim record in palace_drawers.
+                    logger.warning("Palace full-text update failed; memory kept canonically: %s", exc)
+                    self._fts_enabled = False
         return drawer_id
 
     def search(
@@ -177,13 +268,22 @@ class PalaceStore:
         limit: int = 10,
     ) -> list[MemoryHit]:
         query = query.strip()
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
         if not query:
             return self.recent(limit=limit, wing=wing, room=room, closet=closet)
 
-        try:
-            return self._search_fts(query, wing=wing, room=room, closet=closet, limit=limit)
-        except sqlite3.Error:
-            return self._search_like(query, wing=wing, room=room, closet=closet, limit=limit)
+        if self._fts_enabled and _terms(query):
+            try:
+                hits = self._search_fts(
+                    query, wing=wing, room=room, closet=closet, limit=limit
+                )
+                if hits:
+                    return hits
+            except sqlite3.Error as exc:
+                logger.warning("Palace full-text search failed; using fallback: %s", exc)
+        return self._search_like(query, wing=wing, room=room, closet=closet, limit=limit)
 
     def _search_fts(
         self,
@@ -228,9 +328,18 @@ class PalaceStore:
         closet: str | None,
         limit: int,
     ) -> list[MemoryHit]:
-        clauses = ["(title LIKE ? OR content LIKE ?)"]
-        like = f"%{query}%"
-        params: list[Any] = [like, like]
+        raw_terms = _query_terms(query)
+        raw_terms = raw_terms or [query]
+        term_clauses: list[str] = []
+        params: list[Any] = []
+        for term in raw_terms:
+            escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{escaped}%"
+            term_clauses.append(
+                "(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')"
+            )
+            params.extend([like, like])
+        clauses = ["(" + " OR ".join(term_clauses) + ")"]
         if wing:
             clauses.append("wing = ?")
             params.append(wing)
@@ -260,6 +369,9 @@ class PalaceStore:
         room: str | None = None,
         closet: str | None = None,
     ) -> list[MemoryHit]:
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
         clauses: list[str] = []
         params: list[Any] = []
         if wing:
@@ -279,7 +391,7 @@ class PalaceStore:
                 SELECT *, 0.0 AS score
                 FROM palace_drawers
                 {where}
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, rowid DESC
                 LIMIT ?
                 """,
                 params,
@@ -287,6 +399,9 @@ class PalaceStore:
         return [self._hit(row) for row in rows]
 
     def wakeup_context(self, query: str, *, max_chars: int = 6000, wing: str = "") -> str:
+        max_chars = max(0, int(max_chars))
+        if max_chars == 0:
+            return ""
         hits = self.search(query, wing=wing or None, limit=8)
         if not hits:
             return ""
@@ -303,10 +418,47 @@ class PalaceStore:
                 f"{snippet}\n"
             )
             if used + len(block) > max_chars:
+                remaining = max_chars - used
+                if remaining > 1:
+                    lines.append(block[:remaining].rstrip())
                 break
             lines.append(block)
             used += len(block)
-        return "\n".join(lines)
+        return "\n".join(lines)[:max_chars]
+
+    def rebuild_search_index(self) -> bool:
+        """Rebuild the disposable FTS index from canonical drawer records."""
+
+        try:
+            with self._connect() as con:
+                con.execute("BEGIN IMMEDIATE")
+                con.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS palace_fts USING fts5(
+                        drawer_id UNINDEXED,
+                        wing,
+                        room,
+                        closet,
+                        title,
+                        content,
+                        tokenize='unicode61'
+                    )
+                    """
+                )
+                con.execute("DELETE FROM palace_fts")
+                con.execute(
+                    """
+                    INSERT INTO palace_fts(drawer_id, wing, room, closet, title, content)
+                    SELECT id, wing, room, closet, title, content
+                    FROM palace_drawers
+                    """
+                )
+            self._fts_enabled = True
+            return True
+        except sqlite3.DatabaseError as exc:
+            logger.warning("Could not rebuild Palace full-text index: %s", exc)
+            self._fts_enabled = False
+            return False
 
     def import_markdown(
         self,
@@ -335,10 +487,6 @@ class PalaceStore:
         return 1
 
     def _hit(self, row: sqlite3.Row) -> MemoryHit:
-        try:
-            metadata = json.loads(row["metadata_json"] or "{}")
-        except json.JSONDecodeError:
-            metadata = {}
         return MemoryHit(
             id=row["id"],
             wing=row["wing"],
@@ -350,7 +498,7 @@ class PalaceStore:
             source=row["source"],
             created_at=row["created_at"],
             score=float(row["score"] or 0.0),
-            metadata=metadata,
+            metadata=_loads(row["metadata_json"]),
         )
 
 
@@ -359,3 +507,11 @@ def resolve_state_db(config: GenesisConfig) -> Path:
     if configured:
         return Path(configured).expanduser()
     return CONFIG_DIR / "state" / "genesis.db"
+
+
+def _loads(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}

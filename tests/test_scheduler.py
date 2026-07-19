@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from genesis.agents.orchestrator import _topo_sort
 from genesis.scheduler import (
     DependencyScheduler,
     StepScope,
@@ -93,6 +94,20 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(("*",), broad.paths)
         self.assertEqual(("*",), invalid.paths)
 
+    def test_declared_glob_scopes_serialize_conservatively(self) -> None:
+        for index, path in enumerate([
+            "src/**/*.py",
+            "src/file?.py",
+            "src/[ab].py",
+            "src/{app,cli}.py",
+        ]):
+            with self.subTest(path=path):
+                scope = effective_step_scope(
+                    make_step(f"step-{index}", file_scope=[path])
+                )
+                self.assertEqual(("*",), scope.paths)
+                self.assertEqual("declared", scope.source)
+
     def test_selects_only_ready_non_overlapping_steps(self) -> None:
         scheduler = DependencyScheduler([
             make_step("step-1", context_hint="src/a.py"),
@@ -109,6 +124,18 @@ class SchedulerTests(unittest.TestCase):
         )
 
         self.assertEqual(["step-1", "step-2"], [item.step.step_id for item in selected])
+
+    def test_topological_sort_rejects_duplicate_step_ids(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Duplicate step ID"):
+            _topo_sort([make_step("duplicate"), make_step("duplicate")])
+
+    def test_topological_sort_rejects_empty_step_ids(self) -> None:
+        with self.assertRaisesRegex(ValueError, "empty step ID"):
+            _topo_sort([make_step("   ")])
+
+    def test_topological_sort_rejects_unknown_dependencies(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unknown step dependencies.*missing"):
+            _topo_sort([make_step("step-1", depends_on=["missing"])])
 
 
 if __name__ == "__main__":
