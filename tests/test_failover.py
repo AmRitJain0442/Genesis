@@ -217,6 +217,41 @@ class WorkerFailoverTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("codex-main", orch.registry.exhausted_names())
 
+    def test_supplied_memory_snapshot_is_reused_without_wakeup(self) -> None:
+        agent = types.SimpleNamespace(name="codex-main")
+        observed_memory = []
+
+        def fake_make_worker(agent, mem, wd, output_callback=None):
+            observed_memory.append(mem)
+            return types.SimpleNamespace(execute=lambda s: WorkerResult(
+                step_id=s.step_id,
+                raw_response="",
+                result_text="ok",
+                success=True,
+            ))
+
+        original = orch_mod._make_worker
+        orch_mod._make_worker = fake_make_worker
+        try:
+            orch = _orch({"codex-main": agent})
+            orch.memory.get_summary = lambda _limit: (_ for _ in ()).throw(
+                AssertionError("memory should have been cached")
+            )
+            state = {"name": "codex-main", "agent": agent}
+            result = orch._worker_execute_with_failover(
+                _step(),
+                ".",
+                None,
+                state,
+                "",
+                memory_summary="cached context",
+            )
+        finally:
+            orch_mod._make_worker = original
+
+        self.assertTrue(result.success)
+        self.assertEqual(["cached context"], observed_memory)
+
 
 class BrainFailoverTests(unittest.TestCase):
     def test_invoke_fails_over_on_exhaustion(self) -> None:

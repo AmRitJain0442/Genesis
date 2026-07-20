@@ -41,6 +41,17 @@ class SpecialtyTests(unittest.TestCase):
         self.assertIn("YOUR SPECIALTY FOR THIS STEP: testing & test coverage", mem)
         self.assertIn("MEM", mem)
 
+    def test_memory_sections_share_one_strict_budget(self) -> None:
+        markdown, palace = Orchestrator._fit_memory_sections(
+            "m" * 100,
+            "p" * 100,
+            51,
+        )
+
+        self.assertLessEqual(len(markdown) + len("\n\n---\n\n") + len(palace), 51)
+        self.assertTrue(markdown)
+        self.assertTrue(palace)
+
 
 class ReviewerSelectionTests(unittest.TestCase):
     def test_prefers_peer_brain_as_reviewer(self) -> None:

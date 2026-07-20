@@ -277,6 +277,35 @@ class WorktreeManager:
             return
         self._git_stdin(patch_text, "apply", "--binary", "-")
 
+    def rollback_patch(self, patch_text: str, paths: list[str]) -> None:
+        """Reverse an applied patch after a pre-commit integration failure.
+
+        ``GitManager.commit_step`` stages the reviewed manifest before it tries
+        to commit. Reset only those paths to HEAD, verify the exact reverse
+        patch, then apply it. This leaves unrelated workspace state untouched.
+        """
+
+        if not patch_text.strip():
+            return
+        if not paths:
+            raise RuntimeError("cannot safely roll back a patch without its manifest")
+        self._git("reset", "--mixed", "HEAD", "--", *paths)
+        self._git_stdin(
+            patch_text,
+            "apply",
+            "--check",
+            "--reverse",
+            "--binary",
+            "-",
+        )
+        self._git_stdin(
+            patch_text,
+            "apply",
+            "--reverse",
+            "--binary",
+            "-",
+        )
+
     def remove(self, worktree_path: str | Path) -> None:
         path = Path(worktree_path).resolve()
         self._assert_under(path, self.worktrees_root.resolve())

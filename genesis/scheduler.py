@@ -17,6 +17,7 @@ _PATH_RE = re.compile(
 )
 _TRAILING_PUNCTUATION = ".,;:)]}'\""
 _LEADING_PUNCTUATION = "([{'\""
+_GLOB_METACHARACTERS = frozenset("*?[]{}")
 _BROAD_WORDS = {
     "architecture",
     "config",
@@ -161,6 +162,8 @@ def declared_step_scope(step: Step) -> StepScope | None:
         if not candidate:
             continue
         if candidate == WILDCARD_SCOPE:
+            return StepScope(step_id=step.step_id, paths=(WILDCARD_SCOPE,), source="declared")
+        if any(char in candidate for char in _GLOB_METACHARACTERS):
             return StepScope(step_id=step.step_id, paths=(WILDCARD_SCOPE,), source="declared")
         normalized = _normalize_path_candidate(candidate)
         if not normalized:

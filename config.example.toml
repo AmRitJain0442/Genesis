@@ -128,7 +128,7 @@ checkpoint_mode = "always"
 
 [memory]
 file              = "GENESIS_MEMORY.md"
-max_context_chars = 6000
+max_context_chars = 6000       # total Markdown + Palace memory budget per prompt
 auto_append_plan  = true
 palace_enabled    = true   # store searchable verbatim memories in SQLite
 

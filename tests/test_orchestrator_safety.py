@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from genesis.agents.base import AgentInfo, BaseAgent
 from genesis.agents.orchestrator import Orchestrator
@@ -128,6 +129,13 @@ class FakeWorkerAgent(BaseAgent):
             "</code>\n"
             "</result>"
         )
+
+
+class ProgressWorkerAgent(FakeWorkerAgent):
+    def chat(self, system: str, messages: list[dict], output_callback=None) -> str:
+        if output_callback:
+            output_callback("worker progress")
+        return super().chat(system, messages, output_callback=output_callback)
 
 
 class OrchestratorSafetyTests(unittest.TestCase):
@@ -313,6 +321,7 @@ class OrchestratorSafetyTests(unittest.TestCase):
             memory = MemoryManager(str(root / "GENESIS_MEMORY.md"))
             git = GitManager(str(root), cfg.git)
             runtime = RuntimeStore(cfg.runtime.state_db)
+            palace = PalaceStore(cfg.runtime.state_db)
 
             orchestrator = Orchestrator(
                 FakePlanReviewAgent(verdict="approved", task_id="run-ok"),
@@ -322,7 +331,7 @@ class OrchestratorSafetyTests(unittest.TestCase):
                 cfg,
                 str(root),
                 runtime=runtime,
-                palace=PalaceStore(cfg.runtime.state_db),
+                palace=palace,
                 policy=ExecutionPolicy(),
             )
 
@@ -338,6 +347,221 @@ class OrchestratorSafetyTests(unittest.TestCase):
             self.assertIn("review_completed", event_types)
             self.assertIn("verification_completed", event_types)
             self.assertIn("release_summary", event_types)
+            outcomes = palace.recent(room="run-ok", closet="steps")
+            self.assertEqual(1, len(outcomes))
+            self.assertNotIn("Patch:\n", outcomes[0].content)
+            self.assertIn(step.patch_artifact_id, outcomes[0].content)
+            self.assertIn(step.commit_sha, outcomes[0].content)
+            git.close()
+
+    def test_markdown_memory_failure_does_not_undo_committed_work(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.verification.commands = []
+            cfg.dialogue.enabled = False
+            memory = MemoryManager(str(root / "GENESIS_MEMORY.md"))
+            runtime = RuntimeStore(cfg.runtime.state_db)
+            git = GitManager(str(root), cfg.git)
+            orchestrator = Orchestrator(
+                FakePlanReviewAgent(verdict="approved", task_id="run-memory-failure"),
+                {"fake-worker": FakeWorkerAgent(filename="durable.txt", content="ok")},
+                memory,
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=PalaceStore(cfg.runtime.state_db),
+                policy=ExecutionPolicy(),
+            )
+
+            with patch.object(
+                memory,
+                "append_step",
+                side_effect=OSError("disk full"),
+            ):
+                orchestrator.run_task("commit despite supplemental memory failure")
+
+            self.assertEqual("ok\n", (root / "durable.txt").read_text(encoding="utf-8"))
+            self.assertEqual("completed", runtime.get_run("run-memory-failure").status)
+            failures = [
+                event for event in runtime.events("run-memory-failure")
+                if event.event_type == "memory_write_failed"
+            ]
+            self.assertEqual(1, len(failures))
+            self.assertEqual("append_step", failures[0].payload["operation"])
+            git.close()
+
+    def test_observer_callback_exceptions_do_not_fail_successful_work(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.verification.commands = []
+            cfg.dialogue.enabled = False
+            runtime = RuntimeStore(cfg.runtime.state_db)
+            git = GitManager(str(root), cfg.git)
+            orchestrator = Orchestrator(
+                FakePlanReviewAgent(verdict="approved", task_id="run-callbacks"),
+                {"fake-worker": ProgressWorkerAgent(filename="ok.txt", content="ok")},
+                MemoryManager(str(root / "GENESIS_MEMORY.md")),
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=PalaceStore(cfg.runtime.state_db),
+                policy=ExecutionPolicy(),
+            )
+
+            observed: set[str] = set()
+
+            def exploding(name: str):
+                def callback(*args, **kwargs):
+                    observed.add(name)
+                    raise RuntimeError(f"observer failed: {name}")
+                return callback
+
+            callback_names = {
+                "on_status",
+                "on_plan",
+                "on_step_start",
+                "on_worker_assigned",
+                "on_output",
+                "on_step_result",
+                "on_review",
+                "on_commit",
+                "on_step_complete",
+                "on_task_complete",
+            }
+            callbacks = {name: exploding(name) for name in callback_names}
+
+            orchestrator.run_task("complete despite observer errors", callbacks=callbacks)
+
+            self.assertEqual(callback_names, observed)
+            self.assertEqual("ok\n", (root / "ok.txt").read_text(encoding="utf-8"))
+            self.assertEqual("completed", runtime.get_run("run-callbacks").status)
+            git.close()
+
+    def test_on_error_callback_exception_does_not_hide_blocked_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.verification.commands = []
+            cfg.dialogue.enabled = False
+            runtime = RuntimeStore(cfg.runtime.state_db)
+            git = GitManager(str(root), cfg.git)
+            orchestrator = Orchestrator(
+                FakePlanReviewAgent(verdict="rejected", task_id="run-error-callback"),
+                {"fake-worker": FakeWorkerAgent()},
+                MemoryManager(str(root / "GENESIS_MEMORY.md")),
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=PalaceStore(cfg.runtime.state_db),
+                policy=ExecutionPolicy(),
+            )
+            called = []
+
+            def on_error(*args, **kwargs):
+                called.append(True)
+                raise RuntimeError("observer failed")
+
+            orchestrator.run_task(
+                "block despite observer error",
+                callbacks={"on_error": on_error},
+            )
+
+            self.assertEqual([True], called)
+            self.assertEqual("blocked", runtime.get_run("run-error-callback").status)
+            WorktreeManager(root).cleanup_run("run-error-callback")
+            git.close()
+
+    def test_apply_failure_does_not_record_approved_outcome_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.verification.commands = []
+            cfg.dialogue.enabled = False
+            memory = MemoryManager(str(root / "GENESIS_MEMORY.md"))
+            runtime = RuntimeStore(cfg.runtime.state_db)
+            palace = PalaceStore(cfg.runtime.state_db)
+            git = GitManager(str(root), cfg.git)
+            orchestrator = Orchestrator(
+                FakePlanReviewAgent(verdict="approved", task_id="run-apply-failure"),
+                {"fake-worker": FakeWorkerAgent(filename="ok.txt", content="ok")},
+                memory,
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=palace,
+                policy=ExecutionPolicy(),
+            )
+
+            with patch.object(
+                WorktreeManager,
+                "apply_patch",
+                side_effect=RuntimeError("forced apply failure"),
+            ):
+                orchestrator.run_task("fail while applying approved patch")
+
+            memory_text = memory.read()
+            self.assertNotIn("**Status:** approved", memory_text)
+            self.assertIn("**Status:** rejected", memory_text)
+            self.assertEqual(
+                [],
+                palace.recent(room="run-apply-failure", closet="steps"),
+            )
+            self.assertEqual("blocked", runtime.get_run("run-apply-failure").status)
+            self.assertFalse((root / "ok.txt").exists())
+            WorktreeManager(root).cleanup_run("run-apply-failure")
+            git.close()
+
+    def test_commit_failure_rolls_approved_patch_back_out_of_main(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._init_repo(root)
+            cfg = GenesisConfig()
+            cfg.runtime.state_db = str(root / ".genesis" / "state" / "state.db")
+            cfg.verification.commands = []
+            cfg.dialogue.enabled = False
+            memory = MemoryManager(str(root / "GENESIS_MEMORY.md"))
+            runtime = RuntimeStore(cfg.runtime.state_db)
+            git = GitManager(str(root), cfg.git)
+            orchestrator = Orchestrator(
+                FakePlanReviewAgent(verdict="approved", task_id="run-commit-failure"),
+                {"fake-worker": FakeWorkerAgent(filename="not-committed.txt", content="ok")},
+                memory,
+                git,
+                cfg,
+                str(root),
+                runtime=runtime,
+                palace=PalaceStore(cfg.runtime.state_db),
+                policy=ExecutionPolicy(),
+            )
+
+            with patch.object(git, "commit_step", return_value=None):
+                orchestrator.run_task("roll back a failed integration commit")
+
+            self.assertFalse((root / "not-committed.txt").exists())
+            self.assertEqual(
+                "",
+                self._git_output(root, "status", "--short", "--", "not-committed.txt"),
+            )
+            self.assertEqual("blocked", runtime.get_run("run-commit-failure").status)
+            self.assertNotIn("**Status:** approved", memory.read())
+            WorktreeManager(root).cleanup_run("run-commit-failure")
             git.close()
 
     def test_dirty_worktree_is_checkpointed_before_isolated_execution(self) -> None:

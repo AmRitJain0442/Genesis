@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import logging
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from genesis.config import GenesisConfig
+from genesis.agents.base import terminate_process_tree
 from genesis.policy import ExecutionPolicy
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -57,30 +63,44 @@ class Verifier:
                 )
 
             if self.output_callback:
-                self.output_callback(f"verify $ {command}")
+                try:
+                    self.output_callback(f"verify $ {command}")
+                except Exception:
+                    logger.warning("Verification output callback failed", exc_info=True)
 
-            try:
-                proc = subprocess.run(
-                    command,
-                    cwd=self.work_dir,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=self.config.verification.timeout,
-                )
-                output = (proc.stdout or "") + (proc.stderr or "")
-            except subprocess.TimeoutExpired:
-                return VerificationResult(
-                    False,
-                    reason=f"verification timed out after {self.config.verification.timeout}s: {command}",
-                    commands=results,
-                )
+            with tempfile.TemporaryFile(mode="w+b") as captured:
+                try:
+                    proc = subprocess.Popen(
+                        command,
+                        cwd=self.work_dir,
+                        shell=True,
+                        stdout=captured,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                except OSError as exc:
+                    return VerificationResult(
+                        False,
+                        reason=f"could not start verification command {command}: {exc}",
+                        commands=results,
+                    )
+                try:
+                    proc.wait(timeout=self.config.verification.timeout)
+                except subprocess.TimeoutExpired:
+                    terminate_process_tree(proc)
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    return VerificationResult(
+                        False,
+                        reason=f"verification timed out after {self.config.verification.timeout}s: {command}",
+                        commands=results,
+                    )
+                output = _read_bounded_output(captured)
 
             output = output.strip()
-            if len(output) > 4000:
-                output = output[:4000].rstrip() + "\n..."
             results.append(CommandResult(command, proc.returncode, output))
             if proc.returncode != 0:
                 return VerificationResult(
@@ -90,3 +110,24 @@ class Verifier:
                 )
 
         return VerificationResult(True, commands=results)
+
+
+def _read_bounded_output(stream, limit: int = 4000) -> str:
+    """Read useful head/tail diagnostics without buffering unlimited output."""
+
+    stream.flush()
+    size = stream.seek(0, 2)
+    if size <= limit:
+        stream.seek(0)
+        data = stream.read()
+    else:
+        marker = b"\n... (verification output truncated) ...\n"
+        payload_limit = max(0, limit - len(marker))
+        head_size = int(payload_limit * 0.7)
+        tail_size = payload_limit - head_size
+        stream.seek(0)
+        head = stream.read(head_size)
+        stream.seek(-tail_size, 2)
+        tail = stream.read(tail_size)
+        data = head + marker + tail
+    return data.decode("utf-8", errors="replace")

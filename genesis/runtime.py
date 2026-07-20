@@ -6,14 +6,15 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, ContextManager
 
+from genesis._sqlite import enable_wal, sqlite_connection
 from genesis.config import GenesisConfig
 from genesis.palace import resolve_state_db
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _json(data: dict[str, Any] | None) -> str:
@@ -80,13 +81,12 @@ class RuntimeStore:
     def from_config(cls, config: GenesisConfig) -> "RuntimeStore":
         return cls(resolve_state_db(config))
 
-    def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.db_path, timeout=30.0)
-        con.row_factory = sqlite3.Row
-        return con
+    def _connect(self) -> ContextManager[sqlite3.Connection]:
+        return sqlite_connection(self.db_path)
 
     def _ensure_schema(self) -> None:
         with self._connect() as con:
+            enable_wal(con)
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
@@ -165,6 +165,14 @@ class RuntimeStore:
             con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_run_steps_run ON run_steps(run_id, status)"
             )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runs_normalized_task_status_updated "
+                "ON runs(lower(trim(task)), status, updated_at DESC)"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_artifacts_run_step_created "
+                "ON artifacts(run_id, step_id, created_at)"
+            )
 
     def start_run(
         self,
@@ -176,14 +184,29 @@ class RuntimeStore:
         run_id = run_id or uuid.uuid4().hex[:12]
         now = _utc_now()
         with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            existing = con.execute(
+                "SELECT task FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if existing:
+                raise ValueError(
+                    f"Run ID {run_id!r} already exists for task {existing['task']!r}"
+                )
             con.execute(
                 """
-                INSERT OR REPLACE INTO runs(run_id, task, status, created_at, updated_at, metadata_json)
+                INSERT INTO runs(run_id, task, status, created_at, updated_at, metadata_json)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (run_id, task, "running", now, now, _json(metadata)),
             )
-        self.record_event(run_id, "run_started", payload={"task": task, **(metadata or {})})
+            self._insert_event(
+                con,
+                run_id,
+                "run_started",
+                payload={**(metadata or {}), "task": task},
+                created_at=now,
+            )
         return run_id
 
     def update_run_status(
@@ -195,15 +218,15 @@ class RuntimeStore:
     ) -> None:
         now = _utc_now()
         with self._connect() as con:
+            # Serialize the read/merge/write so parallel worker updates cannot
+            # silently discard one another's metadata.
+            con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT metadata_json FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()
-            current: dict[str, Any] = {}
-            if row:
-                try:
-                    current = json.loads(row["metadata_json"] or "{}")
-                except json.JSONDecodeError:
-                    current = {}
+            if not row:
+                raise KeyError(f"Unknown run ID: {run_id}")
+            current = _loads(row["metadata_json"])
             current.update(metadata or {})
             con.execute(
                 """
@@ -213,7 +236,13 @@ class RuntimeStore:
                 """,
                 (status, now, _json(current), run_id),
             )
-        self.record_event(run_id, f"run_{status}", payload=metadata or {})
+            self._insert_event(
+                con,
+                run_id,
+                f"run_{status}",
+                payload=metadata or {},
+                created_at=now,
+            )
 
     def record_event(
         self,
@@ -224,13 +253,25 @@ class RuntimeStore:
         payload: dict[str, Any] | None = None,
     ) -> None:
         with self._connect() as con:
-            con.execute(
-                """
-                INSERT INTO runtime_events(run_id, step_id, event_type, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (run_id, step_id, event_type, _json(payload), _utc_now()),
-            )
+            self._insert_event(con, run_id, event_type, step_id=step_id, payload=payload)
+
+    @staticmethod
+    def _insert_event(
+        con: sqlite3.Connection,
+        run_id: str,
+        event_type: str,
+        *,
+        step_id: str = "",
+        payload: dict[str, Any] | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        con.execute(
+            """
+            INSERT INTO runtime_events(run_id, step_id, event_type, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (run_id, step_id, event_type, _json(payload), created_at or _utc_now()),
+        )
 
     def checkpoint(
         self,
@@ -240,7 +281,9 @@ class RuntimeStore:
         step_id: str = "",
         payload: dict[str, Any] | None = None,
     ) -> None:
+        now = _utc_now()
         with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
             con.execute(
                 """
                 INSERT OR REPLACE INTO checkpoints(
@@ -248,14 +291,16 @@ class RuntimeStore:
                 )
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (run_id, step_id, checkpoint_name, _json(payload), _utc_now()),
+                (run_id, step_id, checkpoint_name, _json(payload), now),
             )
-        self.record_event(
-            run_id,
-            "checkpoint",
-            step_id=step_id,
-            payload={"checkpoint": checkpoint_name, **(payload or {})},
-        )
+            self._insert_event(
+                con,
+                run_id,
+                "checkpoint",
+                step_id=step_id,
+                payload={**(payload or {}), "checkpoint": checkpoint_name},
+                created_at=now,
+            )
 
     def get_checkpoint(
         self,
@@ -275,10 +320,7 @@ class RuntimeStore:
             ).fetchone()
         if not row:
             return None
-        try:
-            return json.loads(row["payload_json"] or "{}")
-        except json.JSONDecodeError:
-            return {}
+        return _loads(row["payload_json"])
 
     def add_artifact(
         self,
@@ -354,10 +396,17 @@ class RuntimeStore:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         now = _utc_now()
-        current = self.get_step(run_id, step_id)
-        merged_metadata = dict(current.metadata) if current else {}
-        merged_metadata.update(metadata or {})
         with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT * FROM run_steps WHERE run_id = ? AND step_id = ?",
+                (run_id, step_id),
+            ).fetchone()
+            current = self._step(row) if row else None
+            merged_metadata = dict(current.metadata) if current else {}
+            merged_metadata.update(metadata or {})
+            next_title = title or (current.title if current else "")
+            next_status = status if status is not None else (current.status if current else "pending")
             con.execute(
                 """
                 INSERT INTO run_steps(
@@ -381,8 +430,8 @@ class RuntimeStore:
                 (
                     run_id,
                     step_id,
-                    title or (current.title if current else ""),
-                    status if status is not None else (current.status if current else "pending"),
+                    next_title,
+                    next_status,
                     worker if worker is not None else (current.worker if current else ""),
                     worktree_path if worktree_path is not None else (current.worktree_path if current else ""),
                     patch_artifact_id if patch_artifact_id is not None else (current.patch_artifact_id if current else ""),
@@ -393,15 +442,14 @@ class RuntimeStore:
                     _json(merged_metadata),
                 ),
             )
-        self.record_event(
-            run_id,
-            "step_status",
-            step_id=step_id,
-            payload={
-                "status": status if status is not None else (current.status if current else "pending"),
-                "title": title or (current.title if current else ""),
-            },
-        )
+            self._insert_event(
+                con,
+                run_id,
+                "step_status",
+                step_id=step_id,
+                payload={"status": next_status, "title": next_title},
+                created_at=now,
+            )
 
     def get_step(self, run_id: str, step_id: str) -> StepRecord | None:
         with self._connect() as con:
@@ -453,12 +501,15 @@ class RuntimeStore:
         return self._run(row) if row else None
 
     def latest_runs(self, limit: int = 10) -> list[RunRecord]:
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
         with self._connect() as con:
             rows = con.execute(
                 """
                 SELECT *
                 FROM runs
-                ORDER BY updated_at DESC
+                ORDER BY updated_at DESC, rowid DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -489,44 +540,43 @@ class RuntimeStore:
         return self._run(row) if row else None
 
     def events(self, run_id: str, limit: int = 100) -> list[RuntimeEvent]:
+        """Return the newest ``limit`` events in chronological order."""
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
         with self._connect() as con:
             rows = con.execute(
                 """
-                SELECT *
-                FROM runtime_events
-                WHERE run_id = ?
+                SELECT * FROM (
+                    SELECT *
+                    FROM runtime_events
+                    WHERE run_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
                 ORDER BY id ASC
-                LIMIT ?
                 """,
                 (run_id, limit),
             ).fetchall()
         return [self._event(row) for row in rows]
 
     def _run(self, row: sqlite3.Row) -> RunRecord:
-        try:
-            metadata = json.loads(row["metadata_json"] or "{}")
-        except json.JSONDecodeError:
-            metadata = {}
         return RunRecord(
             run_id=row["run_id"],
             task=row["task"],
             status=row["status"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
-            metadata=metadata,
+            metadata=_loads(row["metadata_json"]),
         )
 
     def _event(self, row: sqlite3.Row) -> RuntimeEvent:
-        try:
-            payload = json.loads(row["payload_json"] or "{}")
-        except json.JSONDecodeError:
-            payload = {}
         return RuntimeEvent(
             id=int(row["id"]),
             run_id=row["run_id"],
             step_id=row["step_id"],
             event_type=row["event_type"],
-            payload=payload,
+            payload=_loads(row["payload_json"]),
             created_at=row["created_at"],
         )
 
@@ -562,6 +612,6 @@ class RuntimeStore:
 def _loads(raw: str) -> dict[str, Any]:
     try:
         value = json.loads(raw or "{}")
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         return {}
     return value if isinstance(value, dict) else {}
