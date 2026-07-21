@@ -394,6 +394,9 @@ class RuntimeStore:
         verification: dict[str, Any] | None = None,
         commit_sha: str | None = None,
         metadata: dict[str, Any] | None = None,
+        replace_metadata: bool = False,
+        event_type: str = "",
+        event_payload: dict[str, Any] | None = None,
     ) -> None:
         now = _utc_now()
         with self._connect() as con:
@@ -403,7 +406,11 @@ class RuntimeStore:
                 (run_id, step_id),
             ).fetchone()
             current = self._step(row) if row else None
-            merged_metadata = dict(current.metadata) if current else {}
+            merged_metadata = (
+                {}
+                if replace_metadata
+                else dict(current.metadata) if current else {}
+            )
             merged_metadata.update(metadata or {})
             next_title = title or (current.title if current else "")
             next_status = status if status is not None else (current.status if current else "pending")
@@ -450,6 +457,85 @@ class RuntimeStore:
                 payload={"status": next_status, "title": next_title},
                 created_at=now,
             )
+            if event_type:
+                self._insert_event(
+                    con,
+                    run_id,
+                    event_type,
+                    step_id=step_id,
+                    payload=event_payload,
+                    created_at=now,
+                )
+
+    def record_step_event(
+        self,
+        run_id: str,
+        step_id: str,
+        event_type: str,
+        *,
+        title: str = "",
+        status: str | None = None,
+        worktree_path: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Atomically update a step and append its correlated event.
+
+        Repair accounting uses this path so a crash cannot publish an attempt
+        without consuming its budget (or consume it without journaling why).
+        """
+        now = _utc_now()
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT title, status, worktree_path, metadata_json FROM run_steps "
+                "WHERE run_id = ? AND step_id = ?",
+                (run_id, step_id),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Unknown step: {run_id}/{step_id}")
+            merged_metadata = _loads(row["metadata_json"])
+            merged_metadata.update(metadata or {})
+            next_title = title or row["title"]
+            next_status = status if status is not None else row["status"]
+            next_worktree = (
+                worktree_path
+                if worktree_path is not None
+                else row["worktree_path"]
+            )
+            con.execute(
+                """
+                UPDATE run_steps
+                SET title = ?, status = ?, worktree_path = ?, updated_at = ?,
+                    metadata_json = ?
+                WHERE run_id = ? AND step_id = ?
+                """,
+                (
+                    next_title,
+                    next_status,
+                    next_worktree,
+                    now,
+                    _json(merged_metadata),
+                    run_id,
+                    step_id,
+                ),
+            )
+            self._insert_event(
+                con,
+                run_id,
+                "step_status",
+                step_id=step_id,
+                payload={"status": next_status, "title": next_title},
+                created_at=now,
+            )
+            self._insert_event(
+                con,
+                run_id,
+                event_type,
+                step_id=step_id,
+                payload=payload,
+                created_at=now,
+            )
 
     def get_step(self, run_id: str, step_id: str) -> StepRecord | None:
         with self._connect() as con:
@@ -476,23 +562,64 @@ class RuntimeStore:
         current = self.get_step(run_id, step_id)
         if not current:
             return
+        run = self.get_run(run_id)
+        retry_generation = int(current.metadata.get("retry_generation", 0) or 0) + 1
+        retry_metadata = {
+            "retried": True,
+            "retry_generation": retry_generation,
+            "repair_attempts": 0,
+        }
+        if "step" in current.metadata:
+            retry_metadata["step"] = current.metadata["step"]
+        for key in ("retained_worktrees", "cleanup_pending_worktrees"):
+            value = current.metadata.get(key, [])
+            if isinstance(value, list):
+                retry_metadata[key] = [
+                    str(item) for item in value if isinstance(item, str) and item
+                ]
+        if current.metadata.get("integration_retry_from"):
+            retry_metadata["integration_retry_from"] = str(
+                current.metadata["integration_retry_from"]
+            )
+        self.record_event(
+            run_id,
+            "manual_retry_started",
+            step_id=step_id,
+            payload={
+                "retry_generation": retry_generation,
+                "prior_status": current.status,
+                "prior_blocked_reason": current.metadata.get("blocked_reason", ""),
+                "retained_worktrees": retry_metadata.get(
+                    "retained_worktrees", []
+                ),
+            },
+        )
         self.upsert_step(
             run_id,
             step_id,
             title=current.title,
             status="pending",
             worker="",
-            worktree_path="",
+            # Keep the rejected draft so an explicit retry continues from the
+            # worker's useful changes instead of silently throwing them away.
+            worktree_path=current.worktree_path,
             patch_artifact_id="",
             review={},
             verification={},
             commit_sha="",
-            metadata={"retried": True},
+            metadata=retry_metadata,
+            replace_metadata=True,
         )
+        blocked_steps = list((run.metadata if run else {}).get("blocked_steps", []) or [])
         self.update_run_status(
             run_id,
             "running",
-            metadata={"retry_step": step_id, "blocked_step": "", "reason": ""},
+            metadata={
+                "retry_step": step_id,
+                "blocked_step": "",
+                "blocked_steps": [item for item in blocked_steps if item != step_id],
+                "reason": "",
+            },
         )
 
     def get_run(self, run_id: str) -> RunRecord | None:

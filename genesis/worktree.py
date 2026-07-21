@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -30,6 +31,7 @@ class WorktreePatch:
     patch_sha: str = ""
     status_lines: list[str] = field(default_factory=list)
     diff_status_lines: list[str] = field(default_factory=list)
+    deleted_files: list[str] = field(default_factory=list)
 
     @property
     def has_changes(self) -> bool:
@@ -239,32 +241,55 @@ class WorktreeManager:
         patch = self._git_in(
             path, "diff", "--cached", "--binary", merge_base
         ).stdout
-        changed = self._git_in(
-            path, "diff", "--cached", "--name-only", merge_base
-        ).stdout.splitlines()
+        changed = _nul_fields(self._git_in(
+            path, "diff", "--cached", "--name-only", "-z", merge_base
+        ).stdout)
         status_lines = self._git_in(
             path, "status", "--short", "--untracked-files=all"
         ).stdout.splitlines()
-        diff_status_lines = self._git_in(
-            path, "diff", "--cached", "--name-status", merge_base
-        ).stdout.splitlines()
+        diff_status_records = _parse_name_status_z(self._git_in(
+            path, "diff", "--cached", "--name-status", "-z", merge_base
+        ).stdout)
+        diff_status_lines = [
+            _format_name_status(status, paths)
+            for status, paths in diff_status_records
+        ]
         overlay_patch, overlay_changed, overlay_status = self._overlay_patch(
             path,
             overlays,
         )
         if overlay_patch:
             patch = patch.rstrip() + "\n" + overlay_patch
-        changed = sorted(set(changed) | set(overlay_changed))
+        changed_paths = set(changed) | set(overlay_changed)
         diff_status_lines.extend(overlay_status)
+        deleted_paths = {
+            paths[0]
+            for status, paths in diff_status_records
+            if status.startswith("D") and paths
+        }
+        deleted_paths.update(
+            relative
+            for relative in overlay_changed
+            if not os.path.lexists(path / relative)
+        )
+        # `--name-only` reports only the destination of a detected rename or
+        # copy. Both sides are part of the reviewed patch identity and must be
+        # staged/committed together during exact-manifest integration.
+        for status, status_paths in diff_status_records:
+            if status.startswith(("R", "C")):
+                changed_paths.update(status_paths[:2])
+            elif status_paths:
+                changed_paths.add(status_paths[-1])
         return WorktreePatch(
             worktree_path=str(path),
             patch_text=patch,
-            changed_files=sorted(p for p in changed if p),
+            changed_files=sorted(p for p in changed_paths if p),
             base_sha=merge_base,
             head_sha=worktree_head,
             patch_sha=hashlib.sha256(patch.encode("utf-8")).hexdigest()[:16],
             status_lines=status_lines,
             diff_status_lines=diff_status_lines,
+            deleted_files=sorted(deleted_paths),
         )
 
     def apply_check(self, patch_text: str) -> None:
@@ -276,6 +301,99 @@ class WorktreeManager:
         if not patch_text.strip():
             return
         self._git_stdin(patch_text, "apply", "--binary", "-")
+
+    def candidate_matches_main(
+        self,
+        worktree_path: str | Path,
+        changed_files: list[str],
+    ) -> bool:
+        """Return true only when every candidate path exactly matches main."""
+        path = Path(worktree_path).resolve()
+        self._assert_under(path, self.worktrees_root.resolve())
+        if not changed_files:
+            return False
+        for raw in changed_files:
+            # Git already uses forward slashes on Windows. Preserve a literal
+            # backslash on POSIX, where it is a valid filename character.
+            relative = Path(raw)
+            if relative.is_absolute() or ".." in relative.parts:
+                return False
+            main_item = self.repo_root / relative
+            candidate_item = path / relative
+            main_exists = os.path.lexists(main_item)
+            candidate_exists = os.path.lexists(candidate_item)
+            if main_exists != candidate_exists:
+                return False
+            if not main_exists:  # the reviewed deletion is present on main
+                continue
+            main_link = main_item.is_symlink()
+            candidate_link = candidate_item.is_symlink()
+            if main_link != candidate_link:
+                return False
+            if main_link:
+                if os.readlink(main_item) != os.readlink(candidate_item):
+                    return False
+                continue
+            if not main_item.is_file() or not candidate_item.is_file():
+                return False
+            if main_item.read_bytes() != candidate_item.read_bytes():
+                return False
+            if os.name != "nt":
+                main_exec = bool(main_item.stat().st_mode & 0o111)
+                candidate_exec = bool(candidate_item.stat().st_mode & 0o111)
+                if main_exec != candidate_exec:
+                    return False
+        return True
+
+    def main_matches_base(
+        self,
+        worktree_path: str | Path,
+        changed_files: list[str],
+    ) -> bool:
+        """Return true when main matches the candidate worktree's exact base.
+
+        Git handles tracked paths; overlay metadata supplies the recoverable
+        baseline for explicitly referenced ignored source files.
+        """
+        path = Path(worktree_path).resolve()
+        self._assert_under(path, self.worktrees_root.resolve())
+        overlays = {
+            str(record.get("path", "")).replace("\\", "/"): record
+            for record in self._overlay_records(path)
+        }
+        for raw in changed_files:
+            relative = raw.replace("\\", "/") if os.name == "nt" else raw
+            record = overlays.get(relative)
+            main_item = self.repo_root / Path(relative)
+            if record is not None:
+                if (
+                    not main_item.is_file()
+                    or self._file_sha(main_item) != record.get("sha256")
+                ):
+                    return False
+                continue
+
+            diff = self._git(
+                "diff",
+                "--quiet",
+                "--no-ext-diff",
+                "HEAD",
+                "--",
+                relative,
+                check=False,
+            )
+            if diff.returncode != 0:
+                return False
+            tracked = self._git(
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                relative,
+                check=False,
+            ).returncode == 0
+            if not tracked and os.path.lexists(main_item):
+                return False
+        return bool(changed_files)
 
     def rollback_patch(self, patch_text: str, paths: list[str]) -> None:
         """Reverse an applied patch after a pre-commit integration failure.
@@ -520,7 +638,10 @@ class WorktreeManager:
             ))
             sections.append(f"diff --git a/{relative} b/{relative}\n{diff}")
             changed.append(relative)
-            statuses.append(("M" if worker_file.exists() else "D") + f"\t{relative}")
+            statuses.append(_format_name_status(
+                "M" if worker_file.exists() else "D",
+                [relative],
+            ))
         return "\n".join(sections), changed, statuses
 
     @staticmethod
@@ -532,3 +653,34 @@ def _safe_name(value: str) -> str:
     keep = [ch if ch.isalnum() or ch in ("-", "_", ".") else "-" for ch in value]
     name = "".join(keep).strip(".-")
     return name or "item"
+
+
+def _nul_fields(raw: str) -> list[str]:
+    """Decode Git's unquoted, NUL-delimited path output."""
+    return [item for item in raw.split("\0") if item]
+
+
+def _parse_name_status_z(raw: str) -> list[tuple[str, list[str]]]:
+    """Parse ``git diff --name-status -z`` without filename ambiguity."""
+    fields = _nul_fields(raw)
+    records: list[tuple[str, list[str]]] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        index += 1
+        path_count = 2 if status.startswith(("R", "C")) else 1
+        if index + path_count > len(fields):
+            raise RuntimeError("malformed NUL-delimited Git name-status output")
+        paths = fields[index:index + path_count]
+        index += path_count
+        records.append((status, paths))
+    return records
+
+
+def _format_name_status(status: str, paths: list[str]) -> str:
+    """Make status evidence readable while preserving record boundaries."""
+    escaped = [
+        path.replace("\r", r"\r").replace("\n", r"\n").replace("\t", r"\t")
+        for path in paths
+    ]
+    return "\t".join([status, *escaped])

@@ -4,7 +4,7 @@ import types
 import unittest
 from pathlib import Path
 
-from genesis.worktree import WorktreeManager
+from genesis.worktree import WorktreeManager, _parse_name_status_z
 
 
 def _git(cwd, *args):
@@ -171,6 +171,85 @@ class PrepareMainTests(unittest.TestCase):
             )
         finally:
             manager.remove(worktree)
+
+    def test_capture_patch_manifest_includes_both_sides_of_rename(self):
+        (self.repo / "old.txt").write_text("same bytes\n", encoding="utf-8")
+        _git(self.repo, "add", "old.txt")
+        _git(self.repo, "commit", "-m", "init")
+        manager = self._wt()
+        worktree = manager.create("rename", "step")
+        try:
+            (worktree / "old.txt").rename(worktree / "new.txt")
+
+            patch = manager.capture_patch(worktree)
+
+            self.assertEqual(["new.txt", "old.txt"], patch.changed_files)
+            self.assertTrue(any(
+                line.startswith("R") for line in patch.diff_status_lines
+            ))
+            manager.apply_check(patch.patch_text)
+            manager.apply_patch(patch.patch_text)
+            self.assertFalse((self.repo / "old.txt").exists())
+            self.assertEqual(
+                "same bytes\n",
+                (self.repo / "new.txt").read_text(encoding="utf-8"),
+            )
+        finally:
+            manager.remove(worktree)
+
+    def test_capture_patch_preserves_unicode_filename_and_exact_candidate_state(self):
+        (self.repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+        _git(self.repo, "add", "seed.txt")
+        _git(self.repo, "commit", "-m", "init")
+        manager = self._wt()
+        worktree = manager.create("special-paths", "step")
+        filenames = ["caf\u00e9.txt"]
+        try:
+            for index, filename in enumerate(filenames):
+                (worktree / filename).write_text(
+                    f"value = {index}\n",
+                    encoding="utf-8",
+                )
+
+            patch = manager.capture_patch(worktree)
+
+            self.assertEqual(sorted(filenames), patch.changed_files)
+            self.assertFalse(
+                manager.candidate_matches_main(worktree, patch.changed_files)
+            )
+            self.assertTrue(any("caf\u00e9.txt" in line for line in patch.diff_status_lines))
+            manager.apply_check(patch.patch_text)
+            manager.apply_patch(patch.patch_text)
+            self.assertTrue(
+                manager.candidate_matches_main(worktree, patch.changed_files)
+            )
+        finally:
+            manager.remove(worktree)
+
+    def test_capture_patch_keeps_lossless_unicode_filename_deletions(self):
+        filename = "disparu-\u00e9.txt"
+        (self.repo / filename).write_text("remove me\n", encoding="utf-8")
+        _git(self.repo, "add", filename)
+        _git(self.repo, "commit", "-m", "init")
+        manager = self._wt()
+        worktree = manager.create("special-delete", "step")
+        try:
+            (worktree / filename).unlink()
+
+            patch = manager.capture_patch(worktree)
+
+            self.assertEqual([filename], patch.changed_files)
+            self.assertEqual([filename], patch.deleted_files)
+            self.assertIn(filename, patch.diff_status_lines[0])
+        finally:
+            manager.remove(worktree)
+
+    def test_nul_name_status_parser_preserves_control_characters(self):
+        filename = "tab\tand\nline.txt"
+
+        records = _parse_name_status_z(f"A\0{filename}\0")
+
+        self.assertEqual([("A", [filename])], records)
 
     def test_referenced_ignored_source_is_overlaid_and_patched_safely(self):
         (self.repo / ".gitignore").write_text("tribe.py\n.env\n", encoding="utf-8")
