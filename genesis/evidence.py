@@ -49,6 +49,7 @@ class AcceptanceCheck:
     name: str
     passed: bool
     detail: str
+    repairable: bool = True
 
 
 @dataclass(frozen=True)
@@ -63,14 +64,25 @@ class AcceptanceGateReport:
     def violations(self) -> list[str]:
         return [check.detail for check in self.checks if not check.passed]
 
+    @property
+    def repairable(self) -> bool:
+        """Whether changing the candidate patch can plausibly clear every failure."""
+        return all(check.repairable for check in self.checks if not check.passed)
+
     def as_dict(self) -> dict:
         return {
             "passed": self.passed,
             "checks": [
-                {"name": item.name, "passed": item.passed, "detail": item.detail}
+                {
+                    "name": item.name,
+                    "passed": item.passed,
+                    "detail": item.detail,
+                    "repairable": item.repairable,
+                }
                 for item in self.checks
             ],
             "violations": self.violations,
+            "repairable": self.repairable,
         }
 
 
@@ -79,7 +91,12 @@ def evaluate_patch_evidence(step: "Step", patch: "WorktreePatch") -> EvidenceGua
     artifact_files = sorted(
         path for path in patch.changed_files if _is_transient_artifact(path)
     )
-    deleted_files = _deleted_paths(patch.diff_status_lines)
+    # Prefer the lossless manifest captured from Git's NUL-delimited output.
+    # The human-readable status lines intentionally escape control characters.
+    deleted_files = list(
+        getattr(patch, "deleted_files", None)
+        or _deleted_paths(patch.diff_status_lines)
+    )
     scopes = list(getattr(step, "file_scope", None) or [])
     out_of_scope_deletions = sorted(
         path for path in deleted_files if scopes and not _matches_scope(path, scopes)
@@ -138,7 +155,15 @@ def evaluate_acceptance_gates(
             if exists else f"Create the required artifact {artifact}; it is missing from the worktree.",
         ))
 
-    if "pin" in lowered and ("requirements" in lowered or "dependenc" in lowered):
+    pinning_requested = bool(re.search(
+        r"\b(?:pin|pins|pinned|pinning)\b",
+        lowered,
+    ))
+    dependency_subject = bool(re.search(
+        r"\b(?:requirements?|dependenc(?:y|ies))\b",
+        lowered,
+    ))
+    if pinning_requested and dependency_subject:
         requirement_files = [
             root / name for name in ("requirements.txt", "requirements-dev.txt")
             if (root / name).is_file()
@@ -416,6 +441,7 @@ def _run_secret_scanner(
             f"secret-scan:{scanner}",
             False,
             f"{scanner} was explicitly required but is unavailable; do not report the scan as clean.",
+            repairable=False,
         )
     try:
         command = _scanner_command(scanner, executable)
@@ -426,6 +452,7 @@ def _run_secret_scanner(
             f"secret-scan:{scanner}",
             False,
             f"{scanner} could not be inspected: {exc}",
+            repairable=False,
         )
     cache_key = (
         "scanner-cache-v2",
@@ -464,6 +491,7 @@ def _run_secret_scanner(
                 f"secret-scan:{scanner}",
                 False,
                 f"{scanner} could not complete: {exc}",
+                repairable=False,
             )
         output = (result.stdout + "\n" + result.stderr).strip().replace("\n", " ")[-600:]
         trufflehog_findings = (
@@ -472,6 +500,17 @@ def _run_secret_scanner(
             and bool(result.stdout.strip())
         )
         passed = result.returncode == 0 and not trufflehog_findings
+        tool_error = any(marker in output.lower() for marker in (
+            "unknown command",
+            "unknown flag",
+            "flag provided but not defined",
+            "not recognized as the name",
+            "invalid configuration",
+            "failed to load config",
+            "could not load config",
+            "permission denied",
+            "no such file or directory",
+        ))
         check = AcceptanceCheck(
             f"secret-scan:{scanner}",
             passed,
@@ -482,13 +521,8 @@ def _run_secret_scanner(
                 if trufflehog_findings
                 else f"{scanner} scan failed with exit {result.returncode}: {output}"
             ),
+            repairable=not tool_error,
         )
-        tool_error = any(marker in output.lower() for marker in (
-            "unknown command",
-            "unknown flag",
-            "flag provided but not defined",
-            "not recognized as the name",
-        ))
         if not tool_error:
             with _SCANNER_CACHE_LOCK:
                 _SCANNER_CACHE[cache_key] = check

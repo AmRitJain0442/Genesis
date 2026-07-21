@@ -67,6 +67,52 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertFalse(report.passed)
         self.assertTrue(any(".env.example" in item for item in report.violations))
         self.assertTrue(any("requirements.txt" in item for item in report.violations))
+        self.assertIn(
+            "pinned-dependencies",
+            [check.name for check in report.checks],
+        )
+
+    def test_requirement_mapping_does_not_activate_dependency_pinning(self) -> None:
+        report = evaluate_acceptance_gates(
+            _step(
+                "Create docs/TRACEABILITY.md mapping every requirement to a stable "
+                "REQ-### id. Reconcile the requirements against the WBS and deliver "
+                "docs only — no source."
+            ),
+            _patch([
+                "docs/ASSUMPTIONS.md",
+                "docs/PRD.md",
+                "docs/TRACEABILITY.md",
+            ]),
+            self.root,
+        )
+
+        self.assertTrue(report.passed, report.violations)
+        self.assertNotIn(
+            "pinned-dependencies",
+            [check.name for check in report.checks],
+        )
+
+    def test_explicit_dependency_pinning_phrases_activate_gate(self) -> None:
+        phrases = (
+            "Pin every runtime requirement with ==.",
+            "Use pinned dependencies for reproducible installs.",
+            "Finish pinning dependency versions.",
+        )
+
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                report = evaluate_acceptance_gates(
+                    _step(phrase),
+                    _patch(["seed.txt"]),
+                    self.root,
+                )
+
+                self.assertFalse(report.passed)
+                self.assertIn(
+                    "pinned-dependencies",
+                    [check.name for check in report.checks],
+                )
 
     def test_security_contract_passes_on_actual_files_and_index(self) -> None:
         (self.root / ".env.example").write_text(
@@ -118,6 +164,7 @@ class AcceptanceGateTests(unittest.TestCase):
             )
 
         self.assertFalse(report.passed)
+        self.assertFalse(report.repairable)
         self.assertTrue(any("unavailable" in item for item in report.violations))
 
     def test_external_scanners_are_deferred_during_worker_dialogue(self) -> None:
