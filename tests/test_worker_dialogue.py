@@ -130,6 +130,25 @@ class WorkerDialogueTests(unittest.TestCase):
             for _, content in rec.posts
         ))
 
+    def test_final_turn_guard_failure_never_reports_preflight_passed(self) -> None:
+        blocked = _result(["docs/PRD.md"])
+        blocked.evidence = {
+            "guard_violations": ["Required artifact is still missing."]
+        }
+
+        outcome, rec = self._dialogue(
+            evaluations=[],
+            max_turns=1,
+            worker_results=[blocked],
+            fast_path=True,
+        )
+
+        self.assertFalse(outcome.approved)
+        messages = [content for _, content in rec.posts]
+        self.assertFalse(any("preflight passed" in item.lower() for item in messages))
+        self.assertTrue(any("draft is not accepted" in item.lower() for item in messages))
+        self.assertTrue(any("Required artifact is still missing" in item for item in messages))
+
     def test_hits_turn_budget_without_approval(self) -> None:
         outcome, rec = self._dialogue(evaluations=[(False, "more"), (False, "more")], max_turns=2)
         self.assertFalse(outcome.approved)

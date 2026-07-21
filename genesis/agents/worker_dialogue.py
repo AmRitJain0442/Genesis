@@ -40,9 +40,10 @@ def _summary(
 ) -> str:
     files = list(files if files is not None else (getattr(result, "files_written", None) or []))
     head = (
-        f"Turn {turn}: wrote {len(files)} file(s): {', '.join(files)}"
+        f"Turn {turn} draft: {len(files)} file(s) changed (not yet accepted): "
+        f"{', '.join(files)}"
         if files
-        else f"Turn {turn}: completed without file changes"
+        else f"Turn {turn} draft: completed without file changes (not yet accepted)"
     )
     note = (getattr(result, "result_text", "") or "").strip().splitlines()
     if note:
@@ -64,6 +65,7 @@ class WorkerDialogue:
         post: Callable[..., None],
         on_status: Callable[[str], None] | None = None,
         fast_path: bool = False,
+        before_retry: Callable[[str, str, "WorkerResult"], bool] | None = None,
     ) -> None:
         self.step = step
         self.worker_name = worker_name
@@ -75,6 +77,7 @@ class WorkerDialogue:
         self.post = post
         self.on_status = on_status
         self.fast_path = fast_path
+        self.before_retry = before_retry
 
     def _status(self, msg: str) -> None:
         if self.on_status:
@@ -82,6 +85,15 @@ class WorkerDialogue:
                 self.on_status(msg)
             except Exception:
                 pass
+
+    def _allow_retry(self, stage: str, reason: str, result: "WorkerResult") -> bool:
+        if self.before_retry is None:
+            return True
+        try:
+            return bool(self.before_retry(stage, reason, result))
+        except Exception:
+            logger.warning("Dialogue retry budget callback failed", exc_info=True)
+            return False
 
     def run(self) -> DialogueOutcome:
         current = self.step
@@ -150,24 +162,63 @@ class WorkerDialogue:
             # directly without spending a brain call or posting a misleading
             # "wrote 0 files" implementation message.
             if not made_progress and turn < self.max_turns:
-                current = self.make_revision(
-                    current,
+                feedback = (
                     "No output or file changes were produced. Execute the step now "
-                    "and make the concrete requested changes.",
+                    "and make the concrete requested changes."
                 )
+                if not self._allow_retry("dialogue_empty", feedback, result):
+                    self._status(f"Repair budget unavailable for another turn on {sid}")
+                    self.post(
+                        self.brain_name,
+                        "brain",
+                        "Automatic repair budget unavailable; handing the retained "
+                        "draft to final acceptance.",
+                        "status",
+                    )
+                    break
+                current = self.make_revision(current, feedback)
                 continue
 
             guard_violations = list(evidence.get("guard_violations", []) or [])
-            if guard_violations and turn < self.max_turns:
+            if guard_violations:
                 feedback = "Deterministic evidence guard failed:\n- " + "\n- ".join(
                     str(item) for item in guard_violations
                 )
+                if turn < self.max_turns:
+                    if not self._allow_retry(
+                        "dialogue_evidence",
+                        feedback,
+                        result,
+                    ):
+                        self._status(
+                            f"Repair budget unavailable after evidence failure on {sid}"
+                        )
+                        self.post(
+                            self.brain_name,
+                            "brain",
+                            "Evidence guard failed and no automatic repair budget "
+                            "remains; the draft is not accepted.\n" + feedback,
+                            "status",
+                        )
+                        break
+                    self._status(
+                        f"Evidence guard rejected turn {turn} on {sid}; retrying repair"
+                    )
+                    self.post(self.brain_name, "brain", feedback, "status")
+                    current = self.make_revision(current, feedback)
+                    continue
+
                 self._status(
-                    f"Evidence guard rejected turn {turn} on {sid}; retrying repair"
+                    f"Evidence guard still failing at the turn budget on {sid}"
                 )
-                self.post(self.brain_name, "brain", feedback, "status")
-                current = self.make_revision(current, feedback)
-                continue
+                self.post(
+                    self.brain_name,
+                    "brain",
+                    "Evidence guard still failing at the turn budget; "
+                    "the draft is not accepted.\n" + feedback,
+                    "status",
+                )
+                break
 
             if self.fast_path:
                 self._status(
@@ -203,6 +254,15 @@ class WorkerDialogue:
                 break
 
             self._status(f"{self.brain_name} requested changes on {sid} (turn {turn})")
+            if not self._allow_retry("dialogue_review", feedback, result):
+                self.post(
+                    self.brain_name,
+                    "brain",
+                    "Revision requested, but no automatic repair budget remains; "
+                    "handing the retained draft to independent acceptance.",
+                    "status",
+                )
+                break
             self.post(self.brain_name, "brain", f"Revise: {feedback}", "message")
             current = self.make_revision(self.step, feedback)
 

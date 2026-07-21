@@ -122,7 +122,7 @@ commit_prefix = "[genesis]"
 
 [runtime]
 state_db = ""              # empty = ~/.genesis/state/genesis.db
-retry_budget = 1           # bounded self-repair attempts per failed review/verification
+retry_budget = 2           # shared repairs: worker, gates, review, verification, integration
 max_parallel_workers = 3   # non-overlapping ready steps use the three normal workers
 checkpoint_mode = "always"
 

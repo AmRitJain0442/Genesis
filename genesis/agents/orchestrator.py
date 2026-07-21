@@ -27,7 +27,7 @@ from genesis.scheduler import (
     declared_step_scope,
     infer_step_scope,
 )
-from genesis.verifier import Verifier, VerificationResult
+from genesis.verifier import CommandResult, Verifier, VerificationResult
 from genesis.worktree import WorktreeManager, WorktreePatch
 
 if TYPE_CHECKING:
@@ -53,6 +53,56 @@ def _make_worker(agent: BaseAgent, memory_summary: str, work_dir: str,
 logger = logging.getLogger(__name__)
 
 
+class AgentOutput(str):
+    """A backwards-compatible output line carrying its parallel step context.
+
+    It behaves exactly like ``str`` for existing observers while richer clients
+    can attribute interleaved output and token usage to the correct worker.
+    """
+
+    def __new__(
+        cls,
+        value: object,
+        *,
+        step_id: str = "",
+        worker_name: str = "",
+    ) -> AgentOutput:
+        instance = super().__new__(cls, str(value))
+        instance.step_id = step_id
+        instance.worker_name = worker_name
+        return instance
+
+
+def _worker_failure_policy(reason: str) -> tuple[bool, str]:
+    """Classify whether another code-producing turn can plausibly help."""
+    lowered = str(reason or "").lower()
+    if is_exhaustion_error(lowered):
+        return False, "capacity_wait"
+    hard_markers = (
+        "no space left on device",
+        "disk full",
+        "read-only file system",
+        "access is denied",
+        "permission denied",
+        "authentication required",
+        "login required",
+        "not logged in",
+        "api key is missing",
+        "missing api key",
+        "credentials not found",
+        "unauthorized",
+        "forbidden",
+        "blocked by policy",
+        "policy denied",
+        "no worker agents available",
+        "executable not found",
+        "command not found",
+    )
+    if any(marker in lowered for marker in hard_markers):
+        return False, "hard_failure"
+    return True, ""
+
+
 @dataclass
 class _StepExecution:
     step: Step
@@ -66,6 +116,9 @@ class _StepExecution:
     review: Review | None = None
     verification: VerificationResult | None = None
     repair_attempts: int = 0
+    repair_id: str = ""
+    repair_outcome: str = ""
+    repair_patch_sha: str = ""
     reviewer_name: str = ""
     failed_agent: str = ""
     failed_reason: str = ""
@@ -135,6 +188,9 @@ Review rules:
 - Never approve code with syntax errors, incomplete stubs, or missing imports.
 - memory_note must be factual (what was built), not aspirational (what was attempted).
 - should_retry = true only when the fix is clear and a retry would plausibly succeed.
+- Act like a senior mentor: prefer needs_revision with complete, concrete repair
+  instructions whenever the isolated patch can plausibly be corrected. Do not
+  reject merely because several fixable defects remain.
 """
 
 _REVIEW_SYSTEM = """\
@@ -166,6 +222,9 @@ Rules:
   when you can identify a concrete defect or missing artifact.
 - Use needs_revision only when the worker can likely repair it with one focused retry.
 - Use rejected for unsafe, unrelated, or fundamentally wrong work.
+- Be a constructive mentor. Enumerate every concrete defect needed for the next
+  attempt; reserve rejected for work that cannot safely or plausibly be repaired
+  in the retained isolated worktree.
 - Never approve syntax errors, broken imports, failing tests, placeholders, or unreviewable output.
 """
 
@@ -689,16 +748,27 @@ class Orchestrator:
     ) -> None:
         cb = callbacks or {}
         output_callback = cb.get("on_output")
+        repair_observer = cb.get("on_repair")
         output_lock = Lock()
         worktree_lock = Lock()
 
         def fire(name: str, *args, **kwargs) -> None:
             self._fire_callback(callbacks, name, *args, **kwargs)
 
-        def guarded_output(text: str) -> None:
+        def guarded_output(
+            text: str,
+            *,
+            step_id: str = "",
+            worker_name: str = "",
+        ) -> None:
             if output_callback:
+                payload = AgentOutput(
+                    text,
+                    step_id=step_id,
+                    worker_name=worker_name,
+                )
                 with output_lock:
-                    self._notify_callback(output_callback, "on_output", text)
+                    self._notify_callback(output_callback, "on_output", payload)
 
         if not self.config.git.auto_commit:
             raise RuntimeError(
@@ -724,6 +794,24 @@ class Orchestrator:
                 "workspace_preflight",
                 payload=workspace_snapshot,
             )
+        self._reconcile_integrated_steps(plan, worktrees, fire)
+        if not self._complete_pending_integration_rollbacks(
+            plan,
+            worktrees,
+            fire,
+        ):
+            reason = (
+                "A journaled integration rollback could not be completed safely; "
+                "main was left untouched and the run requires operator review."
+            )
+            if self.runtime:
+                self.runtime.update_run_status(
+                    run_id,
+                    "blocked",
+                    metadata={"reason": reason},
+                )
+            fire("on_status", reason)
+            return
         fire(
             "on_status",
             "Workspace preflight: "
@@ -748,9 +836,45 @@ class Orchestrator:
             if not record:
                 continue
             if record.status == "committed":
+                cleanup_pending = [
+                    str(item)
+                    for item in (
+                        record.metadata.get("cleanup_pending_worktrees", [])
+                        or []
+                    )
+                    if item
+                ]
+                if record.worktree_path and record.worktree_path not in cleanup_pending:
+                    cleanup_pending.append(record.worktree_path)
+                if cleanup_pending:
+                    self._cleanup_step_worktrees(
+                        run_id,
+                        step,
+                        cleanup_pending,
+                        worktrees,
+                    )
                 committed_ids.add(step.step_id)
                 fire("on_status", f"Skipping committed {step.step_id}")
             elif record.status == "blocked":
+                blocked_ids.add(step.step_id)
+            elif record.metadata.get("repair_state") in {
+                "repair_exhausted",
+                "repair_disabled",
+                "hard_failure",
+                "capacity_wait",
+                "integration_failed",
+            }:
+                # Recover legacy/crash-window terminal repairs as blocked. An
+                # operator retry resets this state and deliberately grants a
+                # fresh budget; an ordinary resume must not do so implicitly.
+                if self.runtime:
+                    self.runtime.upsert_step(
+                        run_id,
+                        step.step_id,
+                        title=step.title,
+                        status="blocked",
+                        metadata={"lease": "blocked"},
+                    )
                 blocked_ids.add(step.step_id)
             elif record.status in {"running", "reviewing", "verifying"}:
                 if self.runtime:
@@ -785,6 +909,31 @@ class Orchestrator:
                 for scheduled in batch:
                     step = scheduled.step
                     worker_name, worker_agent = self._assign_worker(step, unavailable=active_workers)
+                    def step_output(
+                        text: str,
+                        *,
+                        _step_id: str = step.step_id,
+                        _worker_name: str = worker_name,
+                    ) -> None:
+                        guarded_output(
+                            str(text),
+                            step_id=getattr(text, "step_id", "") or _step_id,
+                            worker_name=getattr(text, "worker_name", "") or _worker_name,
+                        )
+
+                    def step_repair(
+                        event: dict,
+                        *,
+                        _step: Step = step,
+                    ) -> None:
+                        with output_lock:
+                            self._fire_callback(
+                                callbacks,
+                                "on_repair",
+                                _step,
+                                event,
+                            )
+
                     active_workers.add(worker_name)
                     active_scopes[step.step_id] = scheduled.scope
                     fire("on_step_start", step, completed + len(active), len(steps))
@@ -817,8 +966,9 @@ class Orchestrator:
                         worker_name,
                         worker_agent,
                         worktrees,
-                        guarded_output,
+                        step_output,
                         worktree_lock,
+                        step_repair if repair_observer else None,
                     )
                     active[future] = (scheduled, worker_name)
 
@@ -913,7 +1063,38 @@ class Orchestrator:
                         worktrees.apply_check(execution.patch.patch_text)
                         worktrees.apply_patch(execution.patch.patch_text)
                     except Exception as e:
-                        self._block_step(run_id, step, "git-apply", f"Patch apply failed: {e}", str(e), fire)
+                        reason = (
+                            "Approved patch could not be applied to current main: "
+                            f"{e}"
+                        )
+                        if self._schedule_integration_repair(
+                            run_id,
+                            step,
+                            execution,
+                            stage="integration_apply",
+                            reason=reason,
+                            worktrees=worktrees,
+                            worktree_lock=worktree_lock,
+                            fire=fire,
+                            refresh_base=True,
+                        ):
+                            continue
+                        repair_status = self._record_repair_outcome(
+                            run_id,
+                            step,
+                            execution,
+                            outcome="integration_failed",
+                        )
+                        if repair_status:
+                            fire("on_status", repair_status)
+                        self._block_step(
+                            run_id,
+                            step,
+                            "git-apply",
+                            f"Patch apply failed: {e}",
+                            str(e),
+                            fire,
+                        )
                         blocked_ids.add(step.step_id)
                         continue
 
@@ -921,8 +1102,71 @@ class Orchestrator:
                         step.step_id,
                         step.title,
                         paths=execution.patch.changed_files,
+                        patch_sha=execution.patch.patch_sha,
+                        run_id=run_id,
                     )
                     if not sha and execution.patch.has_changes:
+                        # The commit command may have completed before its
+                        # response/validation failed. Reconcile exact durable
+                        # identity before touching the working tree.
+                        sha = self.git.find_step_commit(
+                            run_id,
+                            step.step_id,
+                            execution.patch.patch_sha,
+                        ) or self.git.find_commit_by_patch(
+                            execution.patch.patch_sha,
+                            execution.patch.changed_files,
+                        )
+                    if not sha and execution.patch.has_changes:
+                        base_reason = "Commit failed after applying approved patch."
+                        # Journal the budgeted retry (or terminal state) before
+                        # changing main again. A crash on either side of the
+                        # rollback can then resume without granting a free turn.
+                        repair_scheduled = self._schedule_integration_repair(
+                            run_id,
+                            step,
+                            execution,
+                            stage="integration_commit",
+                            reason=base_reason,
+                            worktrees=worktrees,
+                            worktree_lock=worktree_lock,
+                            fire=fire,
+                            refresh_base=False,
+                            rollback_pending=True,
+                        )
+                        repair_status = ""
+                        if not repair_scheduled:
+                            repair_status = self._record_repair_outcome(
+                                run_id,
+                                step,
+                                execution,
+                                outcome="integration_failed",
+                            )
+                            if self.runtime and not repair_status:
+                                self.runtime.record_step_event(
+                                    run_id,
+                                    step.step_id,
+                                    "integration_failure_pending_rollback",
+                                    title=step.title,
+                                    status="blocked",
+                                    metadata={
+                                        "repair_state": "integration_failed",
+                                        "repair_stage": "integration_commit",
+                                        "repair_attempts": execution.repair_attempts,
+                                        "repair_budget": max(
+                                            0,
+                                            int(self.config.runtime.retry_budget),
+                                        ),
+                                        "draft_retained": True,
+                                        "blocked_reason": base_reason,
+                                        "lease": "blocked",
+                                    },
+                                    payload={
+                                        "reason": base_reason,
+                                        "patch_sha": execution.patch.patch_sha,
+                                    },
+                                )
+
                         rollback_error = ""
                         try:
                             worktrees.rollback_patch(
@@ -935,10 +1179,40 @@ class Orchestrator:
                                 "Could not roll back uncommitted patch for %s",
                                 step.step_id,
                             )
-                        reason = (
-                            "Commit failed after applying approved patch."
-                            + rollback_error
-                        )
+                        reason = base_reason + rollback_error
+                        if repair_scheduled and not rollback_error:
+                            if self.runtime:
+                                try:
+                                    self.runtime.record_step_event(
+                                        run_id,
+                                        step.step_id,
+                                        "integration_rollback_completed",
+                                        title=step.title,
+                                        status="repairing",
+                                        metadata={
+                                            "repair_state": "validating",
+                                        },
+                                        payload={
+                                            "patch_sha": execution.patch.patch_sha,
+                                        },
+                                    )
+                                except Exception:
+                                    # The persisted rollback-pending phase is
+                                    # itself resumable, so this remains safe.
+                                    logger.exception(
+                                        "Could not record completed rollback for %s",
+                                        step.step_id,
+                                    )
+                            continue
+                        if repair_scheduled:
+                            repair_status = self._record_repair_outcome(
+                                run_id,
+                                step,
+                                execution,
+                                outcome="integration_failed",
+                            )
+                        if repair_status:
+                            fire("on_status", repair_status)
                         self._block_step(
                             run_id,
                             step,
@@ -949,27 +1223,65 @@ class Orchestrator:
                         )
                         blocked_ids.add(step.step_id)
                         continue
+                    retained_cleanup: list[str] = []
                     if self.runtime:
+                        integrated_record = self.runtime.get_step(
+                            run_id, step.step_id
+                        )
+                        if integrated_record:
+                            retained_cleanup = [
+                                str(item)
+                                for item in (
+                                    integrated_record.metadata.get(
+                                        "retained_worktrees", []
+                                    )
+                                    or []
+                                )
+                                if item
+                            ]
+                    cleanup_paths = list(dict.fromkeys(
+                        item
+                        for item in [
+                            *retained_cleanup,
+                            str(execution.worktree_path or ""),
+                        ]
+                        if item
+                    ))
+                    (
+                        repair_event_type,
+                        repair_metadata,
+                        repair_event_payload,
+                        repair_status,
+                    ) = self._repair_outcome_details(step, execution)
+                    if self.runtime:
+                        committed_metadata = self._scope_metadata(
+                            step,
+                            scheduled.scope,
+                            lease="released",
+                            extra={
+                                "reviewer": execution.reviewer_name,
+                                "review_verdict": execution.review.verdict if execution.review else "",
+                                "current_patch_sha": execution.patch.patch_sha,
+                                "reviewed_patch_sha": execution.reviewed_patch_sha,
+                                "review_state": "committed",
+                                "repair_attempts": execution.repair_attempts,
+                                "retained_worktrees": [],
+                                "cleanup_pending_worktrees": cleanup_paths,
+                            },
+                        )
+                        committed_metadata.update(repair_metadata)
                         self.runtime.upsert_step(
                             run_id,
                             step.step_id,
                             title=step.title,
                             status="committed",
                             commit_sha=sha or "",
-                            metadata=self._scope_metadata(
-                                step,
-                                scheduled.scope,
-                                lease="released",
-                                extra={
-                                    "reviewer": execution.reviewer_name,
-                                    "review_verdict": execution.review.verdict if execution.review else "",
-                                    "current_patch_sha": execution.patch.patch_sha,
-                                    "reviewed_patch_sha": execution.reviewed_patch_sha,
-                                    "review_state": "committed",
-                                    "repair_attempts": execution.repair_attempts,
-                                },
-                            ),
+                            metadata=committed_metadata,
+                            event_type=repair_event_type,
+                            event_payload=repair_event_payload,
                         )
+                    if repair_status:
+                        fire("on_status", repair_status)
                     self._try_memory_write(
                         "append_step",
                         lambda: self.memory.append_step(
@@ -996,11 +1308,12 @@ class Orchestrator:
                     if sha and self.config.git.auto_push:
                         self.git.push()
                     fire("on_commit", step, sha)
-                    if execution.worktree_path:
-                        try:
-                            worktrees.remove(execution.worktree_path)
-                        except Exception as e:
-                            logger.warning("Could not remove worktree %s: %s", execution.worktree_path, e)
+                    self._cleanup_step_worktrees(
+                        run_id,
+                        step,
+                        cleanup_paths,
+                        worktrees,
+                    )
 
                     committed_ids.add(step.step_id)
                     completed += 1
@@ -1052,6 +1365,363 @@ class Orchestrator:
                 },
             )
 
+    def _reconcile_integrated_steps(
+        self,
+        plan: Plan,
+        worktrees: WorktreeManager,
+        fire: Callable,
+    ) -> None:
+        """Close the Git-to-runtime crash gap using exact reviewed bytes."""
+        if not self.runtime or not self.git:
+            return
+        for step in plan.steps:
+            record = self.runtime.get_step(plan.task_id, step.step_id)
+            if not record or record.status == "committed" or not record.worktree_path:
+                continue
+            metadata = record.metadata
+            current_patch_sha = str(metadata.get("current_patch_sha", "") or "")
+            reviewed_patch_sha = str(metadata.get("reviewed_patch_sha", "") or "")
+            if not current_patch_sha or reviewed_patch_sha != current_patch_sha:
+                continue
+            try:
+                review = Review(**record.review_json)
+            except Exception:
+                continue
+            if review.step_id != step.step_id or review.verdict != "approved":
+                continue
+            verification_data = record.verification_json
+            verified_patch_sha = str(
+                metadata.get("verified_patch_sha", "") or ""
+            )
+            verification_patch_sha = str(
+                verification_data.get("verified_patch_sha", "") or ""
+            )
+            if (
+                verified_patch_sha != current_patch_sha
+                or verification_patch_sha != current_patch_sha
+            ):
+                # A pass/failure belongs only to the immutable bytes the
+                # verifier observed. Never reuse a prior candidate's result
+                # to close a Git/runtime crash gap for replacement bytes.
+                continue
+            verification_passed = bool(verification_data.get("passed", False))
+            if (
+                not verification_passed
+                and self.config.verification.require_for_commit
+            ):
+                continue
+
+            worktree_path = Path(record.worktree_path)
+            if not worktree_path.exists():
+                continue
+            try:
+                patch = worktrees.capture_patch(worktree_path, step)
+                if (
+                    patch.patch_sha != current_patch_sha
+                    or not patch.has_changes
+                    or not worktrees.candidate_matches_main(
+                        worktree_path,
+                        patch.changed_files,
+                    )
+                ):
+                    continue
+            except Exception as exc:
+                logger.warning(
+                    "Could not inspect integration recovery for %s: %s",
+                    step.step_id,
+                    exc,
+                )
+                continue
+
+            sha = self.git.find_step_commit(
+                plan.task_id,
+                step.step_id,
+                patch.patch_sha,
+            )
+            if not sha:
+                # The process may have died after applying but before commit.
+                # Exact candidate equality lets us finish that reviewed commit
+                # without staging any unrelated paths.
+                sha = self.git.commit_step(
+                    step.step_id,
+                    step.title,
+                    paths=patch.changed_files,
+                    patch_sha=patch.patch_sha,
+                    run_id=plan.task_id,
+                )
+            if not sha:
+                # Compatibility for an older restart that checkpointed the
+                # already-applied bytes before this reconciliation existed.
+                sha = self.git.find_step_commit(
+                    plan.task_id,
+                    step.step_id,
+                    patch.patch_sha,
+                ) or self.git.find_commit_by_patch(
+                    patch.patch_sha,
+                    patch.changed_files,
+                )
+            if not sha:
+                continue
+
+            try:
+                repair_attempts = max(
+                    0, int(metadata.get("repair_attempts", 0) or 0)
+                )
+            except (TypeError, ValueError):
+                repair_attempts = 0
+            command_results = [
+                CommandResult(
+                    command=str(item.get("command", "")),
+                    returncode=int(item.get("returncode", 0) or 0),
+                    output=str(item.get("output", "")),
+                )
+                for item in verification_data.get("commands", [])
+                if isinstance(item, dict)
+            ]
+            verification = VerificationResult(
+                passed=verification_passed,
+                skipped=bool(verification_data.get("skipped", False)),
+                reason=str(verification_data.get("reason", "") or ""),
+                commands=command_results,
+                failure_kind=str(
+                    verification_data.get("failure_kind", "") or ""
+                ),
+                repairable=bool(verification_data.get("repairable", True)),
+            )
+            execution = _StepExecution(
+                step=step,
+                worker_name=record.worker,
+                worktree_path=worktree_path,
+                patch=patch,
+                patch_id=record.patch_artifact_id,
+                patch_version=int(metadata.get("current_patch_version", 0) or 0),
+                reviewed_patch_sha=reviewed_patch_sha,
+                review=review,
+                verification=verification,
+                repair_attempts=repair_attempts,
+                repair_id=str(metadata.get("repair_id", "") or ""),
+                repair_outcome=(
+                    "verified" if verification_passed else "accepted_advisory"
+                ),
+                repair_patch_sha=patch.patch_sha,
+                reviewer_name=str(metadata.get("reviewer", "") or ""),
+            )
+            (
+                repair_event_type,
+                repair_metadata,
+                repair_event_payload,
+                _,
+            ) = self._repair_outcome_details(step, execution)
+            reconciled_cleanup = list(dict.fromkeys(
+                item
+                for item in [
+                    *[
+                        str(value)
+                        for value in (
+                            metadata.get("retained_worktrees", []) or []
+                        )
+                        if value
+                    ],
+                    str(worktree_path),
+                ]
+                if item
+            ))
+            reconciled_metadata: dict[str, object] = {
+                "current_patch_sha": patch.patch_sha,
+                "reviewed_patch_sha": patch.patch_sha,
+                "review_state": "committed",
+                "repair_attempts": repair_attempts,
+                "reconciled_integration": True,
+                "lease": "released",
+                "retained_worktrees": [],
+                "cleanup_pending_worktrees": reconciled_cleanup,
+            }
+            reconciled_metadata.update(repair_metadata)
+            self.runtime.upsert_step(
+                plan.task_id,
+                step.step_id,
+                title=step.title,
+                status="committed",
+                commit_sha=sha,
+                metadata=reconciled_metadata,
+                event_type=repair_event_type or "integration_reconciled",
+                event_payload=(
+                    repair_event_payload
+                    if repair_event_type
+                    else {
+                        "patch_sha": patch.patch_sha,
+                        "commit_sha": sha,
+                    }
+                ),
+            )
+            if repair_event_type:
+                self.runtime.record_event(
+                    plan.task_id,
+                    "integration_reconciled",
+                    step_id=step.step_id,
+                    payload={
+                        "patch_sha": patch.patch_sha,
+                        "commit_sha": sha,
+                        "repair_attempts": repair_attempts,
+                    },
+                )
+            self._try_memory_write(
+                "append_reconciled_step",
+                lambda: self.memory.append_step(
+                    step.step_id,
+                    step.title,
+                    record.worker,
+                    review.memory_note,
+                    review.verdict,
+                ),
+                run_id=plan.task_id,
+                step_id=step.step_id,
+            )
+            self._remember_step(
+                plan.task_id,
+                step,
+                record.worker,
+                review,
+                patch,
+                patch_artifact_id=record.patch_artifact_id,
+                commit_sha=sha,
+            )
+            if self.config.git.auto_push:
+                self.git.push()
+            self._cleanup_step_worktrees(
+                plan.task_id,
+                step,
+                reconciled_cleanup,
+                worktrees,
+            )
+            fire(
+                "on_status",
+                f"Reconciled already-integrated {step.step_id} at commit {sha}.",
+            )
+            fire("on_commit", step, sha)
+
+    def _complete_pending_integration_rollbacks(
+        self,
+        plan: Plan,
+        worktrees: WorktreeManager,
+        fire: Callable,
+    ) -> bool:
+        """Finish a pre-journaled rollback before workspace checkpointing."""
+        if not self.runtime or not self.git:
+            return True
+
+        all_safe = True
+        for step in plan.steps:
+            record = self.runtime.get_step(plan.task_id, step.step_id)
+            if (
+                not record
+                or record.status == "committed"
+                or record.metadata.get("repair_state")
+                != "integration_rollback_pending"
+            ):
+                continue
+
+            def fail_pending(reason: str) -> None:
+                nonlocal all_safe
+                all_safe = False
+                try:
+                    self.runtime.record_step_event(
+                        plan.task_id,
+                        step.step_id,
+                        "integration_rollback_recovery_failed",
+                        title=step.title,
+                        status="blocked",
+                        metadata={
+                            "repair_state": "integration_failed",
+                            "repair_stage": "integration_commit",
+                            "blocked_reason": reason,
+                            "draft_retained": True,
+                            "lease": "blocked",
+                        },
+                        payload={"reason": reason},
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not persist rollback recovery failure for %s",
+                        step.step_id,
+                    )
+                fire("on_error", step, reason)
+
+            if not record.worktree_path:
+                fail_pending(
+                    "Cannot finish the journaled integration rollback because "
+                    "the retained worktree path is missing."
+                )
+                continue
+            worktree_path = Path(record.worktree_path)
+            if not worktree_path.exists():
+                fail_pending(
+                    "Cannot finish the journaled integration rollback because "
+                    f"the retained worktree no longer exists: {worktree_path}"
+                )
+                continue
+            try:
+                patch = worktrees.capture_patch(worktree_path, step)
+                expected_sha = str(
+                    record.metadata.get("current_patch_sha", "") or ""
+                )
+                if (
+                    not patch.has_changes
+                    or not expected_sha
+                    or patch.patch_sha != expected_sha
+                ):
+                    raise RuntimeError(
+                        "retained candidate identity changed before rollback recovery"
+                    )
+
+                # A clean HEAD delta means rollback already completed (or the
+                # exact result is durably in HEAD). Never reverse committed
+                # bytes merely because they equal the retained candidate.
+                if not worktrees.main_matches_base(
+                    worktree_path,
+                    patch.changed_files,
+                ):
+                    if not worktrees.candidate_matches_main(
+                        worktree_path,
+                        patch.changed_files,
+                    ):
+                        raise RuntimeError(
+                            "main contains changes that are neither HEAD nor the "
+                            "exact reviewed candidate"
+                        )
+                    worktrees.rollback_patch(
+                        patch.patch_text,
+                        patch.changed_files,
+                    )
+                    if not worktrees.main_matches_base(
+                        worktree_path,
+                        patch.changed_files,
+                    ):
+                        raise RuntimeError(
+                            "reviewed paths still differ from HEAD after rollback"
+                        )
+
+                self.runtime.record_step_event(
+                    plan.task_id,
+                    step.step_id,
+                    "integration_rollback_recovered",
+                    title=step.title,
+                    status="repairing",
+                    metadata={"repair_state": "validating"},
+                    payload={"patch_sha": patch.patch_sha},
+                )
+                fire(
+                    "on_status",
+                    f"Recovered journaled rollback for {step.step_id}; "
+                    "revalidating the retained candidate.",
+                )
+            except Exception as exc:
+                fail_pending(
+                    "Could not safely finish journaled integration rollback: "
+                    f"{exc}"
+                )
+        return all_safe
+
     def _run_step_in_worktree(
         self,
         run_id: str,
@@ -1062,6 +1732,7 @@ class Orchestrator:
         worktrees: WorktreeManager,
         output_callback: Callable[[str], None] | None,
         worktree_lock,
+        repair_callback: Callable[[dict], None] | None = None,
     ) -> _StepExecution:
         execution = _StepExecution(step=step, worker_name=worker_name)
         execution.reviewer_name = self._reviewer_name()
@@ -1098,15 +1769,84 @@ class Orchestrator:
             # Failover state: the account actually used may change mid-step if the
             # current one hits its rate/usage limit.
             worker_state = {"name": worker_name, "agent": worker_agent}
+            base_output_callback = output_callback
+
+            def contextual_output(text: str) -> None:
+                if base_output_callback:
+                    base_output_callback(AgentOutput(
+                        text,
+                        step_id=step.step_id,
+                        worker_name=worker_state["name"],
+                    ))
+
+            output_callback = contextual_output if base_output_callback else None
             turn_version = 0
             # Run context does not change during implementation turns; revision
             # instructions travel in the revised Step itself. Reusing this
             # bounded snapshot avoids rereading Markdown and querying FTS for
             # every dialogue/retry turn.
             step_memory = self._step_memory(step, plan, run_id)
+            record_metadata = dict(record.metadata) if record else {}
+            try:
+                turn_version = max(
+                    0, int(record_metadata.get("current_patch_version", 0) or 0)
+                )
+            except (TypeError, ValueError):
+                turn_version = 0
+            repair_phase = {
+                "state": str(record_metadata.get("repair_state", "") or ""),
+                "stage": str(record_metadata.get("repair_stage", "") or ""),
+                "id": str(record_metadata.get("repair_id", "") or ""),
+                "prior_patch_sha": str(
+                    record_metadata.get("repair_prior_patch_sha", "") or ""
+                ),
+                "reason": str(record_metadata.get("last_repair_reason", "") or ""),
+            }
+            try:
+                legacy_repair_attempts = int(
+                    record_metadata.get("repair_attempts", 0) or 0
+                )
+            except (TypeError, ValueError):
+                legacy_repair_attempts = 0
+            if (
+                not repair_phase["state"]
+                and legacy_repair_attempts > 0
+            ):
+                # Legacy/in-flight repair rows predate explicit phases. Treat
+                # them as already executing so the scheduler's running lease
+                # cannot accidentally grant a fresh, unbudgeted worker turn.
+                repair_phase["state"] = "executing"
+            execution.repair_id = repair_phase["id"]
+
+            def set_repair_phase(
+                state: str,
+                event_type: str,
+                *,
+                patch_sha: str = "",
+            ) -> None:
+                repair_phase["state"] = state
+                if not self.runtime or not repair_phase["id"]:
+                    return
+                metadata: dict[str, object] = {"repair_state": state}
+                if patch_sha:
+                    metadata["repair_candidate_patch_sha"] = patch_sha
+                self.runtime.record_step_event(
+                    run_id,
+                    step.step_id,
+                    event_type,
+                    title=step.title,
+                    metadata=metadata,
+                    payload={
+                        "repair_id": repair_phase["id"],
+                        "stage": repair_phase["stage"],
+                        "patch_sha": patch_sha,
+                    },
+                )
 
             def run_turn(s):
                 nonlocal turn_version
+                if repair_phase["state"] == "scheduled":
+                    set_repair_phase("executing", "repair_worker_started")
                 result = self._worker_execute_with_failover(
                     s,
                     worktree_path,
@@ -1120,12 +1860,12 @@ class Orchestrator:
                 if result is not None and result.success:
                     turn_version += 1
                     reported_files = list(result.files_written or [])
-                    turn_patch = worktrees.capture_patch(worktree_path, s)
+                    turn_patch = worktrees.capture_patch(worktree_path, step)
                     result.files_written = turn_patch.changed_files
                     result.evidence = self._turn_evidence(
                         turn_patch,
                         turn_version,
-                        step=s,
+                        step=step,
                         reported_files=reported_files,
                         work_dir=worktree_path,
                     )
@@ -1135,6 +1875,12 @@ class Orchestrator:
                         turn_patch,
                         turn_version,
                     )
+                    if repair_phase["state"] == "executing":
+                        set_repair_phase(
+                            "candidate_ready",
+                            "repair_candidate_ready",
+                            patch_sha=turn_patch.patch_sha,
+                        )
                     if self.runtime:
                         self.runtime.record_event(
                             run_id,
@@ -1148,349 +1894,602 @@ class Orchestrator:
                         )
                 return result
 
-            # Phase 3b: a multi-turn brain<->worker dialogue shapes the work
-            # before the independent reviewer gates it. Single-shot when disabled.
-            if getattr(self.config, "dialogue", None) and self.config.dialogue.enabled:
-                outcome = self._run_worker_dialogue(
-                    step, run_turn, worker_state["name"], step_room, output_callback
+            # A single shared budget covers every automatic worker repair in
+            # this execution generation. Crash/resume keeps the persisted count;
+            # an explicit operator retry resets it in RuntimeStore.
+            repair_budget = max(0, int(self.config.runtime.retry_budget))
+            try:
+                persisted_repairs = int(
+                    (record.metadata if record else {}).get("repair_attempts", 0) or 0
                 )
-                result = outcome.result
-            else:
-                result = run_turn(step)
-                self._post_step(
-                    step_room, worker_state["name"], "worker",
-                    f"Wrote {len(getattr(result, 'files_written', []) or [])} file(s)", "code",
-                )
+            except (TypeError, ValueError):
+                persisted_repairs = 0
+            execution.repair_attempts = max(0, persisted_repairs)
+            repairs_left = max(0, repair_budget - execution.repair_attempts)
+            brain_name = getattr(self.agent, "name", "brain") or "brain"
+            last_repair_trigger = {"stage": "", "reason": ""}
 
-            # Failover may have switched the account partway through.
-            worker_name = worker_state["name"]
-            execution.worker_name = worker_name
-            execution.result = result
-            if result is None or not result.success:
-                reason = (getattr(result, "error", "") if result else "") or "worker failed"
-                execution.failed_agent = worker_name
-                execution.failed_reason = reason
-                execution.memory_note = f"FAILED: {reason}"
-                self._post_step(step_room, worker_name, "worker", f"Failed: {reason}", "status")
-                return execution
-
-            patch = worktrees.capture_patch(worktree_path, step)
-            # The captured patch is the authoritative review manifest. Never
-            # leave a final-turn-only file list attached to an empty patch.
-            result.files_written = patch.changed_files
-            execution.patch = patch
-            execution.patch_version = turn_version
-            execution.patch_id = self._store_patch(run_id, step.step_id, patch)
-            if self.runtime:
-                self.runtime.upsert_step(
-                    run_id,
-                    step.step_id,
-                    title=step.title,
-                    status="reviewing",
-                    patch_artifact_id=execution.patch_id,
-                    metadata={"changed_files": patch.changed_files},
-                )
-                self.runtime.record_event(
-                    run_id,
-                    "worker_finished",
-                    step_id=step.step_id,
-                    payload={
-                        "worker": worker_name,
-                        "changed_files": patch.changed_files,
-                        "repair_attempts": execution.repair_attempts,
-                    },
-                )
-
-            if not patch.has_changes:
-                execution.failed_agent = worker_name
-                execution.failed_reason = (
-                    "Worker completed without a reviewable patch. No reviewer "
-                    "was called because the changed-file manifest is empty."
-                )
-                execution.memory_note = execution.failed_reason
-                self._post_step(
-                    step_room,
-                    worker_name,
-                    "worker",
-                    execution.failed_reason,
-                    "status",
-                )
-                return execution
-
-            gates = evaluate_acceptance_gates(step, patch, worktree_path)
-            if self.runtime:
-                self.runtime.record_event(
-                    run_id,
-                    "deterministic_gates",
-                    step_id=step.step_id,
-                    payload={"patch_sha": patch.patch_sha, **gates.as_dict()},
-                )
-            if not gates.passed:
-                execution.failed_agent = worker_name
-                execution.failed_reason = "Deterministic acceptance gates failed: " + " ".join(
-                    gates.violations
-                )
-                execution.memory_note = execution.failed_reason
-                self._post_step(
-                    step_room,
-                    worker_name,
-                    "worker",
-                    execution.failed_reason,
-                    "status",
-                )
-                return execution
-
-            review = self.review(
-                step,
-                result,
-                plan=plan,
-                run_id=run_id,
-                work_dir=worktree_path,
-                diff_text=patch.patch_text or "No git diff available.",
-            )
-            execution.review = review
-            execution.reviewed_patch_sha = patch.patch_sha
-            self._post_step(
-                step_room, execution.reviewer_name, "reviewer",
-                f"[patch v{execution.patch_version} {patch.patch_sha}] "
-                f"{review.verdict} ({review.quality_score}/10): {review.feedback}",
-                "decision",
-            )
-            if self.runtime:
-                self.runtime.upsert_step(
-                    run_id,
-                    step.step_id,
-                    title=step.title,
-                    status="reviewing",
-                    review=review.model_dump(),
-                    metadata={
-                        "reviewer": execution.reviewer_name,
-                        "review_verdict": review.verdict,
-                        "reviewed_patch_sha": patch.patch_sha,
-                        "review_patch_version": execution.patch_version,
-                        "review_state": "current",
-                        "repair_attempts": execution.repair_attempts,
-                    },
-                )
-
-            self._record_review(
-                run_id,
-                step,
-                review,
-                reviewer=execution.reviewer_name,
-                repair_attempts=execution.repair_attempts,
-                patch=patch,
-                patch_version=execution.patch_version,
-            )
-
-            retries_left = max(0, self.config.runtime.retry_budget)
-            while review.verdict == "needs_revision" and review.should_retry and retries_left:
-                retries_left -= 1
-                execution.repair_attempts += 1
-                reason = review.suggested_revision or review.feedback or review.verdict
-                if output_callback:
-                    output_callback(f"Retrying {step.step_id}: {reason}")
-                self._record_repair_attempt(
-                    run_id,
-                    step,
-                    reason=reason,
-                    attempts_used=execution.repair_attempts,
-                    attempts_left=retries_left,
-                )
-                revised = self._revision_step(step, reason)
-                result = run_turn(revised)
-                execution.result = result
-                if not result.success:
-                    review = review.model_copy(update={
-                        "verdict": "rejected",
-                        "quality_score": 1,
-                        "feedback": result.error,
-                        "memory_note": f"Revision failed: {result.error}",
-                        "should_retry": False,
-                    })
-                    execution.review = review
-                    break
-                patch = worktrees.capture_patch(worktree_path, revised)
-                result.files_written = patch.changed_files
-                execution.patch = patch
+            def capture_candidate(candidate_result: WorkerResult) -> WorktreePatch:
+                # Acceptance activation is anchored to the immutable original
+                # step. Repair feedback must never create a new keyword gate.
+                candidate_patch = worktrees.capture_patch(worktree_path, step)
+                candidate_result.files_written = candidate_patch.changed_files
+                execution.result = candidate_result
+                execution.patch = candidate_patch
                 execution.patch_version = turn_version
-                execution.patch_id = self._store_patch(run_id, step.step_id, patch)
-                if self.runtime:
-                    self.runtime.record_event(
-                        run_id,
-                        "worker_finished",
-                        step_id=step.step_id,
-                        payload={
-                            "worker": worker_name,
-                            "changed_files": patch.changed_files,
-                            "repair_attempts": execution.repair_attempts,
-                        },
-                    )
-                gates = evaluate_acceptance_gates(revised, patch, worktree_path)
-                if self.runtime:
-                    self.runtime.record_event(
-                        run_id,
-                        "deterministic_gates",
-                        step_id=step.step_id,
-                        payload={"patch_sha": patch.patch_sha, **gates.as_dict()},
-                    )
-                if not gates.passed:
-                    reason = "Deterministic acceptance gates failed: " + " ".join(gates.violations)
-                    review = review.model_copy(update={
-                        "verdict": "rejected",
-                        "quality_score": 1,
-                        "feedback": reason,
-                        "memory_note": reason,
-                        "should_retry": False,
-                    })
-                    execution.review = review
-                    break
-                review = self.review(
-                    revised,
-                    result,
-                    plan=plan,
-                    run_id=run_id,
-                    work_dir=worktree_path,
-                    diff_text=patch.patch_text or "No git diff available.",
+                execution.patch_id = self._store_patch(
+                    run_id, step.step_id, candidate_patch
                 )
-                execution.review = review
-                execution.reviewed_patch_sha = patch.patch_sha
-                self._post_step(
-                    step_room,
-                    execution.reviewer_name,
-                    "reviewer",
-                    f"[patch v{execution.patch_version} {patch.patch_sha}] "
-                    f"{review.verdict} ({review.quality_score}/10): {review.feedback}",
-                    "decision",
-                )
+                execution.worker_name = worker_state["name"]
                 if self.runtime:
                     self.runtime.upsert_step(
                         run_id,
                         step.step_id,
                         title=step.title,
                         status="reviewing",
+                        worker=worker_state["name"],
                         patch_artifact_id=execution.patch_id,
-                        review=review.model_dump(),
                         metadata={
-                            "changed_files": patch.changed_files,
-                            "reviewed_patch_sha": patch.patch_sha,
-                            "review_patch_version": execution.patch_version,
-                            "review_state": "current",
+                            "changed_files": candidate_patch.changed_files,
+                            "repair_attempts": execution.repair_attempts,
+                            "repair_budget": repair_budget,
+                            "repairs_remaining": repairs_left,
+                        },
+                    )
+                    self.runtime.record_event(
+                        run_id,
+                        "worker_finished",
+                        step_id=step.step_id,
+                        payload={
+                            "worker": worker_state["name"],
+                            "changed_files": candidate_patch.changed_files,
                             "repair_attempts": execution.repair_attempts,
                         },
                     )
-                self._record_review(
+                return candidate_patch
+
+            def consume_repair(
+                stage: str,
+                reason: str,
+                *,
+                prior_patch_sha: str = "",
+                invalidate_candidate: bool = True,
+                worker_turn: bool = True,
+            ) -> dict[str, object] | None:
+                nonlocal repairs_left
+                if repairs_left <= 0:
+                    return None
+
+                repairs_left -= 1
+                execution.repair_attempts += 1
+                attempt = execution.repair_attempts
+                bounded_reason = str(reason or "unknown failure").strip()[:6000]
+                last_repair_trigger["stage"] = stage
+                last_repair_trigger["reason"] = bounded_reason
+                repair_event = self._record_repair_attempt(
                     run_id,
                     step,
-                    review,
-                    reviewer=execution.reviewer_name,
-                    repair_attempts=execution.repair_attempts,
-                    patch=patch,
-                    patch_version=execution.patch_version,
+                    reason=bounded_reason,
+                    attempts_used=attempt,
+                    attempts_left=repairs_left,
+                    stage=stage,
+                    budget_total=repair_budget,
+                    prior_patch_sha=prior_patch_sha,
+                    worker=worker_state["name"],
+                    repair_state="scheduled" if worker_turn else "validating",
+                )
+                execution.repair_id = str(repair_event.get("repair_id", "") or "")
+                repair_phase.update({
+                    "state": "scheduled" if worker_turn else "validating",
+                    "stage": stage,
+                    "id": execution.repair_id,
+                    "prior_patch_sha": prior_patch_sha,
+                    "reason": bounded_reason,
+                })
+                status = (
+                    f"REPAIR {attempt}/{repair_budget} | {step.step_id} | {stage}\n"
+                    f"{bounded_reason}"
+                )
+                if repair_callback and repair_event:
+                    repair_callback(repair_event)
+                elif output_callback:
+                    output_callback(status)
+                self._post_step(
+                    step_room, brain_name, "brain", status, "status"
                 )
 
-            if review.verdict != "approved":
-                execution.failed_agent = worker_name
-                execution.failed_reason = review.feedback or review.verdict
-                execution.memory_note = review.memory_note
+                if invalidate_candidate:
+                    execution.review = None
+                    execution.reviewed_patch_sha = ""
+                    execution.verification = None
+                return repair_event
+
+            def start_repair(
+                stage: str,
+                reason: str,
+                *,
+                prior_patch_sha: str = "",
+            ) -> tuple[Step, WorkerResult | None, str] | None:
+                repair_event = consume_repair(
+                    stage,
+                    reason,
+                    prior_patch_sha=prior_patch_sha,
+                )
+                if repair_event is None:
+                    return None
+
+                bounded_reason = str(reason or "unknown failure").strip()[:6000]
+
+                repair_instruction = (
+                    "Continue in the existing isolated worktree. Preserve correct "
+                    "work already present, diagnose the evidence below, and make the "
+                    "smallest complete correction. Do not merely describe the fix; "
+                    "edit the files and verify the result."
+                    f"\n\nObserved {stage} failure:\n{bounded_reason}"
+                )
+                revised_step = self._revision_step(step, repair_instruction)
+                repaired_result = run_turn(revised_step)
+                execution.worker_name = worker_state["name"]
+                return revised_step, repaired_result, prior_patch_sha
+
+            def terminal_failure(
+                stage: str,
+                reason: str,
+                *,
+                repairable: bool,
+                agent: str | None = None,
+                block_kind_hint: str = "",
+            ) -> _StepExecution:
+                base_reason = str(reason or "unknown failure").strip()
+                retained = (
+                    f" Draft retained at {worktree_path} and was not applied."
+                    if worktree_path
+                    else " Draft was not applied."
+                )
+                if block_kind_hint == "capacity_wait":
+                    block_kind = "capacity_wait"
+                    guidance = (
+                        " Automatic repair is waiting for worker capacity; "
+                        "retry after the account cooldown or login is restored."
+                    )
+                elif repairable and repair_budget <= 0:
+                    block_kind = "repair_disabled"
+                    guidance = " Automatic self-repair is disabled (retry_budget=0)."
+                elif repairable:
+                    block_kind = "repair_exhausted"
+                    guidance = (
+                        " Automatic self-repair budget exhausted "
+                        f"({execution.repair_attempts}/{repair_budget} used)."
+                    )
+                else:
+                    block_kind = "hard_failure"
+                    guidance = (
+                        " Automatic self-repair was skipped for this "
+                        "non-repairable failure."
+                    )
+
+                full_reason = base_reason + guidance + retained
+                execution.failed_agent = agent or worker_state["name"]
+                execution.failed_reason = full_reason
+                execution.memory_note = full_reason
+                if self.runtime:
+                    event_type = (
+                        "repair_budget_exhausted"
+                        if block_kind == "repair_exhausted"
+                        else "repair_deferred"
+                        if block_kind == "capacity_wait"
+                        else "repair_skipped"
+                    )
+                    self.runtime.record_step_event(
+                        run_id,
+                        step.step_id,
+                        event_type,
+                        title=step.title,
+                        status="blocked",
+                        metadata={
+                            "last_failure_stage": stage,
+                            "block_kind": block_kind,
+                            "repair_attempts": execution.repair_attempts,
+                            "repair_budget": repair_budget,
+                            "repairs_remaining": repairs_left,
+                            "repair_state": block_kind,
+                            "repair_stage": stage,
+                            "draft_retained": bool(worktree_path),
+                            "blocked_reason": full_reason,
+                            "lease": "blocked",
+                            "resolution": (
+                                "retry_after_cooldown"
+                                if block_kind == "capacity_wait"
+                                else "manual_retry"
+                                if block_kind in {"repair_exhausted", "repair_disabled"}
+                                else "operator_action"
+                            ),
+                        },
+                        payload={
+                            "stage": stage,
+                            "block_kind": block_kind,
+                            "reason": base_reason,
+                            "attempts_used": execution.repair_attempts,
+                            "budget_total": repair_budget,
+                            "worktree_path": str(worktree_path or ""),
+                        },
+                    )
+                label = (
+                    "AUTO-REPAIR EXHAUSTED"
+                    if block_kind == "repair_exhausted"
+                    else "AUTO-REPAIR DISABLED"
+                    if block_kind == "repair_disabled"
+                    else "WAITING FOR CAPACITY"
+                    if block_kind == "capacity_wait"
+                    else "HARD BLOCK"
+                )
+                self._post_step(
+                    step_room,
+                    brain_name,
+                    "brain",
+                    f"{label} | {step.step_id} | {stage}\n{full_reason}",
+                    "status",
+                )
                 return execution
 
-            if self.runtime:
-                self.runtime.upsert_step(run_id, step.step_id, title=step.title, status="verifying")
+            def stage_repair_outcome(
+                final_patch: WorktreePatch,
+                outcome: str = "verified",
+            ) -> None:
+                # The candidate is not resolved until its reviewed patch has
+                # been integrated and durably committed on the main worktree.
+                if execution.repair_attempts <= 0:
+                    return
+                execution.repair_outcome = outcome
+                execution.repair_patch_sha = final_patch.patch_sha
+
+            def prepare_candidate(
+                candidate_step: Step,
+                candidate_result: WorkerResult | None,
+                *,
+                must_change_from: str = "",
+            ) -> tuple[
+                Step,
+                WorkerResult | None,
+                WorktreePatch | None,
+                dict[str, object] | None,
+            ]:
+                required_change = must_change_from
+                current_step = candidate_step
+                current_result = candidate_result
+
+                while True:
+                    if current_result is None or not getattr(
+                        current_result, "success", False
+                    ):
+                        reason = (
+                            (getattr(current_result, "error", "") if current_result else "")
+                            or "Worker failed without returning a result."
+                        )
+                        repairable, block_kind = _worker_failure_policy(reason)
+                        repair = (
+                            start_repair(
+                                "worker",
+                                f"Worker execution failed: {reason}",
+                                prior_patch_sha=required_change,
+                            )
+                            if repairable
+                            else None
+                        )
+                        if repair is not None:
+                            current_step, current_result, required_change = repair
+                            continue
+                        return current_step, current_result, None, {
+                            "stage": "worker",
+                            "reason": f"Worker execution failed: {reason}",
+                            "repairable": repairable,
+                            "block_kind": block_kind,
+                        }
+
+                    candidate_patch = capture_candidate(current_result)
+
+                    if not candidate_patch.has_changes:
+                        reason = (
+                            "Worker completed without a reviewable patch. "
+                            "The authoritative changed-file manifest is empty."
+                        )
+                        repair = start_repair(
+                            "patch",
+                            reason,
+                            prior_patch_sha=candidate_patch.patch_sha,
+                        )
+                        if repair is not None:
+                            current_step, current_result, required_change = repair
+                            continue
+                        return current_step, current_result, candidate_patch, {
+                            "stage": "patch",
+                            "reason": reason,
+                            "repairable": True,
+                        }
+
+                    if (
+                        required_change
+                        and candidate_patch.patch_sha == required_change
+                    ):
+                        reason = (
+                            "The repair attempt produced no material patch change. "
+                            f"Patch {candidate_patch.patch_sha} is identical to the "
+                            "candidate that failed acceptance. Original "
+                            f"{last_repair_trigger['stage'] or 'candidate'} failure: "
+                            f"{last_repair_trigger['reason'] or 'unknown failure'}"
+                        )
+                        repair = start_repair(
+                            "no_progress",
+                            reason,
+                            prior_patch_sha=candidate_patch.patch_sha,
+                        )
+                        if repair is not None:
+                            current_step, current_result, required_change = repair
+                            continue
+                        return current_step, current_result, candidate_patch, {
+                            "stage": "no_progress",
+                            "reason": reason,
+                            "repairable": True,
+                        }
+
+                    required_change = ""
+                    gates = evaluate_acceptance_gates(
+                        step, candidate_patch, worktree_path
+                    )
+                    if self.runtime:
+                        self.runtime.record_event(
+                            run_id,
+                            "deterministic_gates",
+                            step_id=step.step_id,
+                            payload={
+                                "patch_sha": candidate_patch.patch_sha,
+                                "repair_attempts": execution.repair_attempts,
+                                **gates.as_dict(),
+                            },
+                        )
+                    if not gates.passed:
+                        reason = (
+                            "Deterministic acceptance gates failed: "
+                            + " ".join(gates.violations)
+                        )
+                        repair = (
+                            start_repair(
+                                "acceptance",
+                                reason,
+                                prior_patch_sha=candidate_patch.patch_sha,
+                            )
+                            if gates.repairable
+                            else None
+                        )
+                        if repair is not None:
+                            current_step, current_result, required_change = repair
+                            continue
+                        return current_step, current_result, candidate_patch, {
+                            "stage": "acceptance",
+                            "reason": reason,
+                            "repairable": gates.repairable,
+                        }
+
+                    return current_step, current_result, candidate_patch, None
+
+            # The dialogue can improve the first draft, but every result still
+            # enters the same authoritative candidate loop afterward.
+            def consume_dialogue_retry(
+                stage: str,
+                reason: str,
+                turn_result: WorkerResult,
+            ) -> bool:
+                evidence = getattr(turn_result, "evidence", None) or {}
+                return consume_repair(
+                    stage,
+                    reason,
+                    prior_patch_sha=str(evidence.get("patch_sha", "") or ""),
+                ) is not None
+
+            candidate_step = step
+            if record_metadata.get("retried"):
+                retained_paths = [
+                    str(item)
+                    for item in (
+                        record_metadata.get("retained_worktrees", []) or []
+                    )
+                    if item
+                ]
+                retry_context = (
+                    "This is an explicit operator retry in the retained worktree. "
+                    "Preserve useful draft changes, diagnose the prior failure, "
+                    "and make the smallest complete correction."
+                )
+                if retained_paths:
+                    retry_context += (
+                        " Earlier reviewed drafts remain available at: "
+                        + ", ".join(retained_paths)
+                    )
+                candidate_step = self._revision_step(step, retry_context)
+            resume_required_change = ""
+            resumable_repair_states = {
+                "scheduled",
+                "executing",
+                "candidate_ready",
+                "validating",
+                "integration_rollback_pending",
+                "active",  # compatibility with older in-flight state
+            }
+            resuming_repair = (
+                persisted_repairs > 0
+                and repair_phase["state"] in resumable_repair_states
+            )
+            if resuming_repair and repair_phase["state"] == "scheduled":
+                candidate_step = self._revision_step(
+                    step,
+                    "Resume the already-budgeted repair attempt in the retained "
+                    "worktree. Preserve existing progress and address this failure:\n"
+                    + (repair_phase["reason"] or "interrupted repair"),
+                )
+                result = run_turn(candidate_step)
+                resume_required_change = repair_phase["prior_patch_sha"]
+            elif resuming_repair:
+                # An executing/candidate-ready repair may have been interrupted
+                # after mutating files. Re-validate those retained bytes instead
+                # of granting another unbudgeted worker turn.
+                retained_patch = worktrees.capture_patch(worktree_path, step)
+                stored_patch_sha = str(
+                    record_metadata.get("current_patch_sha", "") or ""
+                )
+                if retained_patch.patch_sha != stored_patch_sha:
+                    turn_version = max(1, turn_version + 1)
+                    self._record_patch_version(
+                        run_id,
+                        step,
+                        retained_patch,
+                        turn_version,
+                    )
+                else:
+                    turn_version = max(1, turn_version)
+                result = WorkerResult(
+                    step_id=step.step_id,
+                    raw_response="",
+                    result_text="Resuming retained repair candidate after interruption.",
+                    files_written=retained_patch.changed_files,
+                    evidence=self._turn_evidence(
+                        retained_patch,
+                        turn_version,
+                        step=step,
+                        reported_files=retained_patch.changed_files,
+                        work_dir=worktree_path,
+                    ),
+                    success=True,
+                )
+                candidate_step = self._revision_step(
+                    step,
+                    "Re-validate the retained repair candidate after interruption. "
+                    + (repair_phase["reason"] or ""),
+                )
+                if repair_phase["stage"] not in {
+                    "verification_timeout",
+                    "integration_commit",
+                }:
+                    resume_required_change = repair_phase["prior_patch_sha"]
+                self._post_step(
+                    step_room,
+                    brain_name,
+                    "brain",
+                    "Resuming retained repair bytes without spending or granting "
+                    "another worker turn.",
+                    "status",
+                )
+            elif (
+                getattr(self.config, "dialogue", None)
+                and self.config.dialogue.enabled
+            ):
+                outcome = self._run_worker_dialogue(
+                    candidate_step,
+                    run_turn,
+                    worker_state["name"],
+                    step_room,
+                    output_callback,
+                    before_retry=consume_dialogue_retry,
+                )
+                result = outcome.result
+                candidate_step = outcome.last_step or step
+                if repair_phase["stage"].startswith("dialogue_"):
+                    resume_required_change = repair_phase["prior_patch_sha"]
+            else:
+                result = run_turn(candidate_step)
+                self._post_step(
+                    step_room,
+                    worker_state["name"],
+                    "worker",
+                    "Draft patch captured: "
+                    f"{len(getattr(result, 'files_written', []) or [])} file(s) "
+                    "changed (not yet accepted)",
+                    "tool",
+                )
+
+            execution.worker_name = worker_state["name"]
+            candidate_step, result, patch, failure = prepare_candidate(
+                candidate_step,
+                result,
+                must_change_from=resume_required_change,
+            )
+            if failure is not None:
+                return terminal_failure(
+                    str(failure["stage"]),
+                    str(failure["reason"]),
+                    repairable=bool(failure["repairable"]),
+                    block_kind_hint=str(failure.get("block_kind", "") or ""),
+                )
+            assert result is not None and patch is not None
+
             verifier = Verifier(
                 self.config,
                 self.policy or ExecutionPolicy.load(self.work_dir, self.config),
                 str(worktree_path),
                 output_callback=output_callback,
             )
-            verification = verifier.verify(changed_files=execution.patch.changed_files if execution.patch else [])
-            execution.verification = verification
-            self._record_verification(run_id, step.step_id, verification)
-            if self.runtime:
-                self.runtime.upsert_step(
-                    run_id,
-                    step.step_id,
-                    title=step.title,
-                    status="verifying",
-                    verification=self._verification_payload(verification),
-                    metadata={"repair_attempts": execution.repair_attempts},
-                )
-            if not verification.passed:
-                while retries_left:
-                    retries_left -= 1
-                    execution.repair_attempts += 1
-                    reason = self._verification_summary(verification)
-                    if output_callback:
-                        output_callback(f"Repairing {step.step_id} after verification failure")
-                    self._record_repair_attempt(
-                        run_id,
-                        step,
-                        reason=reason,
-                        attempts_used=execution.repair_attempts,
-                        attempts_left=retries_left,
-                    )
-                    revised = self._revision_step(step, reason)
-                    result = run_turn(revised)
-                    execution.result = result
-                    if not result.success:
-                        execution.failed_agent = worker_name
-                        execution.failed_reason = result.error or "worker failed during verification repair"
-                        execution.memory_note = f"Verification repair failed: {execution.failed_reason}"
-                        return execution
 
-                    patch = worktrees.capture_patch(worktree_path, revised)
-                    result.files_written = patch.changed_files
-                    execution.patch = patch
-                    execution.patch_version = turn_version
-                    execution.patch_id = self._store_patch(run_id, step.step_id, patch)
-                    if self.runtime:
-                        self.runtime.record_event(
-                            run_id,
-                            "worker_finished",
-                            step_id=step.step_id,
-                            payload={
-                                "worker": worker_name,
-                                "changed_files": patch.changed_files,
-                                "repair_attempts": execution.repair_attempts,
-                            },
-                        )
-                        self.runtime.upsert_step(
-                            run_id,
-                            step.step_id,
-                            title=step.title,
-                            status="reviewing",
-                            patch_artifact_id=execution.patch_id,
-                            metadata={
-                                "changed_files": patch.changed_files,
-                                "repair_attempts": execution.repair_attempts,
-                            },
+            # Every repaired candidate re-enters review and verification. No
+            # earlier verdict or verification result can authorize new bytes.
+            while True:
+                while True:
+                    review = None
+                    review_error = ""
+                    for review_attempt in range(2):
+                        try:
+                            candidate_review = self.review(
+                                candidate_step,
+                                result,
+                                plan=plan,
+                                run_id=run_id,
+                                work_dir=worktree_path,
+                                diff_text=(
+                                    patch.patch_text
+                                    or "No git diff available."
+                                ),
+                            )
+                            if candidate_review.step_id != step.step_id:
+                                raise ValueError(
+                                    "Reviewer returned a verdict for "
+                                    f"{candidate_review.step_id!r}; expected {step.step_id!r}."
+                                )
+                            review = candidate_review
+                            break
+                        except Exception as exc:
+                            review_error = str(exc)
+                            if review_attempt == 0:
+                                status = (
+                                    f"Independent review failed for {step.step_id}; "
+                                    "retrying the same immutable patch once."
+                                )
+                                if output_callback:
+                                    output_callback(status)
+                                self._post_step(
+                                    step_room,
+                                    execution.reviewer_name,
+                                    "reviewer",
+                                    status,
+                                    "status",
+                                )
+                                if self.runtime:
+                                    self.runtime.record_event(
+                                        run_id,
+                                        "review_retried",
+                                        step_id=step.step_id,
+                                        payload={
+                                            "patch_sha": patch.patch_sha,
+                                            "reason": review_error,
+                                            "attempt": 2,
+                                        },
+                                    )
+                    if review is None:
+                        return terminal_failure(
+                            "review_transport",
+                            "Independent reviewer failed twice on the same patch: "
+                            + (review_error or "unknown reviewer error"),
+                            repairable=False,
+                            agent=execution.reviewer_name,
                         )
 
-                    gates = evaluate_acceptance_gates(revised, patch, worktree_path)
-                    if self.runtime:
-                        self.runtime.record_event(
-                            run_id,
-                            "deterministic_gates",
-                            step_id=step.step_id,
-                            payload={"patch_sha": patch.patch_sha, **gates.as_dict()},
-                        )
-                    if not gates.passed:
-                        execution.failed_agent = worker_name
-                        execution.failed_reason = (
-                            "Deterministic acceptance gates failed: "
-                            + " ".join(gates.violations)
-                        )
-                        execution.memory_note = execution.failed_reason
-                        return execution
-
-                    review = self.review(
-                        revised,
-                        result,
-                        plan=plan,
-                        run_id=run_id,
-                        work_dir=worktree_path,
-                        diff_text=patch.patch_text or "No git diff available.",
-                    )
                     execution.review = review
                     execution.reviewed_patch_sha = patch.patch_sha
                     self._post_step(
@@ -1498,7 +2497,8 @@ class Orchestrator:
                         execution.reviewer_name,
                         "reviewer",
                         f"[patch v{execution.patch_version} {patch.patch_sha}] "
-                        f"{review.verdict} ({review.quality_score}/10): {review.feedback}",
+                        f"{review.verdict} ({review.quality_score}/10): "
+                        f"{review.feedback}",
                         "decision",
                     )
                     if self.runtime:
@@ -1507,7 +2507,15 @@ class Orchestrator:
                             step.step_id,
                             title=step.title,
                             status="reviewing",
+                            patch_artifact_id=execution.patch_id,
                             review=review.model_dump(),
+                            metadata={
+                                "changed_files": patch.changed_files,
+                                "reviewed_patch_sha": patch.patch_sha,
+                                "review_patch_version": execution.patch_version,
+                                "review_state": "current",
+                                "repair_attempts": execution.repair_attempts,
+                            },
                         )
                     self._record_review(
                         run_id,
@@ -1518,43 +2526,245 @@ class Orchestrator:
                         patch=patch,
                         patch_version=execution.patch_version,
                     )
-                    if review.verdict != "approved":
-                        execution.failed_agent = worker_name
-                        execution.failed_reason = review.feedback or review.verdict
-                        execution.memory_note = review.memory_note
-                        return execution
 
-                    if self.runtime:
-                        self.runtime.upsert_step(run_id, step.step_id, title=step.title, status="verifying")
-                    verification = verifier.verify(changed_files=execution.patch.changed_files if execution.patch else [])
-                    execution.verification = verification
-                    self._record_verification(run_id, step.step_id, verification)
-                    if self.runtime:
-                        self.runtime.upsert_step(
-                            run_id,
-                            step.step_id,
-                            title=step.title,
-                            status="verifying",
-                            verification=self._verification_payload(verification),
-                            metadata={"repair_attempts": execution.repair_attempts},
-                        )
-                    if verification.passed:
+                    if review.verdict == "approved":
                         break
 
-                if not verification.passed:
-                    if self.config.verification.require_for_commit:
-                        execution.failed_agent = "verifier"
-                        execution.failed_reason = verification.reason
-                        execution.memory_note = f"Verification failed: {verification.reason}"
-                        return execution
-                    # Advisory mode: surface the failure but allow the commit.
-                    if output_callback:
-                        output_callback(
-                            f"Verification failed but require_for_commit=false; "
-                            f"committing anyway: {verification.reason}"
+                    reason = (
+                        review.suggested_revision
+                        or review.feedback
+                        or f"Independent review returned {review.verdict}."
+                    )
+                    retryable_review = (
+                        review.verdict == "needs_revision"
+                        and review.should_retry
+                    )
+                    repair = (
+                        start_repair(
+                            "review",
+                            reason,
+                            prior_patch_sha=patch.patch_sha,
+                        )
+                        if retryable_review
+                        else None
+                    )
+                    if repair is None:
+                        return terminal_failure(
+                            "review",
+                            reason,
+                            repairable=retryable_review,
+                            agent=execution.reviewer_name,
                         )
 
-            return execution
+                    candidate_step, result, required_change = repair
+                    candidate_step, result, patch, failure = prepare_candidate(
+                        candidate_step,
+                        result,
+                        must_change_from=required_change,
+                    )
+                    if failure is not None:
+                        return terminal_failure(
+                            str(failure["stage"]),
+                            str(failure["reason"]),
+                            repairable=bool(failure["repairable"]),
+                            block_kind_hint=str(failure.get("block_kind", "") or ""),
+                        )
+                    assert result is not None and patch is not None
+
+                if self.runtime:
+                    self.runtime.upsert_step(
+                        run_id,
+                        step.step_id,
+                        title=step.title,
+                        status="verifying",
+                        metadata={"repair_attempts": execution.repair_attempts},
+                    )
+                verification = verifier.verify(changed_files=patch.changed_files)
+                execution.verification = verification
+                self._record_verification(
+                    run_id,
+                    step.step_id,
+                    verification,
+                    verified_patch_sha=patch.patch_sha,
+                )
+                if self.runtime:
+                    self.runtime.upsert_step(
+                        run_id,
+                        step.step_id,
+                        title=step.title,
+                        status="verifying",
+                        verification=self._verification_payload(
+                            verification,
+                            verified_patch_sha=patch.patch_sha,
+                        ),
+                        metadata={
+                            "repair_attempts": execution.repair_attempts,
+                            "verified_patch_sha": patch.patch_sha,
+                        },
+                    )
+
+                # Verification commands are untrusted with respect to the
+                # worktree: formatters and test scripts can modify files. Never
+                # commit the pre-verification patch if the verified bytes differ.
+                verified_patch = worktrees.capture_patch(worktree_path, step)
+                if verified_patch.patch_sha != patch.patch_sha:
+                    reviewed_sha = patch.patch_sha
+                    reason = (
+                        "Verification modified the candidate patch after review: "
+                        f"reviewed={reviewed_sha}, verified={verified_patch.patch_sha}. "
+                        "The changed bytes require fresh gates, review, and verification."
+                    )
+                    mutation_repair = consume_repair(
+                        "verification_mutation",
+                        reason,
+                        prior_patch_sha=reviewed_sha,
+                        worker_turn=False,
+                    )
+                    turn_version += 1
+                    result.files_written = verified_patch.changed_files
+                    result.evidence = self._turn_evidence(
+                        verified_patch,
+                        turn_version,
+                        step=step,
+                        reported_files=verified_patch.changed_files,
+                        work_dir=worktree_path,
+                    )
+                    self._record_patch_version(
+                        run_id,
+                        step,
+                        verified_patch,
+                        turn_version,
+                    )
+
+                    if mutation_repair is None:
+                        execution.result = result
+                        execution.patch = verified_patch
+                        execution.patch_version = turn_version
+                        execution.patch_id = self._store_patch(
+                            run_id,
+                            step.step_id,
+                            verified_patch,
+                        )
+                        execution.review = None
+                        execution.reviewed_patch_sha = ""
+                        if self.runtime:
+                            self.runtime.upsert_step(
+                                run_id,
+                                step.step_id,
+                                title=step.title,
+                                status="reviewing",
+                                patch_artifact_id=execution.patch_id,
+                                review={},
+                                metadata={
+                                    "changed_files": verified_patch.changed_files,
+                                    "review_state": "unreviewed",
+                                    "repair_attempts": execution.repair_attempts,
+                                },
+                            )
+                        return terminal_failure(
+                            "verification_mutation",
+                            reason,
+                            repairable=True,
+                            agent="verifier",
+                        )
+
+                    candidate_step = self._revision_step(
+                        step,
+                        "Verification changed the worktree. Treat the resulting "
+                        "bytes as a new candidate and independently validate them.",
+                    )
+                    candidate_step, result, patch, failure = prepare_candidate(
+                        candidate_step,
+                        result,
+                        must_change_from=reviewed_sha,
+                    )
+                    if failure is not None:
+                        return terminal_failure(
+                            str(failure["stage"]),
+                            str(failure["reason"]),
+                            repairable=bool(failure["repairable"]),
+                            block_kind_hint=str(failure.get("block_kind", "") or ""),
+                        )
+                    assert result is not None and patch is not None
+                    continue
+
+                if verification.passed:
+                    stage_repair_outcome(patch)
+                    return execution
+
+                reason = self._verification_summary(verification)
+                if verification.failure_kind == "timeout":
+                    timeout_retry = consume_repair(
+                        "verification_timeout",
+                        reason,
+                        prior_patch_sha=patch.patch_sha,
+                        invalidate_candidate=False,
+                        worker_turn=False,
+                    )
+                    if timeout_retry is not None:
+                        # The candidate bytes did not fail; retry the operational
+                        # check without forcing a meaningless source change.
+                        continue
+                    if not self.config.verification.require_for_commit:
+                        if output_callback:
+                            output_callback(
+                                "Verification timed out and no retry budget remains, "
+                                "but require_for_commit=false; committing advisory result."
+                            )
+                        stage_repair_outcome(patch, "accepted_advisory")
+                        return execution
+                    return terminal_failure(
+                        "verification_timeout",
+                        reason,
+                        repairable=True,
+                        agent="verifier",
+                    )
+
+                if not verification.repairable:
+                    return terminal_failure(
+                        "verification",
+                        reason,
+                        repairable=False,
+                        agent="verifier",
+                    )
+
+                repair = start_repair(
+                    "verification",
+                    reason,
+                    prior_patch_sha=patch.patch_sha,
+                )
+                if repair is None:
+                    if not self.config.verification.require_for_commit:
+                        if output_callback:
+                            output_callback(
+                                "Verification failed and automatic repair is "
+                                "unavailable, but require_for_commit=false; "
+                                "committing advisory result: "
+                                f"{verification.reason}"
+                            )
+                        stage_repair_outcome(patch, "accepted_advisory")
+                        return execution
+                    return terminal_failure(
+                        "verification",
+                        reason,
+                        repairable=True,
+                        agent="verifier",
+                    )
+
+                candidate_step, result, required_change = repair
+                candidate_step, result, patch, failure = prepare_candidate(
+                    candidate_step,
+                    result,
+                    must_change_from=required_change,
+                )
+                if failure is not None:
+                    return terminal_failure(
+                        str(failure["stage"]),
+                        str(failure["reason"]),
+                        repairable=bool(failure["repairable"]),
+                        block_kind_hint=str(failure.get("block_kind", "") or ""),
+                    )
+                assert result is not None and patch is not None
         except Exception as e:
             logger.exception("Step execution failed for %s", step.step_id)
             execution.failed_agent = "worker-runtime"
@@ -1733,7 +2943,8 @@ class Orchestrator:
         }
 
     def _run_worker_dialogue(self, step: Step, run_worker, worker_name: str,
-                             step_room: str, output_callback):
+                             step_room: str, output_callback,
+                             before_retry=None):
         from genesis.agents.worker_dialogue import WorkerDialogue
 
         brain = getattr(self.agent, "name", "brain") or "brain"
@@ -1749,6 +2960,7 @@ class Orchestrator:
                 step_room, sender, role, content, kind),
             on_status=output_callback,
             fast_path=getattr(self.config.dialogue, "fast_path", True),
+            before_retry=before_retry,
         )
         outcome = dialogue.run()
         if output_callback:
@@ -2020,13 +3232,205 @@ class Orchestrator:
             step.step_id,
             title=step.title,
             review={},
+            verification={},
             metadata={
                 "current_patch_sha": patch.patch_sha,
                 "current_patch_version": version,
                 "review_state": "unreviewed",
                 "review_verdict": "",
+                "verified_patch_sha": "",
             },
         )
+
+    def _cleanup_step_worktrees(
+        self,
+        run_id: str,
+        step: Step,
+        paths: list[str],
+        worktrees: WorktreeManager,
+    ) -> list[str]:
+        """Idempotently finish worktree cleanup recorded with a commit."""
+        remaining: list[str] = []
+        cleaned: list[str] = []
+        for cleanup_path in dict.fromkeys(str(item) for item in paths if item):
+            try:
+                worktrees.remove(cleanup_path)
+                cleaned.append(cleanup_path)
+            except Exception as exc:
+                remaining.append(cleanup_path)
+                logger.warning(
+                    "Could not remove worktree %s: %s",
+                    cleanup_path,
+                    exc,
+                )
+        if self.runtime:
+            try:
+                self.runtime.record_step_event(
+                    run_id,
+                    step.step_id,
+                    (
+                        "worktree_cleanup_completed"
+                        if not remaining
+                        else "worktree_cleanup_deferred"
+                    ),
+                    title=step.title,
+                    status="committed",
+                    worktree_path="" if not remaining else None,
+                    metadata={
+                        "cleanup_pending_worktrees": remaining,
+                    },
+                    payload={
+                        "cleaned": cleaned,
+                        "remaining": remaining,
+                    },
+                )
+            except Exception:
+                # The commit transition still contains the original pending
+                # list, making physical cleanup safe to retry after a crash.
+                logger.exception(
+                    "Could not persist worktree cleanup for %s", step.step_id
+                )
+        return remaining
+
+    def _schedule_integration_repair(
+        self,
+        run_id: str,
+        step: Step,
+        execution: _StepExecution,
+        *,
+        stage: str,
+        reason: str,
+        worktrees: WorktreeManager,
+        worktree_lock,
+        fire: Callable,
+        refresh_base: bool,
+        rollback_pending: bool = False,
+    ) -> bool:
+        """Consume one persisted repair turn and safely re-lease the step.
+
+        Apply conflicts get a fresh worktree based on current committed main;
+        the prior reviewed draft remains available for the mentor worker to
+        inspect. Commit failures reuse the immutable retained candidate after
+        rollback, so an operational retry cannot invent unreviewed bytes.
+        """
+        if not self.runtime or not execution.patch:
+            return False
+
+        budget = max(0, int(self.config.runtime.retry_budget))
+        record = self.runtime.get_step(run_id, step.step_id)
+        if not record:
+            return False
+        try:
+            persisted = max(
+                0, int(record.metadata.get("repair_attempts", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            persisted = 0
+        attempts_used = max(execution.repair_attempts, persisted)
+        if attempts_used >= budget:
+            return False
+
+        attempt = attempts_used + 1
+        attempts_left = max(0, budget - attempt)
+        prior_path = Path(record.worktree_path or execution.worktree_path or "")
+        next_path = prior_path
+        retained = [
+            str(item)
+            for item in (record.metadata.get("retained_worktrees", []) or [])
+            if item
+        ]
+        created_path: Path | None = None
+
+        if refresh_base:
+            try:
+                with worktree_lock:
+                    created_path = worktrees.create(
+                        run_id,
+                        f"{step.step_id}-integration-{attempt}-{uuid.uuid4().hex[:6]}",
+                    )
+                    worktrees.materialize_referenced_ignored(created_path, step)
+                next_path = created_path
+                if prior_path and str(prior_path) not in retained:
+                    retained.append(str(prior_path))
+            except Exception as exc:
+                logger.warning(
+                    "Could not prepare fresh integration repair worktree for %s: %s",
+                    step.step_id,
+                    exc,
+                )
+                if created_path:
+                    try:
+                        worktrees.remove(created_path)
+                    except Exception:
+                        pass
+                return False
+
+        detailed_reason = str(reason or "integration failed").strip()
+        if refresh_base:
+            detailed_reason += (
+                " The reviewed draft remains at "
+                f"{prior_path}. Continue in the fresh worktree based on current "
+                f"main at {next_path}; inspect the retained draft, preserve its "
+                "correct intent, and reconcile only the requested changes."
+            )
+        elif rollback_pending:
+            detailed_reason += (
+                " The approved paths are being restored exactly to HEAD before "
+                "the immutable retained candidate is revalidated."
+            )
+        else:
+            detailed_reason += (
+                " Main was restored exactly to HEAD. Re-run the immutable retained "
+                "candidate through gates, review, verification, and commit."
+            )
+
+        repair_state = (
+            "scheduled"
+            if refresh_base
+            else "integration_rollback_pending"
+            if rollback_pending
+            else "validating"
+        )
+        try:
+            event = self._record_repair_attempt(
+                run_id,
+                step,
+                reason=detailed_reason,
+                attempts_used=attempt,
+                attempts_left=attempts_left,
+                stage=stage,
+                budget_total=budget,
+                prior_patch_sha=execution.patch.patch_sha,
+                worker=execution.worker_name,
+                repair_state=repair_state,
+                worktree_path=str(next_path),
+                extra_metadata={
+                    "retained_worktrees": retained,
+                    "integration_retry_from": str(prior_path),
+                    "draft_retained": True,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Could not persist integration repair for %s", step.step_id
+            )
+            if created_path:
+                try:
+                    worktrees.remove(created_path)
+                except Exception:
+                    pass
+            return False
+
+        execution.repair_attempts = attempt
+        execution.repair_id = str(event.get("repair_id", "") or "")
+        execution.worktree_path = next_path
+        fire("on_repair", step, event)
+        fire(
+            "on_status",
+            f"REPAIR {attempt}/{budget} | {step.step_id} | {stage}\n"
+            f"{detailed_reason}",
+        )
+        return True
 
     def _record_repair_attempt(
         self,
@@ -2036,28 +3440,143 @@ class Orchestrator:
         reason: str,
         attempts_used: int,
         attempts_left: int,
-    ) -> None:
-        if not self.runtime:
-            return
-        self.runtime.record_event(
-            run_id,
-            "repair_attempted",
-            step_id=step.step_id,
-            payload={
-                "reason": reason,
-                "attempts_used": attempts_used,
-                "attempts_left": attempts_left,
-            },
+        stage: str = "review",
+        budget_total: int | None = None,
+        prior_patch_sha: str = "",
+        worker: str = "",
+        repair_state: str = "scheduled",
+        worktree_path: str | None = None,
+        extra_metadata: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        total = (
+            max(0, int(budget_total))
+            if budget_total is not None
+            else attempts_used + attempts_left
         )
-        self.runtime.upsert_step(
+        repair_id = uuid.uuid4().hex[:12]
+        payload: dict[str, object] = {
+            "schema_version": 2,
+            "repair_id": repair_id,
+            "stage": stage,
+            "reason": reason,
+            "attempts_used": attempts_used,
+            "attempts_left": attempts_left,
+            "budget_total": total,
+            "prior_patch_sha": prior_patch_sha,
+            "worker": worker,
+            "repair_state": repair_state,
+        }
+        if not self.runtime:
+            return payload
+        metadata: dict[str, object] = {
+            "repair_attempts": attempts_used,
+            "repair_budget": total,
+            "repairs_remaining": attempts_left,
+            "repair_state": repair_state,
+            "repair_stage": stage,
+            "repair_id": repair_id,
+            "repair_prior_patch_sha": prior_patch_sha,
+            "last_repair_reason": reason,
+        }
+        metadata.update(extra_metadata or {})
+        self.runtime.record_step_event(
             run_id,
             step.step_id,
+            "repair_attempted",
             title=step.title,
-            metadata={
-                "repair_attempts": attempts_used,
-                "last_repair_reason": reason,
-            },
+            status="repairing",
+            worktree_path=worktree_path,
+            metadata=metadata,
+            payload=payload,
         )
+        return payload
+
+    def _repair_outcome_details(
+        self,
+        step: Step,
+        execution: _StepExecution,
+        *,
+        outcome: str = "",
+    ) -> tuple[str, dict[str, object], dict[str, object], str]:
+        if execution.repair_attempts <= 0:
+            return "", {}, {}, ""
+        final_outcome = outcome or execution.repair_outcome
+        if not final_outcome:
+            return "", {}, {}, ""
+
+        if final_outcome == "verified":
+            event_type = "repair_resolved"
+            repair_state = "resolved"
+            message = (
+                f"REPAIR RESOLVED | {step.step_id} | "
+                f"committed patch {execution.repair_patch_sha or 'unknown'}"
+            )
+        elif final_outcome == "accepted_advisory":
+            event_type = "repair_advisory_accepted"
+            repair_state = "accepted_advisory"
+            message = (
+                f"REPAIR CLOSED AS ADVISORY | {step.step_id} | "
+                "verification still reports a failure"
+            )
+        else:
+            event_type = "repair_integration_failed"
+            repair_state = "integration_failed"
+            message = (
+                f"REPAIR NOT INTEGRATED | {step.step_id} | "
+                "reviewed draft retained for operator retry"
+            )
+
+        budget_total = max(0, int(self.config.runtime.retry_budget))
+        payload: dict[str, object] = {
+            "repair_id": execution.repair_id,
+            "outcome": final_outcome,
+            "attempts_used": execution.repair_attempts,
+            "budget_total": budget_total,
+            "patch_sha": execution.repair_patch_sha,
+        }
+        if execution.verification is not None:
+            payload["verification"] = self._verification_payload(
+                execution.verification
+            )
+        metadata: dict[str, object] = {
+            "repair_state": repair_state,
+            "repair_outcome": final_outcome,
+            "repair_stage": "",
+            "repair_id": "",
+            "repair_final_patch_sha": execution.repair_patch_sha,
+            "repairs_remaining": max(
+                0, budget_total - execution.repair_attempts
+            ),
+        }
+        if final_outcome == "verified":
+            metadata["last_repair_reason"] = ""
+        return event_type, metadata, payload, message
+
+    def _record_repair_outcome(
+        self,
+        run_id: str,
+        step: Step,
+        execution: _StepExecution,
+        *,
+        outcome: str = "",
+    ) -> str:
+        """Close a non-commit repair outcome as one durable transition."""
+        event_type, metadata, payload, message = self._repair_outcome_details(
+            step,
+            execution,
+            outcome=outcome,
+        )
+        if event_type and self.runtime:
+            self.runtime.record_step_event(
+                run_id,
+                step.step_id,
+                event_type,
+                title=step.title,
+                status="blocked" if outcome == "integration_failed" else None,
+                metadata=metadata,
+                payload=payload,
+            )
+        return message
 
     def _revision_step(self, step: Step, feedback: str) -> Step:
         return step.model_copy(update={
@@ -2092,11 +3611,18 @@ class Orchestrator:
                 )
         return "\n".join(lines)
 
-    def _verification_payload(self, verification: VerificationResult) -> dict:
-        return {
+    def _verification_payload(
+        self,
+        verification: VerificationResult,
+        *,
+        verified_patch_sha: str = "",
+    ) -> dict:
+        payload = {
             "passed": verification.passed,
             "skipped": verification.skipped,
             "reason": verification.reason,
+            "failure_kind": verification.failure_kind,
+            "repairable": verification.repairable,
             "commands": [
                 {
                     "command": cmd.command,
@@ -2106,6 +3632,9 @@ class Orchestrator:
                 for cmd in verification.commands
             ],
         }
+        if verified_patch_sha:
+            payload["verified_patch_sha"] = verified_patch_sha
+        return payload
 
     def _block_step(
         self,
@@ -2189,20 +3718,13 @@ class Orchestrator:
         run_id: str,
         step_id: str,
         verification: VerificationResult,
+        *,
+        verified_patch_sha: str,
     ) -> None:
-        payload = {
-            "passed": verification.passed,
-            "skipped": verification.skipped,
-            "reason": verification.reason,
-            "commands": [
-                {
-                    "command": cmd.command,
-                    "returncode": cmd.returncode,
-                    "output": cmd.output,
-                }
-                for cmd in verification.commands
-            ],
-        }
+        payload = self._verification_payload(
+            verification,
+            verified_patch_sha=verified_patch_sha,
+        )
         if self.runtime:
             self.runtime.record_event(
                 run_id,

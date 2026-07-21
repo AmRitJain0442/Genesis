@@ -81,7 +81,7 @@ commit_prefix = "[genesis]"
 
 [runtime]
 state_db = ""                    # empty = ~/.genesis/state/genesis.db
-retry_budget = 1                 # bounded self-repair attempts per failed review/verification
+retry_budget = 2                 # shared repairs: worker, gates, review, verification, integration
 max_parallel_workers = 3         # run independent, non-overlapping steps concurrently
 checkpoint_mode = "always"
 
@@ -197,7 +197,7 @@ class GitConfig:
 @dataclass
 class RuntimeConfig:
     state_db: str = ""
-    retry_budget: int = 1
+    retry_budget: int = 2         # shared automatic repair attempts per step
     max_parallel_workers: int = 3
     checkpoint_mode: str = "always"
 
@@ -361,7 +361,7 @@ def load_config() -> GenesisConfig:
     if r := data.get("runtime"):
         cfg.runtime = RuntimeConfig(
             state_db=r.get("state_db", ""),
-            retry_budget=r.get("retry_budget", 1),
+            retry_budget=r.get("retry_budget", 2),
             max_parallel_workers=r.get("max_parallel_workers", 3),
             checkpoint_mode=r.get("checkpoint_mode", "always"),
         )

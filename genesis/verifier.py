@@ -28,6 +28,8 @@ class VerificationResult:
     skipped: bool = False
     reason: str = ""
     commands: list[CommandResult] = field(default_factory=list)
+    failure_kind: str = ""
+    repairable: bool = True
 
 
 class Verifier:
@@ -46,7 +48,12 @@ class Verifier:
     def verify(self, *, changed_files: list[str] | None = None) -> VerificationResult:
         policy_check = self.policy.check_paths(changed_files or [])
         if not policy_check.allowed:
-            return VerificationResult(False, reason=policy_check.reason)
+            return VerificationResult(
+                False,
+                reason=policy_check.reason,
+                failure_kind="policy_denied",
+                repairable=False,
+            )
 
         commands = list(self.config.verification.commands)
         if not commands:
@@ -60,6 +67,8 @@ class Verifier:
                     False,
                     reason=command_check.reason,
                     commands=results,
+                    failure_kind="policy_denied",
+                    repairable=False,
                 )
 
             if self.output_callback:
@@ -83,6 +92,8 @@ class Verifier:
                         False,
                         reason=f"could not start verification command {command}: {exc}",
                         commands=results,
+                        failure_kind="spawn_error",
+                        repairable=False,
                     )
                 try:
                     proc.wait(timeout=self.config.verification.timeout)
@@ -97,16 +108,26 @@ class Verifier:
                         False,
                         reason=f"verification timed out after {self.config.verification.timeout}s: {command}",
                         commands=results,
+                        failure_kind="timeout",
                     )
                 output = _read_bounded_output(captured)
 
             output = output.strip()
             results.append(CommandResult(command, proc.returncode, output))
             if proc.returncode != 0:
+                lowered_output = output.lower()
+                missing_command = any(marker in lowered_output for marker in (
+                    "is not recognized as an internal or external command",
+                    "is not recognized as the name of a cmdlet",
+                    "command not found",
+                    ": not found",
+                ))
                 return VerificationResult(
                     False,
                     reason=f"verification failed: {command}",
                     commands=results,
+                    failure_kind="spawn_error" if missing_command else "test_exit",
+                    repairable=not missing_command,
                 )
 
         return VerificationResult(True, commands=results)
