@@ -1,4 +1,5 @@
 from __future__ import annotations
+from difflib import get_close_matches
 import os
 import json
 import logging
@@ -8,8 +9,10 @@ from pathlib import Path
 from rich.live import Live
 from rich.console import Group
 from rich.markdown import Markdown
+from rich.text import Text
 
 from genesis import __version__
+from genesis.account_usage import UsageLedger, collect_usage, usage_report_renderable
 from genesis.config import get_config, CONFIG_FILE, CodexAccount, ClaudeAccount
 from genesis.memory import MemoryManager
 from genesis.git_ops import GitManager
@@ -24,7 +27,7 @@ from genesis.agents.orchestrator import Orchestrator
 from genesis.agents.availability import AccountRegistry
 from genesis.chatroom import ChatroomManager, ChatroomServer, RoomKind
 from genesis.ui.console import console
-from genesis.ui.dashboard import DashboardState, make_layout
+from genesis.ui.dashboard import DashboardState, DashboardView
 from genesis.ui.theme import command_panel, command_table, kv_table, markup, progress_bar, status_label, trim
 
 logger = logging.getLogger(__name__)
@@ -40,6 +43,14 @@ _HELP_SECTIONS = [
             ("runs", "Show recent durable runs"),
             ("inspect <run_id>", "Show run state and event trace"),
             ("cleanup <run_id>", "Remove stale worktrees for a run"),
+        ],
+    ),
+    (
+        "Observe",
+        [
+            ("usage [--refresh] [--json]", "Aggregate account capacity, reset windows, graphs, and cost"),
+            ("chat", "Start the local live transcript viewer and show its URL"),
+            ("chat open", "Open the live transcript viewer in your browser"),
         ],
     ),
     (
@@ -87,6 +98,68 @@ _HELP_SECTIONS = [
         ],
     ),
 ]
+
+_KNOWN_COMMANDS = (
+    "add-account",
+    "add-claude-account",
+    "agents",
+    "chat",
+    "cleanup",
+    "clear",
+    "config",
+    "exit",
+    "git",
+    "help",
+    "inspect",
+    "memory",
+    "plan",
+    "remove-account",
+    "remove-all-accounts",
+    "remove-all-claude-accounts",
+    "remove-claude-account",
+    "resume",
+    "retry",
+    "run",
+    "runs",
+    "status",
+    "switch",
+    "usage",
+    "limits",
+    "quota",
+)
+
+
+def _draft_patch_message(step, result) -> str:
+    """Format worker output without implying that review or apply succeeded."""
+    step_id = str(getattr(step, "step_id", "?") or "?")
+    written = [str(path) for path in (getattr(result, "files_written", None) or [])]
+    noun = "file" if len(written) == 1 else "files"
+    lines = [
+        f"DRAFT PATCH | {step_id} | {len(written)} {noun} | not applied",
+        *(f"- {path}" for path in written),
+    ]
+    return "\n".join(lines)
+
+
+def _repair_message(step, event: dict) -> str:
+    attempt = int(event.get("attempts_used", 0) or 0)
+    budget = int(event.get("budget_total", 0) or 0)
+    stage = str(event.get("stage", "candidate") or "candidate").upper()
+    reason = str(event.get("reason", "") or "").strip()
+    header = f"REPAIR {attempt}/{budget} | {getattr(step, 'step_id', '?')} | {stage}"
+    return header + (f"\n{reason}" if reason else "")
+
+
+def _prompt_renderable(project: str, branch: str = "") -> Text:
+    """Return a compact, contextual prompt that remains legible without color."""
+    prompt = Text()
+    prompt.append(" G ", style="bold #071018 on #35D0E2")
+    prompt.append(f"  {project or 'workspace'}", style="bold #E6EDF6")
+    if branch:
+        prompt.append("  /  ", style="#4D6074")
+        prompt.append(branch, style="#8EA1B5")
+    prompt.append("  › ", style="bold #F2B84B")
+    return prompt
 
 
 def _help_renderable() -> Group:
@@ -425,7 +498,7 @@ class GenesisREPL:
 
     # ── Chatroom viewer ─────────────────────────────────────────────────────
 
-    def _ensure_chatroom_server(self) -> str | None:
+    def _ensure_chatroom_server(self, *, open_browser: bool | None = None) -> str | None:
         """Start the localhost viewer on first use; return its URL (or None)."""
         if not self.config.chatroom.enabled:
             return None
@@ -441,13 +514,44 @@ class GenesisREPL:
             logger.warning("Chatroom viewer failed to start: %s", e)
             self.chatroom_server = None
             return None
-        if self.config.chatroom.open_browser:
+        should_open = self.config.chatroom.open_browser if open_browser is None else open_browser
+        if should_open:
             try:
                 import webbrowser
                 webbrowser.open(url)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Could not open chatroom viewer: %s", e)
         return url
+
+    def cmd_chat(self, args: list[str]) -> None:
+        """Start or open the read-only live transcript viewer."""
+        if not self.config.chatroom.enabled:
+            console.print(
+                command_panel(
+                    "[yellow]The viewer is disabled.[/yellow]\n"
+                    "Enable [cyan]chatroom.enabled[/cyan] in your Genesis config.",
+                    "LIVE TRANSCRIPT",
+                    border_style="yellow",
+                )
+            )
+            return
+
+        sub = args[0].lower() if args else "show"
+        if sub not in {"show", "open"}:
+            console.print("[red]Usage: chat [open][/red]")
+            return
+
+        url = self._ensure_chatroom_server(open_browser=sub == "open")
+        if not url:
+            console.print("[red]Could not start the local transcript viewer.[/red]")
+            return
+
+        action = "Opened in your browser" if sub == "open" else "Observer is ready"
+        body = Text()
+        body.append(f"{action}\n", style="bold #7BD88F")
+        body.append(url, style="underline #35D0E2")
+        body.append("\n\nRead-only · localhost · streams reconnect automatically", style="#74879A")
+        console.print(command_panel(body, "LIVE TRANSCRIPT", border_style="#35D0E2", padding=(1, 2)))
 
     def _stop_chatroom_server(self) -> None:
         if self.chatroom_server is not None:
@@ -473,11 +577,6 @@ class GenesisREPL:
             except Exception:
                 pass
 
-        def _files(result) -> str:
-            written = getattr(result, "files_written", None) or []
-            head = f"wrote {len(written)} file(s)"
-            return head + (": " + ", ".join(written) if written else "")
-
         posters = {
             "on_plan": lambda plan, *a: say(
                 brain, "brain", f"Planned {len(plan.steps)} steps — {plan.task_summary}", "decision"),
@@ -486,7 +585,9 @@ class GenesisREPL:
             "on_worker_assigned": lambda step, worker, *a: say(
                 brain, "brain", f"Assigned {worker} -> {step.step_id}", "status"),
             "on_step_result": lambda step, result, worker, *a: say(
-                worker, "worker", f"{step.step_id}: {_files(result)}", "code"),
+                worker, "worker", _draft_patch_message(step, result), "tool"),
+            "on_repair": lambda step, event, *a: say(
+                brain, "system", _repair_message(step, event), "status"),
             "on_review": lambda step, review, *a: say(
                 "reviewer", "reviewer",
                 f"{step.step_id}: {review.verdict} ({review.quality_score}/10) — {review.feedback}",
@@ -495,7 +596,11 @@ class GenesisREPL:
                 brain, "brain", f"Committed {step.step_id}" + (f" @ {sha}" if sha else ""), "decision"),
             "on_status": lambda msg, *a: say(brain, "system", str(msg), "status"),
             "on_error": lambda step, error, *a: say(
-                brain, "system", f"{getattr(step, 'step_id', '?')}: ERROR {error}", "status"),
+                brain,
+                "system",
+                f"BLOCKED | {getattr(step, 'step_id', '?')}\n{error}",
+                "status",
+            ),
             "on_task_complete": lambda plan, *a: say(brain, "brain", "Task complete", "decision"),
         }
 
@@ -534,6 +639,18 @@ class GenesisREPL:
         all_agent_names = list(self._agents.keys())
         state = DashboardState(agent_names=all_agent_names)
         state.task_name = task[:80] + ("..." if len(task) > 80 else "")
+        usage_ledger = UsageLedger()
+        usage_accounts: dict[str, str] = {}
+        for display_name, members in self._agent_groups():
+            for slot_name, agent in members:
+                usage_accounts[slot_name] = display_name
+                usage_accounts[agent.name] = display_name
+        primary_agent = self._get_orchestrator()
+        if primary_agent is not None:
+            usage_accounts["__orch__"] = usage_accounts.get(
+                primary_agent.name,
+                primary_agent.name,
+            )
 
         # ── Callback closures ────────────────────────────────────────────
         def on_plan(plan):
@@ -560,6 +677,8 @@ class GenesisREPL:
         def on_worker_assigned(step, worker_name):
             state.current_worker = worker_name
             state.step_workers[step.step_id] = worker_name
+            if hasattr(state, "active_steps"):
+                state.active_steps[step.step_id] = worker_name
             state.add_event("lease", f"{worker_name} -> {step.step_id}", "green")
             state.add_output(
                 f"  [dim]worker[/dim] [cyan]{markup(worker_name)}[/cyan]",
@@ -568,9 +687,43 @@ class GenesisREPL:
 
         def on_step_result(step, result, worker_name):
             if result.files_written:
-                state.add_event("files", f"{step.step_id}: {len(result.files_written)} changed", "green")
+                state.add_event(
+                    "patch",
+                    f"{step.step_id}: {len(result.files_written)}-file draft; not applied",
+                    "yellow",
+                )
+                state.add_output(
+                    f"  [yellow]DRAFT[/yellow] [bold]{markup(step.step_id)}[/bold] "
+                    f"[dim]{len(result.files_written)} file(s), not applied[/dim]",
+                    trusted_markup=True,
+                )
                 for f in result.files_written:
-                    state.add_output(f"  [green]+[/green] {markup(f)}", trusted_markup=True)
+                    state.add_output(f"    [yellow]~[/yellow] {markup(f)}", trusted_markup=True)
+
+        def on_repair(step, event):
+            attempt = int(event.get("attempts_used", 0) or 0)
+            budget = int(event.get("budget_total", 0) or 0)
+            stage = str(event.get("stage", "candidate") or "candidate")
+            reason = str(event.get("reason", "") or "")
+            state.run_phase = "repairing"
+            state.current_step = step.step_id
+            state.step_statuses[step.step_id] = "repairing"
+            state.step_repairs[step.step_id] = attempt
+            state.add_event(
+                "repair",
+                f"{step.step_id}: {attempt}/{budget} after {stage}",
+                "yellow",
+            )
+            state.add_output(
+                f"  [bold yellow]REPAIR {attempt}/{budget}[/bold yellow] "
+                f"[bold]{markup(step.step_id)}[/bold] [dim]{markup(stage)}[/dim]",
+                trusted_markup=True,
+            )
+            if reason:
+                state.add_output(
+                    f"    [yellow]{markup(trim(reason, 240))}[/yellow]",
+                    trusted_markup=True,
+                )
 
         def on_review(step, review):
             state.run_phase = "reviewing"
@@ -601,7 +754,14 @@ class GenesisREPL:
                 elapsed = (_dt.now() - state.step_start).total_seconds()
                 state.step_elapsed[step.step_id] = elapsed
             state.step_start = None
-            state.current_worker = ""
+            if hasattr(state, "active_steps"):
+                state.active_steps.pop(step.step_id, None)
+                state.current_worker = (
+                    list(state.active_steps.values())[-1] if state.active_steps else ""
+                )
+                state.current_step = next(reversed(state.active_steps), "")
+            else:
+                state.current_worker = ""
             state.current_reviewer = ""
             state.step_verification[step.step_id] = "passed"
             state.add_event("done", f"{step.step_id} complete", "green")
@@ -612,10 +772,6 @@ class GenesisREPL:
                 state.run_phase = "planning"
             elif "executing" in lowered:
                 state.run_phase = "running"
-            elif "repair" in lowered or "retry" in lowered:
-                state.run_phase = "repairing"
-                if state.current_step:
-                    state.step_repairs[state.current_step] = state.step_repairs.get(state.current_step, 0) + 1
             elif "blocked" in lowered or "no runnable" in lowered:
                 state.run_phase = "blocked"
                 state.blocked_reason = msg
@@ -625,13 +781,29 @@ class GenesisREPL:
         def on_error(step, error):
             state.run_phase = "blocked"
             state.blocked_reason = error
-            state.add_output(f"  [red]x {markup(error)}[/red]", trusted_markup=True)
+            state.add_output(
+                f"  [bold red]BLOCKED {markup(step.step_id)}[/bold red]",
+                trusted_markup=True,
+            )
+            state.add_output(f"    [red]{markup(error)}[/red]", trusted_markup=True)
             state.step_statuses[step.step_id] = "blocked"
-            state.current_worker = ""
+            if hasattr(state, "active_steps"):
+                state.active_steps.pop(step.step_id, None)
+                state.current_worker = (
+                    list(state.active_steps.values())[-1] if state.active_steps else ""
+                )
+                state.current_step = next(reversed(state.active_steps), "")
+            else:
+                state.current_worker = ""
             state.add_event("error", f"{step.step_id}: {error}", "red")
 
         def on_task_complete(plan):
             state.run_phase = "completed"
+            state.current_step = ""
+            state.current_worker = ""
+            state.current_reviewer = ""
+            if hasattr(state, "active_steps"):
+                state.active_steps.clear()
             state.add_output(
                 f"\n[bold green]+ Task complete  {state.completed}/{state.total} steps[/bold green]",
                 trusted_markup=True,
@@ -644,6 +816,7 @@ class GenesisREPL:
             "on_step_start": on_step_start,
             "on_worker_assigned": on_worker_assigned,
             "on_step_result": on_step_result,
+            "on_repair": on_repair,
             "on_review": on_review,
             "on_commit": on_commit,
             "on_step_complete": on_step_complete,
@@ -655,42 +828,54 @@ class GenesisREPL:
         # Observability: start the localhost viewer and mirror every coordination
         # event into a chatroom before wiring the Live display on top.
         chat_url = self._ensure_chatroom_server()
+        state.chat_url = chat_url or ""
         raw_callbacks = self._bridge_callbacks_to_chatroom(raw_callbacks, task)
         if chat_url:
-            console.print(f"[dim]Watch the agents live:[/dim] [cyan]{chat_url}[/cyan]")
+            console.print(
+                f"[dim]Live transcript[/dim] [cyan]{chat_url}[/cyan] "
+                "[dim]·[/dim] [bold cyan]chat open[/bold cyan]"
+            )
 
         try:
             with Live(
-                make_layout(state),
+                DashboardView(state),
                 console=console,
-                refresh_per_second=8,
+                refresh_per_second=5,
                 screen=False,
-            ) as live:
-                def make_cb(fn):
-                    def wrapped(*args, **kwargs):
-                        fn(*args, **kwargs)
-                        live.update(make_layout(state))
-                    return wrapped
-
-                callbacks = {k: make_cb(v) for k, v in raw_callbacks.items()}
+            ):
+                # DashboardView renders from current state on Rich's refresh
+                # cadence, so streamed lines appear without rebuilding a full
+                # layout on every token or waiting for another lifecycle event.
+                callbacks = dict(raw_callbacks)
 
                 # on_output fires on every streaming line — update state only;
                 # Live's timer handles redraw. Also extract token counts.
                 def on_output(line: str) -> None:
-                    lowered = str(line).lower()
+                    raw_line = str(line)
+                    step_id = getattr(line, "step_id", "") or state.current_step
+                    worker_name = getattr(line, "worker_name", "") or state.current_worker
+                    lowered = raw_line.lower()
                     if "verify $" in lowered:
                         state.run_phase = "verifying"
-                        if state.current_step:
-                            state.step_verification[state.current_step] = "running"
-                        state.add_event("verify", trim(line, 80), "blue")
-                    elif "retrying" in lowered or "repairing" in lowered:
-                        state.run_phase = "repairing"
-                        if state.current_step:
-                            state.step_repairs[state.current_step] = state.step_repairs.get(state.current_step, 0) + 1
-                        state.add_event("repair", trim(line, 80), "yellow")
-                    state.add_output(f"  {line}")
-                    if "Tokens:" in line:
-                        state.record_token_line(line)
+                        if step_id:
+                            state.step_verification[step_id] = "running"
+                        state.add_event("verify", trim(raw_line, 80), "blue")
+                    if step_id and worker_name and len(state.active_steps) > 1:
+                        state.add_output(
+                            f"  [dim]{markup(worker_name, 18)}/{markup(step_id, 10)}[/dim]  "
+                            f"{markup(raw_line)}",
+                            trusted_markup=True,
+                        )
+                    else:
+                        state.add_output(f"  {raw_line}")
+                    if "Tokens:" in raw_line:
+                        event = state.record_token_line(raw_line, worker_name=worker_name or None)
+                        if event is not None:
+                            ledger_account = usage_accounts.get(
+                                worker_name or "__orch__",
+                                worker_name or "unattributed",
+                            )
+                            usage_ledger.record(ledger_account, event)
 
                 callbacks["on_output"] = on_output
 
@@ -915,6 +1100,21 @@ class GenesisREPL:
                     markup(run.task, 84),
                 )
             console.print(run_tbl)
+
+    def cmd_usage(self, args: list[str] | None = None) -> None:
+        """Show aggregate capacity without letting one broken login hide the rest."""
+        options = [str(arg).lower() for arg in (args or [])]
+        allowed = {"--refresh", "--json"}
+        if any(option not in allowed for option in options) or len(options) != len(set(options)):
+            console.print("[red]Usage: usage [--refresh] [--json][/red]")
+            return
+
+        with console.status("[cyan]Reading account capacity...[/cyan]", spinner="dots"):
+            report = collect_usage(self.config, refresh="--refresh" in options)
+        if "--json" in options:
+            console.print_json(json.dumps(report.to_dict(), ensure_ascii=False))
+        else:
+            console.print(usage_report_renderable(report, width=console.size.width))
 
     def cmd_memory(self, args: list[str]) -> None:
         sub = args[0] if args else "show"
@@ -1199,7 +1399,17 @@ class GenesisREPL:
 
         def on_step_result(step, result, worker_name):
             if result.files_written:
-                console.print(f"  [green]+[/green] {', '.join(result.files_written)}")
+                console.print(
+                    f"  [yellow]DRAFT {markup(step.step_id)}[/yellow] "
+                    f"[dim]({len(result.files_written)} file(s), not applied)[/dim]"
+                )
+                for path in result.files_written:
+                    console.print(f"    [yellow]~[/yellow] {markup(path)}")
+
+        def on_repair(step, event):
+            console.print(
+                f"  [bold yellow]{markup(_repair_message(step, event))}[/bold yellow]"
+            )
 
         def on_review(step, review):
             console.print(f"  review: {review.verdict} score:{review.quality_score}/10")
@@ -1212,7 +1422,8 @@ class GenesisREPL:
             console.print(f"[dim]{msg}[/dim]")
 
         def on_error(step, error):
-            console.print(f"  [red]x {error}[/red]")
+            console.print(f"  [bold red]BLOCKED {markup(step.step_id)}[/bold red]")
+            console.print(f"    [red]{markup(error)}[/red]")
 
         def on_task_complete(plan):
             console.print("[green]Run complete.[/green]")
@@ -1222,6 +1433,7 @@ class GenesisREPL:
             "on_step_start": on_step_start,
             "on_worker_assigned": on_worker_assigned,
             "on_step_result": on_step_result,
+            "on_repair": on_repair,
             "on_review": on_review,
             "on_commit": on_commit,
             "on_status": on_status,
@@ -1750,6 +1962,18 @@ class GenesisREPL:
                     pass
         self._stop_chatroom_server()
 
+    def _branch_label(self) -> str:
+        """Best-effort branch context for the prompt; never blocks the REPL."""
+        repo = getattr(self.git, "repo", None)
+        if repo is None:
+            return ""
+        try:
+            if repo.head.is_detached:
+                return f"detached@{repo.head.commit.hexsha[:7]}"
+            return trim(repo.active_branch.name, 36, placeholder="")
+        except Exception:
+            return ""
+
     def run(self) -> None:
         self._print_banner()
 
@@ -1761,7 +1985,10 @@ class GenesisREPL:
     def _run_loop(self) -> None:
         while True:
             try:
-                console.print("[bold cyan]genesis[/bold cyan][dim]>[/dim] ", end="")
+                console.print(
+                    _prompt_renderable(Path(self.work_dir).name, self._branch_label()),
+                    end="",
+                )
                 line = input().strip()
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[dim]Goodbye.[/dim]")
@@ -1802,6 +2029,8 @@ class GenesisREPL:
                 self.cmd_plan(rest)
             elif cmd == "status":
                 self.cmd_status()
+            elif cmd in ("usage", "limits", "quota"):
+                self.cmd_usage(rest.split())
             elif cmd == "memory":
                 sub, sub_rest = _split_sub(rest)
                 self.cmd_memory([sub] + ([sub_rest] if sub_rest else []))
@@ -1813,6 +2042,8 @@ class GenesisREPL:
                 self.cmd_git([sub] + ([sub_rest] if sub_rest else []))
             elif cmd in ("agents", "agent"):
                 self.cmd_agents()
+            elif cmd == "chat":
+                self.cmd_chat(rest.split())
             elif cmd == "runs":
                 self.cmd_runs()
             elif cmd == "inspect":
@@ -1850,13 +2081,16 @@ class GenesisREPL:
                 self.cmd_switch([sub] + ([sub_rest] if sub_rest else []))
             elif cmd == "clear":
                 console.clear()
-            elif cmd == "help":
+            elif cmd in ("help", "?"):
                 console.print(command_panel(_help_renderable(), "COMMAND INDEX", border_style="cyan", padding=(1, 2)))
             else:
-                console.print(
-                    f"[yellow]Unknown command '{cmd}'.[/yellow] "
-                    f"Type [cyan]help[/cyan] for available commands."
+                suggestion = get_close_matches(cmd, _KNOWN_COMMANDS, n=1, cutoff=0.55)
+                hint = (
+                    f" Did you mean [bold cyan]{markup(suggestion[0])}[/bold cyan]?"
+                    if suggestion
+                    else " Type [cyan]help[/cyan] for available commands."
                 )
+                console.print(f"[yellow]Unknown command '{markup(cmd)}'.[/yellow]{hint}")
 
     def _print_banner(self) -> None:
         from genesis.ui.banner import render_banner
@@ -1881,6 +2115,6 @@ class GenesisREPL:
             version=__version__,
             systems=systems,
             info=info,
-            commands="run <task>   ·   runs   ·   inspect <id>   ·   status   ·   help   ·   exit",
+            commands="run <task>   ·   chat [open]   ·   runs   ·   status   ·   help   ·   exit",
         )
         console.print()

@@ -63,7 +63,8 @@ During execution you see a live command-center dashboard with plan state, active
 - Git-grounded, versioned evidence on every worker turn.
 - Deterministic acceptance gates before model review.
 - Reviewer verdicts bound to immutable patch versions.
-- Bounded self-repair when review or verification fails.
+- Bounded self-repair for worker errors, empty patches, deterministic gates,
+  actionable reviews, and verification failures.
 - Durable runs with `resume`, `retry`, `inspect`, and `cleanup`.
 - Configurable verification gates before commit.
 - Memory file plus searchable SQLite runtime memory.
@@ -229,6 +230,7 @@ If either CLI is missing, run `claude login` or `codex login` again in the same 
 | `inspect <run_id>` | Show run state and event trace. |
 | `cleanup <run_id>` | Remove stale isolated worktrees for a run. |
 | `status` | Show agents, config, and recent git log. |
+| `usage [--refresh] [--json]` | Aggregate quota windows, reset times, capacity graphs, and recorded run cost across linked accounts. |
 | `agents` | List registered agents and their status. |
 | `config show` | Print the active configuration. |
 | `config edit` | Open the config file in your editor. |
@@ -308,6 +310,11 @@ Genesis never deletes the default `~/.codex` directory through `--delete-home`. 
 
 The live dashboard is designed for repeated software work rather than a one-off chat session.
 
+It automatically changes its information density for wide, standard, and narrow
+terminals. Wide windows show the full plan, output, team, quality gates, event
+trace, and telemetry together; smaller windows keep the active work and rolling
+output readable instead of compressing every panel into unusable columns.
+
 | Area | What It Shows |
 | --- | --- |
 | Header | Task, phase, elapsed time, current step, active worker, active reviewer, latest commit, and progress. |
@@ -319,6 +326,48 @@ The live dashboard is designed for repeated software work rather than a one-off 
 | Telemetry | Input tokens, output tokens, cached tokens, cost, and per-agent usage. |
 
 Static REPL views use the same command-center styling. `status` shows the agent roster and runtime controls, `runs` lists recent runs, `inspect <run_id>` opens the diagnostic view, and `plan <task>` previews dependencies and file scopes before execution.
+
+### Account capacity and cost
+
+Run `genesis usage` (or type `usage` in the interactive terminal) for one
+capacity readout across every configured Claude and Codex login:
+
+```powershell
+genesis usage
+genesis usage --refresh
+genesis usage --json
+```
+
+The terminal view graphs each provider's short and weekly windows, shows reset
+times, and sums the remaining percentages as account-equivalent capacity. Reads
+run concurrently, successful results are cached for 60 seconds, and a failed or
+expired login is isolated to its own row. A live failure falls back to the last
+good snapshot and is marked `STALE`.
+
+Genesis also records the token and dollar telemetry emitted by completed CLI
+calls in `~/.genesis/state/usage.db`. The readout shows 24-hour, seven-day, and
+all-time recorded run cost. This history starts when this feature is installed.
+Codex subscription accounts do not expose a dollar cost, so Genesis reports
+their exact capacity without inventing a price estimate.
+
+### Live transcript viewer
+
+Every run can expose a dependency-free, read-only observer at a localhost URL.
+The viewer is an operations log for the agent team: rooms are ordered by recent
+activity, decisions and code are visually distinct, transcripts are searchable,
+and the connection indicator reports live/reconnecting/offline state. It follows
+new activity only while you are already at the bottom, so reading earlier work is
+not interrupted.
+
+From the interactive terminal, start the viewer or open it in your browser:
+
+```text
+chat
+chat open
+```
+
+The viewer remains self-contained and works offline; no messages or assets are
+sent to a third-party frontend service.
 
 Plans are retained in SQLite as soon as planning completes. Running the same
 task text reuses its saved unfinished plan; interrupted runs continue from their
@@ -406,6 +455,21 @@ literal secret fallbacks, and likely hardcoded secrets or endpoints. If a task
 explicitly requires `gitleaks` or `trufflehog`, an unavailable scanner is
 reported as unavailable and never mislabeled as a clean scan.
 
+Recoverable failures do not immediately discard the step. Genesis retains the
+isolated worktree, gives the worker the exact observed evidence, captures a new
+patch version, and runs the complete gate -> independent review -> verification
+pipeline again. One shared `runtime.retry_budget` bounds all automatic repairs
+for the step, persists across crash/resume, and resets only for an explicit
+operator retry. Automatic and explicit retries continue in the retained
+worktree, so useful draft changes are not discarded. An unchanged repair is
+never re-reviewed as if it were new.
+If current main no longer accepts an approved patch, Genesis keeps the reviewed
+draft, opens a fresh isolated worktree from current committed main, and spends
+the same bounded budget on a reconciliation turn. A transient commit failure
+is rolled back path-for-path, then the immutable candidate is revalidated and
+retried; an unsafe or unclean rollback remains a hard block.
+Tooling or policy failures that code changes cannot fix remain hard blocks.
+
 External secret scanners run at the final patch gate, not after every worker
 turn. Genesis detects the installed Gitleaks command set (`detect` on older
 versions and `dir` on newer versions), runs independent scanners concurrently,
@@ -414,10 +478,11 @@ configuration. Install scanners on `PATH`, in `~/go/bin`, or in
 `~/.genesis/tools`; Genesis does not execute binaries discovered in temporary
 download folders.
 
-Each verdict records the reviewed patch SHA and version. A repair creates a new
-patch version, marks the earlier verdict superseded, and requires a fresh
-review. The main repository refuses any patch whose current SHA does not match
-the approved SHA.
+Each verdict and verification result records the exact patch SHA and version it
+observed. A repair creates a new patch version, clears superseded review and
+verification state, and requires both stages again. Crash recovery and the main
+repository refuse any result whose verified, approved, and current SHAs do not
+all match.
 
 Ignored source is not copied wholesale. Genesis may overlay only a source file
 explicitly named by the task, excludes credential-shaped files, and preserves
@@ -485,7 +550,7 @@ palace_enabled = true
 
 [runtime]
 state_db = ""
-retry_budget = 1
+retry_budget = 2 # shared automatic repair attempts per step
 max_parallel_workers = 3
 checkpoint_mode = "always"
 

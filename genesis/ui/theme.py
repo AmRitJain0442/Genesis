@@ -7,24 +7,52 @@ from rich.table import Table
 from rich.text import Text
 
 
+# Genesis uses a restrained, industrial palette: cyan is live signal, green is
+# accepted work, amber means attention, and steel carries structure.  Keeping
+# the colors here prevents individual screens from drifting into unrelated
+# accents and makes the UI legible on both dark and light terminal themes.
+SIGNAL_CYAN = "#2DD4D7"
+SIGNAL_GREEN = "#68D391"
+SIGNAL_AMBER = "#F2B84B"
+SIGNAL_RED = "#F06A6A"
+STEEL = "#78909C"
+STEEL_DARK = "#3E5961"
+
+
 STATUS_STYLES = {
-    "pending": ("PEND", "dim"),
-    "running": ("RUN", "bold cyan"),
-    "reviewing": ("REV", "bold magenta"),
-    "approved": ("OK", "bold green"),
-    "needs_revision": ("FIX", "bold yellow"),
-    "verifying": ("VERIFY", "bold blue"),
-    "committed": ("COMMIT", "bold green"),
-    "completed": ("DONE", "bold green"),
-    "blocked": ("BLOCK", "bold red"),
-    "rejected": ("REJECT", "bold red"),
-    "failed": ("FAIL", "bold red"),
-    "repairing": ("REPAIR", "bold yellow"),
-    "planning": ("PLAN", "bold cyan"),
-    "online": ("ONLINE", "bold green"),
-    "missing": ("MISS", "bold red"),
-    "idle": ("IDLE", "dim"),
+    "pending": ("PEND", f"dim {STEEL}"),
+    "running": ("RUN", f"bold {SIGNAL_CYAN}"),
+    "reviewing": ("REV", f"bold {SIGNAL_AMBER}"),
+    "approved": ("OK", f"bold {SIGNAL_GREEN}"),
+    "needs_revision": ("FIX", f"bold {SIGNAL_AMBER}"),
+    "verifying": ("VERIFY", f"bold {SIGNAL_CYAN}"),
+    "committed": ("COMMIT", f"bold {SIGNAL_GREEN}"),
+    "completed": ("DONE", f"bold {SIGNAL_GREEN}"),
+    "blocked": ("BLOCK", f"bold {SIGNAL_RED}"),
+    "rejected": ("REJECT", f"bold {SIGNAL_RED}"),
+    "failed": ("FAIL", f"bold {SIGNAL_RED}"),
+    "repairing": ("REPAIR", f"bold {SIGNAL_AMBER}"),
+    "planning": ("PLAN", f"bold {SIGNAL_CYAN}"),
+    "committing": ("COMMIT", f"bold {SIGNAL_AMBER}"),
+    "online": ("ONLINE", f"bold {SIGNAL_GREEN}"),
+    "missing": ("MISS", f"bold {SIGNAL_RED}"),
+    "idle": ("IDLE", f"dim {STEEL}"),
 }
+
+
+_BORDER_ALIASES = {
+    "cyan": SIGNAL_CYAN,
+    "blue": STEEL,
+    "magenta": SIGNAL_CYAN,
+    "green": SIGNAL_GREEN,
+    "yellow": SIGNAL_AMBER,
+    "red": SIGNAL_RED,
+}
+
+
+def palette_style(style: str) -> str:
+    """Map legacy Rich color names onto the Genesis signal palette."""
+    return _BORDER_ALIASES.get(style, style)
 
 
 def trim(value: object, width: int, *, placeholder: str = "-") -> str:
@@ -51,11 +79,11 @@ def status_label(status: str, *, width: int = 7) -> str:
 
 def role_label(role: str) -> str:
     role = (role or "worker").lower()
-    if "orchestrator" in role:
-        return "[bold magenta]ORCH[/bold magenta]"
+    if "orchestrator" in role or role == "brain":
+        return f"[bold {SIGNAL_AMBER}]CTRL[/]"
     if "review" in role:
-        return "[bold blue]REVIEW[/bold blue]"
-    return "[cyan]WORK[/cyan]"
+        return f"[bold {SIGNAL_CYAN}]QA[/]"
+    return f"[{SIGNAL_GREEN}]EXEC[/]"
 
 
 def progress_bar(done: int, total: int, *, width: int = 24) -> str:
@@ -70,15 +98,15 @@ def progress_bar(done: int, total: int, *, width: int = 24) -> str:
 def command_table(
     title: str,
     *,
-    border_style: str = "cyan",
+    border_style: str = SIGNAL_CYAN,
     show_lines: bool = False,
     expand: bool = True,
 ) -> Table:
     return Table(
-        title=f"[bold]{escape(title)}[/bold]",
-        box=box.ROUNDED,
-        border_style=border_style,
-        header_style="bold cyan",
+        title=f"[bold {SIGNAL_CYAN}]{escape(title.upper())}[/]",
+        box=box.SQUARE,
+        border_style=palette_style(border_style),
+        header_style=f"bold {SIGNAL_AMBER}",
         show_lines=show_lines,
         expand=expand,
         pad_edge=False,
@@ -89,25 +117,25 @@ def command_panel(
     renderable,
     title: str,
     *,
-    border_style: str = "cyan",
+    border_style: str = SIGNAL_CYAN,
     subtitle: str = "",
     padding: tuple[int, int] = (0, 1),
 ) -> Panel:
-    title_text = f"[bold]{escape(title)}[/bold]"
+    title_text = f"[bold {SIGNAL_CYAN}]{escape(title.upper())}[/]"
     if subtitle:
-        title_text += f" [dim]{escape(subtitle)}[/dim]"
+        title_text += f" [dim {STEEL}]{escape(subtitle)}[/]"
     return Panel(
         renderable,
         title=title_text,
-        border_style=border_style,
-        box=box.ROUNDED,
+        border_style=palette_style(border_style),
+        box=box.SQUARE,
         padding=padding,
     )
 
 
-def kv_table(rows: list[tuple[str, object]], *, title: str = "", border_style: str = "cyan") -> Table:
+def kv_table(rows: list[tuple[str, object]], *, title: str = "", border_style: str = SIGNAL_CYAN) -> Table:
     tbl = command_table(title or "Details", border_style=border_style)
-    tbl.add_column("Key", style="dim", no_wrap=True)
+    tbl.add_column("Key", style=f"dim {STEEL}", no_wrap=True)
     tbl.add_column("Value", overflow="fold")
     for key, value in rows:
         tbl.add_row(markup(key), markup(value))
@@ -115,4 +143,4 @@ def kv_table(rows: list[tuple[str, object]], *, title: str = "", border_style: s
 
 
 def muted(text: object) -> Text:
-    return Text(str(text), style="dim")
+    return Text(str(text), style=f"dim {STEEL}")
